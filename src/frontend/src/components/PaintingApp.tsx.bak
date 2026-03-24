@@ -1,0 +1,2694 @@
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import type { HSVAColor } from "@/utils/colorUtils";
+import { hexToRgb, hsvToRgb, rgbToHex, rgbToHsv } from "@/utils/colorUtils";
+import type { Preset } from "@/utils/toolPresets";
+import { DEFAULT_PRESETS } from "@/utils/toolPresets";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+import { createWebGLBrushContext } from "../utils/webglBrush";
+import type { WebGLBrushContext } from "../utils/webglBrush";
+import { BottomBar } from "./BottomBar";
+import type { BrushSettings } from "./BrushSettingsPanel";
+import {
+  BrushSettingsPanel,
+  DEFAULT_BRUSH_SETTINGS,
+} from "./BrushSettingsPanel";
+import { ColorPickerPanel } from "./ColorPickerPanel";
+import { LayersPanel } from "./LayersPanel";
+import type { Layer } from "./LayersPanel";
+import { SettingsPanel } from "./SettingsPanel";
+import { ToolPresetsPanel } from "./ToolPresetsPanel";
+import { Toolbar } from "./Toolbar";
+import type { Tool } from "./Toolbar";
+
+const PRESSURE_SMOOTHING = 0.15;
+
+const CANVAS_WIDTH = 1200;
+const CANVAS_HEIGHT = 900;
+
+interface UndoEntry {
+  layerId: string;
+  before: ImageData;
+  after: ImageData;
+}
+
+interface ViewTransform {
+  panX: number;
+  panY: number;
+  zoom: number;
+  rotation: number;
+}
+
+type Point = { x: number; y: number };
+type StrokePoint = { x: number; y: number; size: number; opacity: number };
+
+let layerCounter = 1;
+function newLayer(): Layer {
+  layerCounter++;
+  return {
+    id: `layer-${layerCounter}`,
+    name: `Layer ${layerCounter - 1}`,
+    visible: true,
+    opacity: 1,
+  };
+}
+
+function getCanvasPosTransformed(
+  clientX: number,
+  clientY: number,
+  container: HTMLElement,
+  canvas: HTMLCanvasElement,
+  transform: ViewTransform,
+) {
+  const cr = container.getBoundingClientRect();
+  const centerX = cr.left + cr.width / 2;
+  const centerY = cr.top + cr.height / 2;
+  const ox = clientX - centerX - transform.panX;
+  const oy = clientY - centerY - transform.panY;
+  const sx = ox / transform.zoom;
+  const sy = oy / transform.zoom;
+  const rad = (-transform.rotation * Math.PI) / 180;
+  const rx = sx * Math.cos(rad) - sy * Math.sin(rad);
+  const ry = sx * Math.sin(rad) + sy * Math.cos(rad);
+  return {
+    x: rx + canvas.width / 2,
+    y: ry + canvas.height / 2,
+  };
+}
+
+function catmullRomPoints(
+  p0: Point,
+  p1: Point,
+  p2: Point,
+  p3: Point,
+  steps: number,
+): Point[] {
+  const pts: Point[] = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const x =
+      0.5 *
+      (2 * p1.x +
+        (-p0.x + p2.x) * t +
+        (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+        (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
+    const y =
+      0.5 *
+      (2 * p1.y +
+        (-p0.y + p2.y) * t +
+        (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+        (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+    pts.push({ x, y });
+  }
+  return pts;
+}
+
+function ptDist(a: Point, b: Point) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+const DEFAULT_TRANSFORM: ViewTransform = {
+  panX: 0,
+  panY: 0,
+  zoom: 1,
+  rotation: 0,
+};
+
+// Module-level reusable tint canvas — avoids per-stamp canvas allocation
+const _tintCanvas = document.createElement("canvas");
+_tintCanvas.width = _tintCanvas.height = 128;
+const _tintCtx = _tintCanvas.getContext("2d")!;
+
+type BrushSizes = { brush: number; eraser: number };
+
+export function PaintingApp() {
+  // UI state
+  const [activeTool, setActiveTool] = useState<Tool>("brush");
+  const [brushSizes, setBrushSizes] = useState<BrushSizes>({
+    brush: 24,
+    eraser: 24,
+  });
+  const [color, setColor] = useState<HSVAColor>({ h: 0, s: 0, v: 0.05, a: 1 });
+  const [layers, setLayers] = useState<Layer[]>([
+    { id: "layer-1", name: "Layer 1", visible: true, opacity: 1 },
+    { id: "layer-background", name: "Background", visible: true, opacity: 1 },
+  ]);
+  const [activeLayerId, setActiveLayerId] = useState("layer-1");
+  const [backgroundColor, setBackgroundColor] = useState("#ffffff");
+  const [recentColors, setRecentColors] = useState<string[]>([]);
+  const [undoCount, setUndoCount] = useState(0);
+  const [redoCount, setRedoCount] = useState(0);
+  const [brushSettings, setBrushSettings] = useState<BrushSettings>(
+    DEFAULT_BRUSH_SETTINGS,
+  );
+  const [viewTransform, setViewTransform] =
+    useState<ViewTransform>(DEFAULT_TRANSFORM);
+  const [zoomLocked, setZoomLocked] = useState(false);
+  const [rotateLocked, setRotateLocked] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [isFlipped, setIsFlipped] = useState(false);
+  const [activeSubpanel, setActiveSubpanel] = useState<Tool | null>(null);
+  const [presets, setPresets] = useState(DEFAULT_PRESETS);
+  // Import dialog state
+  const [importParsed, setImportParsed] = useState<
+    typeof DEFAULT_PRESETS | null
+  >(null);
+  const [showMergeDialog, setShowMergeDialog] = useState(false);
+  interface ConflictItem {
+    toolType: "brush" | "smear" | "eraser";
+    preset: Preset;
+  }
+  const [conflictQueue, setConflictQueue] = useState<ConflictItem[]>([]);
+  const [pendingMerged, setPendingMerged] = useState<
+    typeof DEFAULT_PRESETS | null
+  >(null);
+  const [currentConflict, setCurrentConflict] = useState<ConflictItem | null>(
+    null,
+  );
+  const [activePresetIds, setActivePresetIds] = useState<
+    Record<string, string | null>
+  >({
+    brush: "brush-default",
+    smear: "smear-default",
+    eraser: "eraser-default",
+  });
+
+  // Canvas refs
+  const displayCanvasRef = useRef<HTMLCanvasElement>(null);
+  const layerCanvasesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Drawing engine refs
+  const isDrawingRef = useRef(false);
+  const lastPosRef = useRef<Point | null>(null);
+  const distAccumRef = useRef(0);
+  const strokePointBufferRef = useRef<StrokePoint[]>([]);
+  const undoStackRef = useRef<UndoEntry[]>([]);
+  const redoStackRef = useRef<UndoEntry[]>([]);
+  const strokeStartSnapshotRef = useRef<ImageData | null>(null);
+  const strokeBufferRef = useRef<HTMLCanvasElement | null>(null);
+  const webglBrushRef = useRef<WebGLBrushContext | null>(null);
+  const belowActiveCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const aboveActiveCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const snapshotCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const activePreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const activeToolRef = useRef(activeTool);
+  const brushSizesRef = useRef(brushSizes);
+  const colorRef = useRef(color);
+  const brushOpacityRef = useRef(color.a);
+  const strokeCommitOpacityRef = useRef(1.0);
+  const backgroundColorRef = useRef("#ffffff");
+  const activeLayerIdRef = useRef(activeLayerId);
+  const layersRef = useRef(layers);
+  const brushSettingsRef = useRef(brushSettings);
+  const viewTransformRef = useRef(viewTransform);
+  const zoomLockedRef = useRef(zoomLocked);
+  const rotateLockedRef = useRef(rotateLocked);
+  const smoothedPressureRef = useRef(0.5);
+  const tipCanvasCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const rafPendingRef = useRef(false);
+  const strokeDisplayDirtyRef = useRef(false);
+  const defaultTipCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Direct-DOM transform for pan/zoom/rotate (avoids React re-renders during gesture)
+  const canvasWrapperRef = useRef<HTMLDivElement>(null);
+  const isFlippedRef = useRef(false);
+
+  // Alt-eyedropper refs
+  const prevToolRef = useRef<Tool>("brush");
+  const altEyedropperActiveRef = useRef(false);
+
+  // View transform interaction refs
+  const spaceDownRef = useRef(false);
+  const zoomModeRef = useRef(false);
+  const rKeyDownRef = useRef(false);
+  const isPanningRef = useRef(false);
+  const panStartRef = useRef({ x: 0, y: 0 });
+  const panOriginRef = useRef({ x: 0, y: 0 });
+  const isRotatingRef = useRef(false);
+  const rotStartRef = useRef(0);
+  const rotOriginRef = useRef(0);
+  const isZoomDraggingRef = useRef(false);
+  const zoomDragStartXRef = useRef(0);
+  const zoomDragOriginRef = useRef(1);
+  const zKeyDownRef = useRef(false);
+  const zoomDragCursorStartRef = useRef({ x: 0, y: 0 });
+  const zoomDragPanOriginRef = useRef({ x: 0, y: 0 });
+  const rotDragCursorRef = useRef({ x: 0, y: 0 });
+  const rotDragCanvasPointRef = useRef({ x: 0, y: 0 });
+  const rotDragPanOriginRef = useRef({ x: 0, y: 0 });
+
+  // Sync refs with state
+  useEffect(() => {
+    activeToolRef.current = activeTool;
+  }, [activeTool]);
+  useEffect(() => {
+    brushSizesRef.current = brushSizes;
+  }, [brushSizes]);
+  useEffect(() => {
+    colorRef.current = color;
+  }, [color]);
+  useEffect(() => {
+    brushOpacityRef.current = color.a;
+  }, [color.a]);
+  useEffect(() => {
+    activeLayerIdRef.current = activeLayerId;
+  }, [activeLayerId]);
+  useEffect(() => {
+    layersRef.current = layers;
+  }, [layers]);
+  useEffect(() => {
+    brushSettingsRef.current = brushSettings;
+  }, [brushSettings]);
+  useEffect(() => {
+    viewTransformRef.current = viewTransform;
+  }, [viewTransform]);
+  useEffect(() => {
+    isFlippedRef.current = isFlipped;
+  }, [isFlipped]);
+  useEffect(() => {
+    zoomLockedRef.current = zoomLocked;
+  }, [zoomLocked]);
+  useEffect(() => {
+    rotateLockedRef.current = rotateLocked;
+  }, [rotateLocked]);
+
+  // Helper: get active tool's current size
+  const getActiveSize = useCallback(() => {
+    const tool = activeToolRef.current;
+    return tool === "eraser"
+      ? brushSizesRef.current.eraser
+      : brushSizesRef.current.brush;
+  }, []);
+
+  // Composite all visible layers onto display canvas
+  const composite = useCallback(() => {
+    const display = displayCanvasRef.current;
+    if (!display) return;
+    const ctx = display.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, display.width, display.height);
+    // Fill background color
+    const bgLayer = layersRef.current.find((l) => l.id === "layer-background");
+    if (!bgLayer || bgLayer.visible) {
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = backgroundColorRef.current;
+      ctx.fillRect(0, 0, display.width, display.height);
+    }
+    const ls = layersRef.current;
+    for (let i = ls.length - 1; i >= 0; i--) {
+      const layer = ls[i];
+      if (layer.id === "layer-background") continue; // rendered as solid fill above
+      if (!layer.visible) continue;
+      const lc = layerCanvasesRef.current.get(layer.id);
+      if (!lc) continue;
+      ctx.globalAlpha = layer.opacity;
+      ctx.drawImage(lc, 0, 0);
+    }
+    ctx.globalAlpha = 1;
+  }, []);
+
+  useEffect(() => {
+    backgroundColorRef.current = backgroundColor;
+    composite();
+    // biome-ignore lint/correctness/useExhaustiveDependencies: composite is stable
+  }, [backgroundColor, composite]);
+
+  // Preload default circle tip
+  useEffect(() => {
+    const img = new Image();
+    img.onload = () => {
+      const tc = document.createElement("canvas");
+      tc.width = tc.height = 128;
+      const ctx = tc.getContext("2d")!;
+      ctx.drawImage(img, 0, 0, 128, 128);
+      const imgData = ctx.getImageData(0, 0, 128, 128);
+      const d = imgData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        d[i] = 255;
+        d[i + 1] = 255;
+        d[i + 2] = 255;
+        d[i + 3] = 255 - lum;
+      }
+      ctx.putImageData(imgData, 0, 0);
+      defaultTipCanvasRef.current = tc;
+    };
+    img.src = "/assets/generated/brush-tip-circle-transparent.dim_128x128.png";
+  }, []);
+
+  // Preload tip image into cache whenever brushSettings.tipImageData changes
+  useEffect(() => {
+    const tipImageData = brushSettings.tipImageData;
+    if (!tipImageData) return;
+    const cacheKey = tipImageData.slice(0, 100);
+    if (tipCanvasCacheRef.current.has(cacheKey)) return;
+    const img = new Image();
+    img.onload = () => {
+      const tc = document.createElement("canvas");
+      tc.width = tc.height = 128;
+      const tcCtx = tc.getContext("2d")!;
+      tcCtx.drawImage(img, 0, 0, 128, 128);
+      const imgData = tcCtx.getImageData(0, 0, 128, 128);
+      const d = imgData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        d[i] = 255;
+        d[i + 1] = 255;
+        d[i + 2] = 255;
+        d[i + 3] = 255 - lum;
+      }
+      tcCtx.putImageData(imgData, 0, 0);
+      tipCanvasCacheRef.current.set(cacheKey, tc);
+    };
+    img.src = tipImageData;
+  }, [brushSettings.tipImageData]);
+
+  // Initialize fixed canvas size
+  useEffect(() => {
+    const display = displayCanvasRef.current;
+    if (!display) return;
+    display.width = CANVAS_WIDTH;
+    display.height = CANVAS_HEIGHT;
+    for (const [, lc] of layerCanvasesRef.current) {
+      lc.width = CANVAS_WIDTH;
+      lc.height = CANVAS_HEIGHT;
+    }
+    const glBrush = createWebGLBrushContext(CANVAS_WIDTH, CANVAS_HEIGHT);
+    if (glBrush) {
+      webglBrushRef.current = glBrush;
+      strokeBufferRef.current = glBrush.canvas;
+    } else {
+      const buf = document.createElement("canvas");
+      buf.width = CANVAS_WIDTH;
+      buf.height = CANVAS_HEIGHT;
+      strokeBufferRef.current = buf;
+    }
+
+    const makeOffscreenCanvas = () => {
+      const c = document.createElement("canvas");
+      c.width = CANVAS_WIDTH;
+      c.height = CANVAS_HEIGHT;
+      return c;
+    };
+    belowActiveCanvasRef.current = makeOffscreenCanvas();
+    aboveActiveCanvasRef.current = makeOffscreenCanvas();
+    snapshotCanvasRef.current = makeOffscreenCanvas();
+    activePreviewCanvasRef.current = makeOffscreenCanvas();
+
+    composite();
+    return () => {
+      webglBrushRef.current?.dispose();
+    };
+  }, [composite]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: layers triggers re-run
+  useEffect(() => {
+    for (const [, lc] of layerCanvasesRef.current) {
+      if (lc.width !== CANVAS_WIDTH || lc.height !== CANVAS_HEIGHT) {
+        lc.width = CANVAS_WIDTH;
+        lc.height = CANVAS_HEIGHT;
+      }
+    }
+    composite();
+  }, [layers, composite]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: layers triggers re-run
+  useEffect(() => {
+    composite();
+  }, [layers, composite]);
+
+  const handleUndo = useCallback(() => {
+    const entry = undoStackRef.current.pop();
+    if (!entry) return;
+    const lc = layerCanvasesRef.current.get(entry.layerId);
+    if (lc) {
+      const ctx = lc.getContext("2d");
+      if (ctx) ctx.putImageData(entry.before, 0, 0);
+    }
+    redoStackRef.current.push(entry);
+    if (redoStackRef.current.length > 50) redoStackRef.current.shift();
+    composite();
+    setUndoCount(undoStackRef.current.length);
+    setRedoCount(redoStackRef.current.length);
+  }, [composite]);
+
+  const handleRedo = useCallback(() => {
+    const entry = redoStackRef.current.pop();
+    if (!entry) return;
+    const lc = layerCanvasesRef.current.get(entry.layerId);
+    if (lc) {
+      const ctx = lc.getContext("2d");
+      if (ctx) ctx.putImageData(entry.after, 0, 0);
+    }
+    undoStackRef.current.push(entry);
+    if (undoStackRef.current.length > 50) undoStackRef.current.shift();
+    composite();
+    setUndoCount(undoStackRef.current.length);
+    setRedoCount(redoStackRef.current.length);
+  }, [composite]);
+
+  const resetView = useCallback(() => {
+    setViewTransform(DEFAULT_TRANSFORM);
+  }, []);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+
+      // Alt key: temporary eyedropper
+      if (e.key === "Alt" && !altEyedropperActiveRef.current) {
+        e.preventDefault();
+        const currentTool = activeToolRef.current;
+        if (currentTool !== "eyedropper") {
+          prevToolRef.current = currentTool;
+          altEyedropperActiveRef.current = true;
+          setActiveTool("eyedropper");
+        }
+        return;
+      }
+
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        e.shiftKey &&
+        e.key.toLowerCase() === "z"
+      ) {
+        e.preventDefault();
+        handleRedo();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        handleUndo();
+        return;
+      }
+      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        switch (e.key.toLowerCase()) {
+          case "b":
+            setActiveTool("brush");
+            break;
+          case "e":
+            setActiveTool("eraser");
+            break;
+          case "s":
+            setActiveTool("smear");
+            break;
+          case "f":
+            setActiveTool("fill");
+            break;
+          case "i":
+            setActiveTool("eyedropper");
+            break;
+          case "[":
+            setBrushSizes((prev) => {
+              const key =
+                activeToolRef.current === "eraser" ? "eraser" : "brush";
+              return { ...prev, [key]: Math.max(1, prev[key] - 5) };
+            });
+            break;
+          case "]":
+            setBrushSizes((prev) => {
+              const key =
+                activeToolRef.current === "eraser" ? "eraser" : "brush";
+              return { ...prev, [key]: Math.min(500, prev[key] + 5) };
+            });
+            break;
+          case "0":
+            setViewTransform(DEFAULT_TRANSFORM);
+            break;
+        }
+      }
+    };
+
+    const upHandler = (e: KeyboardEvent) => {
+      if (e.key === "Alt" && altEyedropperActiveRef.current) {
+        altEyedropperActiveRef.current = false;
+        setActiveTool(prevToolRef.current);
+      }
+    };
+
+    window.addEventListener("keydown", handler);
+    window.addEventListener("keyup", upHandler);
+    return () => {
+      window.removeEventListener("keydown", handler);
+      window.removeEventListener("keyup", upHandler);
+    };
+  }, [handleUndo, handleRedo]);
+
+  // Space key (pan) + Ctrl+Space (zoom drag) + R key (rotate drag)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+
+      if (e.code === "Space") {
+        e.preventDefault();
+        if (e.ctrlKey || e.metaKey) {
+          zoomModeRef.current = true;
+        } else {
+          spaceDownRef.current = true;
+        }
+      }
+      if (
+        e.key.toLowerCase() === "r" &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        rKeyDownRef.current = true;
+      }
+      if (
+        e.key.toLowerCase() === "z" &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        zKeyDownRef.current = true;
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "Space") {
+        spaceDownRef.current = false;
+        zoomModeRef.current = false;
+        isPanningRef.current = false;
+        isZoomDraggingRef.current = false;
+      }
+      if (e.key.toLowerCase() === "r") {
+        rKeyDownRef.current = false;
+        isRotatingRef.current = false;
+      }
+      if (e.key.toLowerCase() === "z") {
+        zKeyDownRef.current = false;
+        isZoomDraggingRef.current = false;
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, []);
+
+  // Wheel zoom
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const t = viewTransformRef.current;
+      const cr = container.getBoundingClientRect();
+      const centerX = cr.left + cr.width / 2;
+      const centerY = cr.top + cr.height / 2;
+      const cx = e.clientX - centerX;
+      const cy = e.clientY - centerY;
+      const factor = 1 - e.deltaY * 0.001;
+      const newZoom = Math.min(20, Math.max(0.05, t.zoom * factor));
+      const zoomRatio = newZoom / t.zoom;
+      const newPanX = cx - (cx - t.panX) * zoomRatio;
+      const newPanY = cy - (cy - t.panY) * zoomRatio;
+      setViewTransform((prev) => ({
+        ...prev,
+        zoom: newZoom,
+        panX: newPanX,
+        panY: newPanY,
+      }));
+    };
+    container.addEventListener("wheel", onWheel, { passive: false });
+    return () => container.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // Multi-touch gestures
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    let prevDist = 0;
+    let prevAngle = 0;
+    let prevMidX = 0;
+    let prevMidY = 0;
+
+    const getDist = (t1: Touch, t2: Touch) => {
+      const dx = t2.clientX - t1.clientX;
+      const dy = t2.clientY - t1.clientY;
+      return Math.sqrt(dx * dx + dy * dy);
+    };
+    const getAngle = (t1: Touch, t2: Touch) =>
+      Math.atan2(t2.clientY - t1.clientY, t2.clientX - t1.clientX);
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const t1 = e.touches[0];
+        const t2 = e.touches[1];
+        prevDist = getDist(t1, t2);
+        prevAngle = getAngle(t1, t2);
+        prevMidX = (t1.clientX + t2.clientX) / 2;
+        prevMidY = (t1.clientY + t2.clientY) / 2;
+        isDrawingRef.current = false;
+        strokeStartSnapshotRef.current = null;
+        lastPosRef.current = null;
+        strokePointBufferRef.current = [];
+      }
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const t1 = e.touches[0];
+        const t2 = e.touches[1];
+        const newDist = getDist(t1, t2);
+        const newAngle = getAngle(t1, t2);
+        const newMidX = (t1.clientX + t2.clientX) / 2;
+        const newMidY = (t1.clientY + t2.clientY) / 2;
+        const zoomFactor = prevDist > 0 ? newDist / prevDist : 1;
+        const angleDeltaDeg = ((newAngle - prevAngle) * 180) / Math.PI;
+        const panDX = newMidX - prevMidX;
+        const panDY = newMidY - prevMidY;
+        setViewTransform((prev) => ({
+          ...prev,
+          zoom: Math.min(20, Math.max(0.05, prev.zoom * zoomFactor)),
+          rotation: prev.rotation + angleDeltaDeg,
+          panX: prev.panX + panDX,
+          panY: prev.panY + panDY,
+        }));
+        prevDist = newDist;
+        prevAngle = newAngle;
+        prevMidX = newMidX;
+        prevMidY = newMidY;
+      }
+    };
+
+    const onTouchEnd = (_e: TouchEvent) => {
+      prevDist = 0;
+    };
+
+    container.addEventListener("touchstart", onTouchStart, { passive: false });
+    container.addEventListener("touchmove", onTouchMove, { passive: false });
+    container.addEventListener("touchend", onTouchEnd, { passive: false });
+    return () => {
+      container.removeEventListener("touchstart", onTouchStart);
+      container.removeEventListener("touchmove", onTouchMove);
+      container.removeEventListener("touchend", onTouchEnd);
+    };
+  }, []);
+
+  // Flood fill
+  const floodFill = useCallback(
+    (
+      lc: HTMLCanvasElement,
+      px: number,
+      py: number,
+      fr: number,
+      fg: number,
+      fb: number,
+      fa: number,
+    ) => {
+      const ctx = lc.getContext("2d");
+      if (!ctx) return;
+      const { width, height } = lc;
+      const x = Math.round(px);
+      const y = Math.round(py);
+      if (x < 0 || x >= width || y < 0 || y >= height) return;
+      const imgData = ctx.getImageData(0, 0, width, height);
+      const data = imgData.data;
+      const idx = (y * width + x) * 4;
+      const tr = data[idx];
+      const tg = data[idx + 1];
+      const tb = data[idx + 2];
+      const ta = data[idx + 3];
+      const tolerance = 30;
+      const colorMatch = (i: number) =>
+        Math.abs(data[i] - tr) <= tolerance &&
+        Math.abs(data[i + 1] - tg) <= tolerance &&
+        Math.abs(data[i + 2] - tb) <= tolerance &&
+        Math.abs(data[i + 3] - ta) <= tolerance;
+      if (
+        Math.abs(tr - fr) < 1 &&
+        Math.abs(tg - fg) < 1 &&
+        Math.abs(tb - fb) < 1 &&
+        Math.abs(ta - fa) < 1
+      )
+        return;
+      const visited = new Uint8Array(width * height);
+      const stack: number[] = [x + y * width];
+      while (stack.length > 0) {
+        const pos = stack.pop()!;
+        const cx = pos % width;
+        const cy = Math.floor(pos / width);
+        if (cx < 0 || cx >= width || cy < 0 || cy >= height) continue;
+        if (visited[pos]) continue;
+        visited[pos] = 1;
+        const pi = pos * 4;
+        if (!colorMatch(pi)) continue;
+        data[pi] = fr;
+        data[pi + 1] = fg;
+        data[pi + 2] = fb;
+        data[pi + 3] = fa;
+        stack.push(pos + 1, pos - 1, pos + width, pos - width);
+      }
+      ctx.putImageData(imgData, 0, 0);
+    },
+    [],
+  );
+
+  const stampDot = useCallback(
+    (
+      ctx: CanvasRenderingContext2D,
+      x: number,
+      y: number,
+      size: number,
+      settings: BrushSettings,
+      strokeAngle: number,
+    ) => {
+      const r = size / 2;
+      const angle =
+        settings.rotateMode === "follow"
+          ? strokeAngle
+          : (settings.rotation * Math.PI) / 180;
+
+      // Image-based brush tip
+      if (settings.tipImageData) {
+        const cacheKey = settings.tipImageData.slice(0, 100);
+        let tipCanvas = tipCanvasCacheRef.current.get(cacheKey);
+
+        if (!tipCanvas) {
+          // Async load: trigger and fall through to primitive for this stamp
+          const img = new Image();
+          img.onload = () => {
+            const tc = document.createElement("canvas");
+            tc.width = tc.height = 128;
+            const tcCtx = tc.getContext("2d")!;
+            tcCtx.drawImage(img, 0, 0, 128, 128);
+            const imgData = tcCtx.getImageData(0, 0, 128, 128);
+            const d = imgData.data;
+            for (let i = 0; i < d.length; i += 4) {
+              const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+              d[i] = 255;
+              d[i + 1] = 255;
+              d[i + 2] = 255;
+              d[i + 3] = 255 - lum;
+            }
+            tcCtx.putImageData(imgData, 0, 0);
+            tipCanvasCacheRef.current.set(cacheKey, tc);
+          };
+          img.src = settings.tipImageData;
+          // Fall through to primitive on first encounter
+        } else {
+          // Create tinted stamp: fill with brush color, mask with tip alpha (reuse module-level canvas)
+          _tintCtx.clearRect(0, 0, 128, 128);
+          _tintCtx.globalCompositeOperation = "source-over";
+          _tintCtx.fillStyle = ctx.fillStyle as string;
+          _tintCtx.fillRect(0, 0, 128, 128);
+          _tintCtx.globalCompositeOperation = "destination-in";
+          _tintCtx.drawImage(tipCanvas, 0, 0);
+          _tintCtx.globalCompositeOperation = "source-over";
+
+          ctx.save();
+          ctx.translate(x, y);
+          if (angle !== 0) ctx.rotate(angle);
+          ctx.drawImage(_tintCanvas, -size / 2, -size / 2, size, size);
+          ctx.restore();
+          return;
+        }
+      }
+
+      // Default tip fallback: use preloaded circle tip or arc (reuse module-level tint canvas)
+      const defTip = defaultTipCanvasRef.current;
+      if (defTip) {
+        _tintCtx.clearRect(0, 0, 128, 128);
+        _tintCtx.globalCompositeOperation = "source-over";
+        _tintCtx.filter =
+          settings.softness > 0
+            ? `blur(${Math.round(settings.softness * 20)}px)`
+            : "none";
+        _tintCtx.fillStyle = ctx.fillStyle as string;
+        _tintCtx.fillRect(0, 0, 128, 128);
+        _tintCtx.globalCompositeOperation = "destination-in";
+        _tintCtx.drawImage(defTip, 0, 0);
+        _tintCtx.globalCompositeOperation = "source-over";
+        _tintCtx.filter = "none";
+        ctx.save();
+        ctx.translate(x, y);
+        if (angle !== 0) ctx.rotate(angle);
+        ctx.drawImage(_tintCanvas, -size / 2, -size / 2, size, size);
+        ctx.restore();
+      } else {
+        ctx.save();
+        ctx.translate(x, y);
+        if (angle !== 0) ctx.rotate(angle);
+        if (settings.softness > 0) {
+          ctx.shadowBlur = settings.softness * size * 0.5;
+          ctx.shadowColor = ctx.fillStyle as string;
+        }
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.restore();
+      }
+    },
+    [],
+  );
+
+  const normalizePressure = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType === "mouse") return 1.0;
+    return e.pressure > 0 ? e.pressure : 0.5;
+  };
+
+  const flushStrokeBuffer = useCallback(
+    (lc: HTMLCanvasElement, _opacity: number, tool: Tool) => {
+      const layerCtx = lc.getContext("2d");
+      const snap = strokeStartSnapshotRef.current;
+      const sbuf = strokeBufferRef.current;
+      if (!layerCtx || !snap || !sbuf) return;
+      layerCtx.putImageData(snap, 0, 0);
+      // Apply stroke-level opacity (the "diluted ink" cap) when committing stroke to layer.
+      layerCtx.globalAlpha = strokeCommitOpacityRef.current;
+      layerCtx.globalCompositeOperation =
+        tool === "eraser" ? "destination-out" : "source-over";
+      layerCtx.drawImage(sbuf, 0, 0);
+      layerCtx.globalAlpha = 1;
+      layerCtx.globalCompositeOperation = "source-over";
+    },
+    [],
+  );
+
+  // Renders preview of active stroke to the display canvas WITHOUT modifying any layer canvas.
+  // Accepts an optional dirty rect — when provided, only composites that region (O(stampArea)
+  // instead of O(fullCanvas)), enabling synchronous per-event updates with negligible cost.
+  const compositeWithStrokePreview = useCallback(
+    (
+      _opacity: number,
+      tool: Tool,
+      dirty?: { minX: number; minY: number; maxX: number; maxY: number },
+    ) => {
+      const display = displayCanvasRef.current;
+      const below = belowActiveCanvasRef.current;
+      const above = aboveActiveCanvasRef.current;
+      const snap = snapshotCanvasRef.current;
+      const preview = activePreviewCanvasRef.current;
+      const sbuf = strokeBufferRef.current;
+      const activeLayerId = activeLayerIdRef.current;
+      if (
+        !display ||
+        !below ||
+        !above ||
+        !snap ||
+        !preview ||
+        !sbuf ||
+        !activeLayerId
+      )
+        return;
+
+      const W = display.width;
+      const H = display.height;
+      const activeLayer = layersRef.current.find((l) => l.id === activeLayerId);
+      if (!activeLayer) return;
+
+      // Determine composite region — clip to canvas bounds, add 2px guard for rounding
+      const useDirty =
+        dirty != null &&
+        Number.isFinite(dirty.minX) &&
+        dirty.maxX >= dirty.minX;
+      const cx = useDirty ? Math.max(0, Math.floor(dirty!.minX) - 2) : 0;
+      const cy = useDirty ? Math.max(0, Math.floor(dirty!.minY) - 2) : 0;
+      const cx2 = useDirty ? Math.min(W, Math.ceil(dirty!.maxX) + 2) : W;
+      const cy2 = useDirty ? Math.min(H, Math.ceil(dirty!.maxY) + 2) : H;
+      const cw = cx2 - cx;
+      const ch = cy2 - cy;
+
+      // 1. Build active layer preview in composite region: snapshot + stroke buffer at strokeOpacity
+      const previewCtx = preview.getContext("2d");
+      if (!previewCtx) return;
+      previewCtx.clearRect(cx, cy, cw, ch);
+      previewCtx.globalAlpha = 1;
+      previewCtx.globalCompositeOperation = "source-over";
+      previewCtx.drawImage(snap, cx, cy, cw, ch, cx, cy, cw, ch);
+      // Apply stroke-level opacity (the "diluted ink" cap) when compositing stroke buffer.
+      previewCtx.globalAlpha = strokeCommitOpacityRef.current;
+      previewCtx.globalCompositeOperation =
+        tool === "eraser" ? "destination-out" : "source-over";
+      previewCtx.drawImage(sbuf, cx, cy, cw, ch, cx, cy, cw, ch);
+      previewCtx.globalAlpha = 1;
+      previewCtx.globalCompositeOperation = "source-over";
+
+      // 2. Composite to display in region: below layers + active layer preview + above layers
+      const displayCtx = display.getContext("2d");
+      if (!displayCtx) return;
+      displayCtx.clearRect(cx, cy, cw, ch);
+      displayCtx.globalAlpha = 1;
+      displayCtx.drawImage(below, cx, cy, cw, ch, cx, cy, cw, ch);
+      displayCtx.globalAlpha = activeLayer.opacity;
+      displayCtx.drawImage(preview, cx, cy, cw, ch, cx, cy, cw, ch);
+      displayCtx.globalAlpha = 1;
+      displayCtx.drawImage(above, cx, cy, cw, ch, cx, cy, cw, ch);
+    },
+    [],
+  );
+
+  // Builds the persistent below/above/snapshot canvases at stroke start.
+  // Called once per stroke from handlePointerDown before the first stamp.
+  const buildStrokeCanvases = useCallback((activeLayerId: string) => {
+    const display = displayCanvasRef.current;
+    const below = belowActiveCanvasRef.current;
+    const above = aboveActiveCanvasRef.current;
+    const snap = snapshotCanvasRef.current;
+    const activeLayerCanvas = layerCanvasesRef.current.get(activeLayerId);
+    if (!display || !below || !above || !snap || !activeLayerCanvas) return;
+
+    const W = display.width;
+    const H = display.height;
+
+    // Clear WebGL stroke buffer for new stroke
+    if (webglBrushRef.current) {
+      webglBrushRef.current.clear();
+    } else {
+      const sbuf = strokeBufferRef.current;
+      if (sbuf) sbuf.getContext("2d")?.clearRect(0, 0, sbuf.width, sbuf.height);
+    }
+
+    const ls = layersRef.current;
+    const activeIdx = ls.findIndex((l) => l.id === activeLayerId);
+
+    // --- Build belowActiveCanvas: background fill + layers below (higher index = drawn first) ---
+    const belowCtx = below.getContext("2d");
+    if (!belowCtx) return;
+    belowCtx.clearRect(0, 0, W, H);
+    belowCtx.globalAlpha = 1;
+    belowCtx.fillStyle = backgroundColorRef.current;
+    belowCtx.fillRect(0, 0, W, H);
+    for (let i = ls.length - 1; i > activeIdx; i--) {
+      const layer = ls[i];
+      if (layer.id === "layer-background") continue;
+      if (!layer.visible) continue;
+      const lc = layerCanvasesRef.current.get(layer.id);
+      if (!lc) continue;
+      belowCtx.globalAlpha = layer.opacity;
+      belowCtx.drawImage(lc, 0, 0);
+    }
+    belowCtx.globalAlpha = 1;
+
+    // --- Build aboveActiveCanvas: layers above active (lower index = drawn last) ---
+    const aboveCtx = above.getContext("2d");
+    if (!aboveCtx) return;
+    aboveCtx.clearRect(0, 0, W, H);
+    for (let i = activeIdx - 1; i >= 0; i--) {
+      const layer = ls[i];
+      if (!layer.visible) continue;
+      const lc = layerCanvasesRef.current.get(layer.id);
+      if (!lc) continue;
+      aboveCtx.globalAlpha = layer.opacity;
+      aboveCtx.drawImage(lc, 0, 0);
+    }
+    aboveCtx.globalAlpha = 1;
+
+    // --- Build snapshotCanvas: copy of active layer pixels at stroke start ---
+    const snapCtx = snap.getContext("2d");
+    if (!snapCtx) return;
+    snapCtx.clearRect(0, 0, W, H);
+    snapCtx.drawImage(activeLayerCanvas, 0, 0);
+  }, []);
+
+  // GPU-accelerated stamp using the WebGL brush context
+  const stampWebGL = useCallback(
+    (
+      sx: number,
+      sy: number,
+      stampSize: number,
+      stampOpacity: number,
+      settings: BrushSettings,
+      angle: number,
+      fillStyle: string,
+      capAlpha?: number,
+    ) => {
+      const glBrush = webglBrushRef.current;
+      if (!glBrush) return;
+      const m = /rgb\((\d+),\s*(\d+),\s*(\d+)\)/.exec(fillStyle);
+      const r = m ? Number.parseInt(m[1]) / 255 : 0;
+      const g = m ? Number.parseInt(m[2]) / 255 : 0;
+      const b = m ? Number.parseInt(m[3]) / 255 : 0;
+      glBrush.stamp(
+        sx,
+        sy,
+        stampSize,
+        stampOpacity,
+        r,
+        g,
+        b,
+        settings.tipImageData ?? null,
+        angle,
+        defaultTipCanvasRef.current,
+        settings.softness,
+        capAlpha,
+      );
+    },
+    [],
+  );
+
+  const renderBrushSegmentAlongPoints = useCallback(
+    (
+      ctx: CanvasRenderingContext2D,
+      points: Point[],
+      sizeFrom: number,
+      sizeTo: number,
+      opacityFrom: number,
+      opacityTo: number,
+      settings: BrushSettings,
+      _tool: Tool,
+      _applyOpacityPerStamp = false,
+      capAlpha?: number,
+    ) => {
+      if (points.length < 2) return;
+      const avgSize = (sizeFrom + sizeTo) / 2;
+      const _fillStyle = _tool !== "eraser" ? (ctx.fillStyle as string) : "";
+      let totalSegDist = 0;
+      for (let i = 1; i < points.length; i++) {
+        totalSegDist += ptDist(points[i - 1], points[i]);
+      }
+      let distFromSegStart = 0;
+      for (let i = 1; i < points.length; i++) {
+        const from = points[i - 1];
+        const to = points[i];
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+        const segDist = Math.sqrt(dx * dx + dy * dy);
+        const strokeAngle = Math.atan2(dy, dx);
+        let accdist = distAccumRef.current + segDist;
+        let stampsPlaced = 0;
+        while (true) {
+          const globalT =
+            totalSegDist > 0
+              ? (distFromSegStart +
+                  (stampsPlaced + 1) *
+                    Math.max(1, (settings.spacing / 100) * avgSize) -
+                  distAccumRef.current) /
+                totalSegDist
+              : 0;
+          const clampedT = Math.min(1, Math.max(0, globalT));
+          const interpSize = sizeFrom + (sizeTo - sizeFrom) * clampedT;
+          const spacingPixels = Math.max(
+            1,
+            (settings.spacing / 100) * interpSize,
+          );
+          if (accdist < spacingPixels) break;
+          const distFromPrev =
+            (stampsPlaced + 1) * spacingPixels - distAccumRef.current;
+          const segT = segDist > 0 ? distFromPrev / segDist : 0;
+          const sx = from.x + dx * segT;
+          const sy = from.y + dy * segT;
+          const _interpOpacity =
+            opacityFrom + (opacityTo - opacityFrom) * clampedT;
+          {
+            const _scatter = settings.scatter ?? 0;
+            const _sizeJitter = settings.sizeJitter ?? 0;
+            const _stampX = sx + (Math.random() - 0.5) * 2 * _scatter;
+            const _stampY = sy + (Math.random() - 0.5) * 2 * _scatter;
+            const _stampSize =
+              interpSize * (1 + (Math.random() - 0.5) * _sizeJitter);
+            if (_tool === "eraser") {
+              stampWebGL(
+                _stampX,
+                _stampY,
+                _stampSize,
+                _interpOpacity,
+                settings,
+                settings.rotateMode === "follow"
+                  ? strokeAngle
+                  : (settings.rotation * Math.PI) / 180,
+                "rgb(255,255,255)",
+                capAlpha,
+              );
+            } else {
+              stampWebGL(
+                _stampX,
+                _stampY,
+                _stampSize,
+                _interpOpacity,
+                settings,
+                settings.rotateMode === "follow"
+                  ? strokeAngle
+                  : (settings.rotation * Math.PI) / 180,
+                _fillStyle,
+                capAlpha,
+              );
+            }
+          }
+          stampsPlaced++;
+          accdist -= spacingPixels;
+        }
+        distAccumRef.current = accdist;
+        distFromSegStart += segDist;
+      }
+    },
+    [stampWebGL],
+  );
+
+  const renderSmearAlongPoints = useCallback(
+    (
+      lc: HTMLCanvasElement,
+      points: Point[],
+      brushSizeVal: number,
+      softness = 0,
+    ) => {
+      const ctx = lc.getContext("2d");
+      if (!ctx || points.length < 2) return;
+      const size = brushSizeVal;
+      const radius = size / 2;
+      const cw = lc.width;
+      const ch = lc.height;
+      for (let i = 1; i < points.length; i++) {
+        const from = points[i - 1];
+        const to = points[i];
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+        const segDist = Math.sqrt(dx * dx + dy * dy);
+        if (segDist < 0.5) continue;
+        const srcX = Math.round(from.x - radius);
+        const srcY = Math.round(from.y - radius);
+        const sw = Math.round(size);
+        const sh = Math.round(size);
+        const clampedX = Math.max(0, srcX);
+        const clampedY = Math.max(0, srcY);
+        const clampedW = Math.min(sw, cw - clampedX);
+        const clampedH = Math.min(sh, ch - clampedY);
+        if (clampedW > 0 && clampedH > 0) {
+          try {
+            const strength = Math.min(0.8, segDist / (size * 0.5));
+            const destX = clampedX + dx * strength;
+            const destY = clampedY + dy * strength;
+
+            // 1. Create an offscreen canvas with the source patch
+            const patchCanvas = document.createElement("canvas");
+            patchCanvas.width = clampedW;
+            patchCanvas.height = clampedH;
+            const patchCtx = patchCanvas.getContext("2d")!;
+
+            // Apply blur if softness > 0 (blurs the smeared pixels)
+            if (softness > 0) {
+              patchCtx.filter = `blur(${Math.round(softness * size * 0.15 + 0.5)}px)`;
+            }
+            patchCtx.drawImage(
+              lc,
+              clampedX,
+              clampedY,
+              clampedW,
+              clampedH,
+              0,
+              0,
+              clampedW,
+              clampedH,
+            );
+            patchCtx.filter = "none";
+
+            // 2. Apply feathered radial gradient mask if softness > 0
+            if (softness > 0) {
+              patchCtx.globalCompositeOperation = "destination-in";
+              const cx = clampedW / 2;
+              const cy = clampedH / 2;
+              const r = Math.min(clampedW, clampedH) / 2;
+              const innerR = r * (1 - softness);
+              const grad = patchCtx.createRadialGradient(
+                cx,
+                cy,
+                Math.max(0, innerR),
+                cx,
+                cy,
+                r,
+              );
+              grad.addColorStop(0, "rgba(0,0,0,1)");
+              grad.addColorStop(1, "rgba(0,0,0,0)");
+              patchCtx.fillStyle = grad;
+              patchCtx.fillRect(0, 0, clampedW, clampedH);
+              patchCtx.globalCompositeOperation = "source-over";
+            }
+
+            // 3. Draw the (optionally blurred + masked) patch onto the layer
+            ctx.drawImage(patchCanvas, destX, destY);
+          } catch {
+            /* ignore OOB */
+          }
+        }
+      }
+    },
+    [],
+  );
+
+  // Apply view transform directly to DOM during gesture — no React re-render
+  const applyTransformToDOM = useCallback((vt: ViewTransform) => {
+    viewTransformRef.current = vt;
+    const el = canvasWrapperRef.current;
+    if (el) {
+      const flip = isFlippedRef.current ? -1 : 1;
+      el.style.transform = `scaleX(${flip}) translate(${vt.panX}px, ${vt.panY}px) rotate(${vt.rotation}deg) scale(${vt.zoom})`;
+    }
+  }, []);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: uses refs intentionally
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      const display = displayCanvasRef.current;
+      const container = containerRef.current;
+      if (!display || !container) return;
+      e.preventDefault();
+      (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+
+      // Z+drag zoom with cursor pivot
+      if (zKeyDownRef.current) {
+        isZoomDraggingRef.current = true;
+        zoomDragStartXRef.current = e.clientX;
+        zoomDragOriginRef.current = viewTransformRef.current.zoom;
+        const cr = container.getBoundingClientRect();
+        zoomDragCursorStartRef.current = {
+          x: e.clientX - (cr.left + cr.width / 2),
+          y: e.clientY - (cr.top + cr.height / 2),
+        };
+        zoomDragPanOriginRef.current = {
+          x: viewTransformRef.current.panX,
+          y: viewTransformRef.current.panY,
+        };
+        return;
+      }
+
+      if (
+        zoomModeRef.current ||
+        (zoomLockedRef.current && !spaceDownRef.current && !rKeyDownRef.current)
+      ) {
+        isZoomDraggingRef.current = true;
+        zoomDragStartXRef.current = e.clientX;
+        zoomDragOriginRef.current = viewTransformRef.current.zoom;
+        const cr2 = container.getBoundingClientRect();
+        zoomDragCursorStartRef.current = {
+          x: e.clientX - (cr2.left + cr2.width / 2),
+          y: e.clientY - (cr2.top + cr2.height / 2),
+        };
+        zoomDragPanOriginRef.current = {
+          x: viewTransformRef.current.panX,
+          y: viewTransformRef.current.panY,
+        };
+        return;
+      }
+
+      if (
+        rKeyDownRef.current ||
+        (rotateLockedRef.current &&
+          !spaceDownRef.current &&
+          !zoomModeRef.current)
+      ) {
+        isRotatingRef.current = true;
+        rotStartRef.current = e.clientX;
+        rotOriginRef.current = viewTransformRef.current.rotation;
+        const cr3 = container.getBoundingClientRect();
+        rotDragCursorRef.current = {
+          x: e.clientX - (cr3.left + cr3.width / 2),
+          y: e.clientY - (cr3.top + cr3.height / 2),
+        };
+        rotDragCanvasPointRef.current = getCanvasPosTransformed(
+          e.clientX,
+          e.clientY,
+          container,
+          display,
+          viewTransformRef.current,
+        );
+        rotDragPanOriginRef.current = {
+          x: viewTransformRef.current.panX,
+          y: viewTransformRef.current.panY,
+        };
+        return;
+      }
+
+      if (e.button === 1 || spaceDownRef.current) {
+        isPanningRef.current = true;
+        panStartRef.current = { x: e.clientX, y: e.clientY };
+        panOriginRef.current = {
+          x: viewTransformRef.current.panX,
+          y: viewTransformRef.current.panY,
+        };
+        return;
+      }
+
+      const pos = getCanvasPosTransformed(
+        e.clientX,
+        e.clientY,
+        container,
+        display,
+        viewTransformRef.current,
+      );
+      const tool = activeToolRef.current;
+      const layerId = activeLayerIdRef.current;
+      const lc = layerCanvasesRef.current.get(layerId);
+
+      if (tool === "eyedropper") {
+        const ctx = display.getContext("2d");
+        if (!ctx) return;
+        const pixel = ctx.getImageData(
+          Math.round(pos.x),
+          Math.round(pos.y),
+          1,
+          1,
+        ).data;
+        const [h, s, v] = rgbToHsv(pixel[0], pixel[1], pixel[2]);
+        const a = pixel[3] / 255;
+        setColor((prev) => ({ ...prev, h, s, v, a: a > 0 ? a : prev.a }));
+        return;
+      }
+
+      // Background layer cannot be painted on
+      if (layerId === "layer-background") return;
+
+      if (!lc) return;
+
+      const layerCtx = lc.getContext("2d");
+      if (layerCtx) {
+        strokeStartSnapshotRef.current = layerCtx.getImageData(
+          0,
+          0,
+          lc.width,
+          lc.height,
+        );
+      }
+
+      if (tool === "fill") {
+        const col = colorRef.current;
+        const [r, g, b] = hsvToRgb(col.h, col.s, col.v);
+        const fa = Math.round(col.a * 255);
+        floodFill(lc, pos.x, pos.y, r, g, b, fa);
+        composite();
+        const after = lc
+          .getContext("2d")
+          ?.getImageData(0, 0, lc.width, lc.height);
+        if (strokeStartSnapshotRef.current && after) {
+          undoStackRef.current.push({
+            layerId,
+            before: strokeStartSnapshotRef.current,
+            after,
+          });
+          if (undoStackRef.current.length > 50) undoStackRef.current.shift();
+          redoStackRef.current = [];
+          setUndoCount(undoStackRef.current.length);
+          setRedoCount(0);
+        }
+        return;
+      }
+
+      isDrawingRef.current = true;
+      lastPosRef.current = pos;
+      distAccumRef.current = 0;
+      if (webglBrushRef.current) {
+        webglBrushRef.current.clear();
+        // Switch blend mode: max-alpha for pressure→opacity (caps stamps, no buildup),
+        // normal source-over for flow buildup mode.
+        webglBrushRef.current.setPressureCapMode(
+          !!brushSettingsRef.current?.pressureOpacity,
+        );
+      } else {
+        const sbufInit = strokeBufferRef.current;
+        if (sbufInit)
+          sbufInit
+            .getContext("2d")
+            ?.clearRect(0, 0, sbufInit.width, sbufInit.height);
+      }
+
+      // Build persistent stroke canvases once at stroke start for real-time opacity compositing
+      buildStrokeCanvases(layerId);
+
+      const ctx = lc.getContext("2d");
+      if (ctx) {
+        const col = colorRef.current;
+        const rawPressure = normalizePressure(e);
+        smoothedPressureRef.current = rawPressure;
+        const pressure = smoothedPressureRef.current;
+        const settings = brushSettingsRef.current;
+        const baseSize = getActiveSize();
+        const baseOpacity = brushOpacityRef.current;
+
+        const effectiveSize = settings.pressureSize
+          ? baseSize *
+            (settings.minSize / 100 + (1 - settings.minSize / 100) * pressure)
+          : baseSize;
+        const pressureFactor = settings.pressureOpacity
+          ? settings.minOpacity + (1 - settings.minOpacity) * pressure
+          : 1.0;
+        // Dual-FBO pressure cap architecture:
+        // effectiveOpacity = flow (per-stamp buildup; accumulates via normal compositing)
+        // capAlpha = pressureFactor * baseOpacity (per-pixel pressure cap; tracked via MAX blend)
+        // strokeCommitOpacity = baseOpacity (dilution cap applied at commit time)
+        const effectiveOpacity = settings.flow ?? 1;
+        const capAlpha = settings.pressureOpacity
+          ? pressureFactor * baseOpacity
+          : undefined;
+        strokeCommitOpacityRef.current = settings.pressureOpacity
+          ? 1.0
+          : baseOpacity;
+
+        strokePointBufferRef.current = [
+          { ...pos, size: effectiveSize, opacity: effectiveOpacity },
+        ];
+        if (tool === "eraser") {
+          stampWebGL(
+            pos.x,
+            pos.y,
+            effectiveSize,
+            effectiveOpacity,
+            settings,
+            settings.rotateMode === "follow"
+              ? 0
+              : (settings.rotation * Math.PI) / 180,
+            "rgb(255,255,255)",
+            capAlpha,
+          );
+        } else {
+          const [r, g, b2] = hsvToRgb(col.h, col.s, col.v);
+          const _initFillStyle = `rgb(${r},${g},${b2})`;
+          stampWebGL(
+            pos.x,
+            pos.y,
+            effectiveSize,
+            effectiveOpacity,
+            settings,
+            settings.rotateMode === "follow"
+              ? 0
+              : (settings.rotation * Math.PI) / 180,
+            _initFillStyle,
+            capAlpha,
+          );
+        }
+        compositeWithStrokePreview(1.0, tool);
+      } else {
+        strokePointBufferRef.current = [
+          { ...pos, size: getActiveSize(), opacity: 1 },
+        ];
+      }
+    },
+    [
+      composite,
+      floodFill,
+      stampDot,
+      getActiveSize,
+      compositeWithStrokePreview,
+      buildStrokeCanvases,
+      stampWebGL,
+    ],
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: uses refs intentionally
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (isZoomDraggingRef.current) {
+        const deltaX = e.clientX - zoomDragStartXRef.current;
+        const newZoom = Math.min(
+          20,
+          Math.max(0.05, zoomDragOriginRef.current * Math.exp(deltaX * 0.005)),
+        );
+        const zoomRatio = newZoom / zoomDragOriginRef.current;
+        const cx = zoomDragCursorStartRef.current.x;
+        const cy = zoomDragCursorStartRef.current.y;
+        const newPanX = cx - (cx - zoomDragPanOriginRef.current.x) * zoomRatio;
+        const newPanY = cy - (cy - zoomDragPanOriginRef.current.y) * zoomRatio;
+        applyTransformToDOM({
+          ...viewTransformRef.current,
+          zoom: newZoom,
+          panX: newPanX,
+          panY: newPanY,
+        });
+        return;
+      }
+      if (isPanningRef.current) {
+        const dx = e.clientX - panStartRef.current.x;
+        const dy = e.clientY - panStartRef.current.y;
+        applyTransformToDOM({
+          ...viewTransformRef.current,
+          panX: panOriginRef.current.x + dx,
+          panY: panOriginRef.current.y + dy,
+        });
+        return;
+      }
+      if (isRotatingRef.current) {
+        const delta = (e.clientX - rotStartRef.current) * 0.5;
+        const newRotation = rotOriginRef.current + delta;
+        const rad = (newRotation * Math.PI) / 180;
+        const z = viewTransformRef.current.zoom;
+        const cp = rotDragCanvasPointRef.current;
+        const cpLocalX = cp.x - CANVAS_WIDTH / 2;
+        const cpLocalY = cp.y - CANVAS_HEIGHT / 2;
+        const rotX = (cpLocalX * Math.cos(rad) - cpLocalY * Math.sin(rad)) * z;
+        const rotY = (cpLocalX * Math.sin(rad) + cpLocalY * Math.cos(rad)) * z;
+        const cx = rotDragCursorRef.current.x;
+        const cy = rotDragCursorRef.current.y;
+        const newPanX = cx - rotX;
+        const newPanY = cy - rotY;
+        applyTransformToDOM({
+          ...viewTransformRef.current,
+          rotation: newRotation,
+          panX: newPanX,
+          panY: newPanY,
+        });
+        return;
+      }
+
+      if (!isDrawingRef.current) return;
+      const display = displayCanvasRef.current;
+      const container = containerRef.current;
+      if (!display || !container) return;
+
+      const pos = getCanvasPosTransformed(
+        e.clientX,
+        e.clientY,
+        container,
+        display,
+        viewTransformRef.current,
+      );
+      const prev = lastPosRef.current;
+      if (!prev) {
+        lastPosRef.current = pos;
+        return;
+      }
+
+      const tool = activeToolRef.current;
+      const layerId = activeLayerIdRef.current;
+      const lc = layerCanvasesRef.current.get(layerId);
+      if (!lc) return;
+
+      const dx = pos.x - prev.x;
+      const dy = pos.y - prev.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      const settings = brushSettingsRef.current;
+      const smoothing = settings.strokeSmoothing;
+      const activeSize = getActiveSize();
+
+      if (tool === "smear") {
+        if (smoothing > 0) {
+          strokePointBufferRef.current.push({
+            ...pos,
+            size: activeSize,
+            opacity: 1,
+          });
+          if (strokePointBufferRef.current.length > 4) {
+            strokePointBufferRef.current =
+              strokePointBufferRef.current.slice(-4);
+          }
+          const buf = strokePointBufferRef.current;
+          if (buf.length >= 4) {
+            const [p0, p1, p2, p3] = buf.slice(-4);
+            const segDist = ptDist(p1, p2);
+            const steps = Math.max(4, Math.ceil(segDist / 1.0));
+            const interpolated = catmullRomPoints(p0, p1, p2, p3, steps);
+            renderSmearAlongPoints(
+              lc,
+              interpolated,
+              activeSize,
+              settings.softness ?? 0,
+            );
+          } else if (buf.length >= 2 && dist > 0.5) {
+            renderSmearAlongPoints(
+              lc,
+              [prev, pos],
+              activeSize,
+              settings.softness ?? 0,
+            );
+          }
+        } else {
+          const ctx = lc.getContext("2d");
+          if (ctx && dist > 0.5) {
+            const size = activeSize;
+            const radius = size / 2;
+            const srcX = Math.round(prev.x - radius);
+            const srcY = Math.round(prev.y - radius);
+            const sw = Math.round(size);
+            const sh = Math.round(size);
+            const cw = lc.width;
+            const ch = lc.height;
+            const clampedX = Math.max(0, srcX);
+            const clampedY = Math.max(0, srcY);
+            const clampedW = Math.min(sw, cw - clampedX);
+            const clampedH = Math.min(sh, ch - clampedY);
+            if (clampedW > 0 && clampedH > 0) {
+              try {
+                const imgData = ctx.getImageData(
+                  clampedX,
+                  clampedY,
+                  clampedW,
+                  clampedH,
+                );
+                const strength = Math.min(0.8, dist / (size * 0.5));
+                ctx.putImageData(
+                  imgData,
+                  clampedX + dx * strength,
+                  clampedY + dy * strength,
+                );
+              } catch {
+                /* ignore OOB */
+              }
+            }
+          }
+        }
+      } else if (tool === "brush" || tool === "eraser") {
+        const ctx = lc.getContext("2d");
+        if (!ctx) return;
+
+        const rawPressure = normalizePressure(e);
+        smoothedPressureRef.current =
+          smoothedPressureRef.current * (1 - PRESSURE_SMOOTHING) +
+          rawPressure * PRESSURE_SMOOTHING;
+        const pressure = smoothedPressureRef.current;
+        const baseSize = activeSize;
+        const baseOpacity = brushOpacityRef.current;
+
+        const effectiveSize = settings.pressureSize
+          ? baseSize *
+            (settings.minSize / 100 + (1 - settings.minSize / 100) * pressure)
+          : baseSize;
+        const pressureFactor = settings.pressureOpacity
+          ? settings.minOpacity + (1 - settings.minOpacity) * pressure
+          : 1.0;
+        // Dual-FBO pressure cap architecture:
+        // effectiveOpacity = flow (per-stamp buildup; accumulates via normal compositing)
+        // capAlpha = pressureFactor * baseOpacity (per-pixel pressure cap; tracked via MAX blend)
+        // strokeCommitOpacity = baseOpacity (dilution cap applied at commit time)
+        const effectiveOpacity = settings.flow ?? 1;
+        const capAlpha = settings.pressureOpacity
+          ? pressureFactor * baseOpacity
+          : undefined;
+        strokeCommitOpacityRef.current = settings.pressureOpacity
+          ? 1.0
+          : baseOpacity;
+
+        const sbufCtxMove = strokeBufferRef.current?.getContext("2d");
+        // Compute fill style independently: sbufCtxMove is null when using WebGL canvas
+        const _colMove = colorRef.current;
+        const [_rMove, _gMove, _bMove] = hsvToRgb(
+          _colMove.h,
+          _colMove.s,
+          _colMove.v,
+        );
+        const _moveFillStyle = `rgb(${_rMove},${_gMove},${_bMove})`;
+        if (sbufCtxMove) {
+          if (tool === "eraser") {
+            sbufCtxMove.fillStyle = "rgba(0,0,0,1)";
+          } else {
+            sbufCtxMove.fillStyle = _moveFillStyle;
+          }
+          sbufCtxMove.globalCompositeOperation = "source-over";
+        }
+
+        if (smoothing > 0) {
+          strokePointBufferRef.current.push({
+            ...pos,
+            size: effectiveSize,
+            opacity: effectiveOpacity,
+          });
+          if (strokePointBufferRef.current.length > 4) {
+            strokePointBufferRef.current =
+              strokePointBufferRef.current.slice(-4);
+          }
+          const buf = strokePointBufferRef.current;
+          if (buf.length >= 4) {
+            const [p0, p1, p2, p3] = buf.slice(-4);
+            const segDist = ptDist(p1, p2);
+            const steps = Math.max(4, Math.ceil(segDist / 1.0));
+            const interpolated = catmullRomPoints(p0, p1, p2, p3, steps);
+            {
+              // For WebGL brush path sbufCtxMove is null; provide a fake ctx with fillStyle
+              const _segCtx =
+                sbufCtxMove ??
+                ({
+                  fillStyle: _moveFillStyle,
+                } as unknown as CanvasRenderingContext2D);
+              renderBrushSegmentAlongPoints(
+                _segCtx,
+                interpolated,
+                p1.size,
+                p2.size,
+                p1.opacity,
+                p2.opacity,
+                settings,
+                tool,
+                true,
+                capAlpha,
+              );
+              // Smoothing path: full composite (no dirty rect — segment may span large area)
+              compositeWithStrokePreview(1.0, tool);
+            }
+          } else if (buf.length >= 2) {
+            const p1 = buf[buf.length - 2];
+            const p2 = buf[buf.length - 1];
+            const spacingPixels = Math.max(
+              1,
+              (settings.spacing / 100) * p1.size,
+            );
+            const strokeAngle = Math.atan2(dy, dx);
+            let accdist = distAccumRef.current + dist;
+            let stampsPlaced = 0;
+            const _moveDirty2 = {
+              minX: Number.POSITIVE_INFINITY,
+              minY: Number.POSITIVE_INFINITY,
+              maxX: Number.NEGATIVE_INFINITY,
+              maxY: Number.NEGATIVE_INFINITY,
+            };
+            while (accdist >= spacingPixels) {
+              const distFromPrev =
+                (stampsPlaced + 1) * spacingPixels - distAccumRef.current;
+              const t = dist > 0 ? distFromPrev / dist : 0;
+              const sx = prev.x + dx * t;
+              const sy = prev.y + dy * t;
+              const interpSize = p1.size + (p2.size - p1.size) * t;
+              const _interpOpacity = p1.opacity + (p2.opacity - p1.opacity) * t;
+              if (sbufCtxMove) {
+                const _scatter = settings.scatter ?? 0;
+                const _sizeJitter = settings.sizeJitter ?? 0;
+                const _stampX = sx + (Math.random() - 0.5) * 2 * _scatter;
+                const _stampY = sy + (Math.random() - 0.5) * 2 * _scatter;
+                const _stampSize =
+                  interpSize * (1 + (Math.random() - 0.5) * _sizeJitter);
+                if (tool === "eraser") {
+                  stampWebGL(
+                    _stampX,
+                    _stampY,
+                    _stampSize,
+                    _interpOpacity,
+                    settings,
+                    settings.rotateMode === "follow"
+                      ? strokeAngle
+                      : (settings.rotation * Math.PI) / 180,
+                    "rgb(255,255,255)",
+                    capAlpha,
+                  );
+                  // Track dirty rect for eraser stamps
+                  const _er = _stampSize / 2;
+                  if (_stampX - _er < _moveDirty2.minX)
+                    _moveDirty2.minX = _stampX - _er;
+                  if (_stampY - _er < _moveDirty2.minY)
+                    _moveDirty2.minY = _stampY - _er;
+                  if (_stampX + _er > _moveDirty2.maxX)
+                    _moveDirty2.maxX = _stampX + _er;
+                  if (_stampY + _er > _moveDirty2.maxY)
+                    _moveDirty2.maxY = _stampY + _er;
+                } else {
+                  stampWebGL(
+                    _stampX,
+                    _stampY,
+                    _stampSize,
+                    _interpOpacity,
+                    settings,
+                    settings.rotateMode === "follow"
+                      ? strokeAngle
+                      : (settings.rotation * Math.PI) / 180,
+                    _moveFillStyle,
+                    capAlpha,
+                  );
+                }
+              }
+              stampsPlaced++;
+              accdist -= spacingPixels;
+            }
+            distAccumRef.current = accdist;
+            // Schedule rAF display update
+            strokeDisplayDirtyRef.current = true;
+            if (!rafPendingRef.current) {
+              rafPendingRef.current = true;
+              requestAnimationFrame(() => {
+                rafPendingRef.current = false;
+                if (strokeDisplayDirtyRef.current) {
+                  strokeDisplayDirtyRef.current = false;
+                  compositeWithStrokePreview(1.0, activeToolRef.current);
+                }
+              });
+            }
+          }
+        } else {
+          const spacingPixels = Math.max(
+            1,
+            (settings.spacing / 100) * effectiveSize,
+          );
+          const strokeAngle = Math.atan2(dy, dx);
+          let accdist = distAccumRef.current + dist;
+          let stampsPlaced = 0;
+          const _moveDirtyNS = {
+            minX: Number.POSITIVE_INFINITY,
+            minY: Number.POSITIVE_INFINITY,
+            maxX: Number.NEGATIVE_INFINITY,
+            maxY: Number.NEGATIVE_INFINITY,
+          };
+          while (accdist >= spacingPixels) {
+            const distFromPrev =
+              (stampsPlaced + 1) * spacingPixels - distAccumRef.current;
+            const t = dist > 0 ? distFromPrev / dist : 0;
+            const sx = prev.x + dx * t;
+            const sy = prev.y + dy * t;
+            {
+              const _scatter = settings.scatter ?? 0;
+              const _sizeJitter = settings.sizeJitter ?? 0;
+              const _stampX = sx + (Math.random() - 0.5) * 2 * _scatter;
+              const _stampY = sy + (Math.random() - 0.5) * 2 * _scatter;
+              const _stampSize =
+                effectiveSize * (1 + (Math.random() - 0.5) * _sizeJitter);
+              if (tool === "eraser") {
+                stampWebGL(
+                  _stampX,
+                  _stampY,
+                  _stampSize,
+                  effectiveOpacity,
+                  settings,
+                  settings.rotateMode === "follow"
+                    ? strokeAngle
+                    : (settings.rotation * Math.PI) / 180,
+                  "rgb(255,255,255)",
+                  capAlpha,
+                );
+                // Track dirty rect for eraser stamps
+                const _erNS = _stampSize / 2;
+                if (_stampX - _erNS < _moveDirtyNS.minX)
+                  _moveDirtyNS.minX = _stampX - _erNS;
+                if (_stampY - _erNS < _moveDirtyNS.minY)
+                  _moveDirtyNS.minY = _stampY - _erNS;
+                if (_stampX + _erNS > _moveDirtyNS.maxX)
+                  _moveDirtyNS.maxX = _stampX + _erNS;
+                if (_stampY + _erNS > _moveDirtyNS.maxY)
+                  _moveDirtyNS.maxY = _stampY + _erNS;
+              } else {
+                stampWebGL(
+                  _stampX,
+                  _stampY,
+                  _stampSize,
+                  effectiveOpacity,
+                  settings,
+                  settings.rotateMode === "follow"
+                    ? strokeAngle
+                    : (settings.rotation * Math.PI) / 180,
+                  _moveFillStyle,
+                  capAlpha,
+                );
+              }
+            }
+            stampsPlaced++;
+            accdist -= spacingPixels;
+          }
+          distAccumRef.current = accdist;
+          // Schedule rAF display update
+          strokeDisplayDirtyRef.current = true;
+          if (!rafPendingRef.current) {
+            rafPendingRef.current = true;
+            requestAnimationFrame(() => {
+              rafPendingRef.current = false;
+              if (strokeDisplayDirtyRef.current) {
+                strokeDisplayDirtyRef.current = false;
+                compositeWithStrokePreview(1.0, activeToolRef.current);
+              }
+            });
+          }
+        }
+      }
+
+      lastPosRef.current = pos;
+      if (!isDrawingRef.current) composite();
+    },
+    [
+      composite,
+      stampDot,
+      stampWebGL,
+      renderBrushSegmentAlongPoints,
+      renderSmearAlongPoints,
+      getActiveSize,
+      compositeWithStrokePreview,
+      applyTransformToDOM,
+    ],
+  );
+
+  const handlePointerUp = useCallback(() => {
+    if (isZoomDraggingRef.current) {
+      isZoomDraggingRef.current = false;
+      setViewTransform({ ...viewTransformRef.current });
+      return;
+    }
+    if (isPanningRef.current) {
+      isPanningRef.current = false;
+      setViewTransform({ ...viewTransformRef.current });
+      return;
+    }
+    if (isRotatingRef.current) {
+      isRotatingRef.current = false;
+      setViewTransform({ ...viewTransformRef.current });
+      return;
+    }
+
+    if (!isDrawingRef.current) return;
+    isDrawingRef.current = false;
+
+    const settings = brushSettingsRef.current;
+    const tool = activeToolRef.current;
+    const layerId = activeLayerIdRef.current;
+    const lc = layerCanvasesRef.current.get(layerId);
+    const buf = strokePointBufferRef.current;
+
+    const _baseOpacity = brushOpacityRef.current;
+    const _upPressure = smoothedPressureRef.current;
+    const _upPressureFactor = settings.pressureOpacity
+      ? settings.minOpacity + (1 - settings.minOpacity) * _upPressure
+      : 1.0;
+    const _upCapAlpha = settings.pressureOpacity
+      ? _upPressureFactor * _baseOpacity
+      : undefined;
+    if (lc && settings.strokeSmoothing > 0 && buf.length >= 3) {
+      const pts = buf.slice(-4);
+      while (pts.length < 4) {
+        pts.push({ ...pts[pts.length - 1] });
+      }
+      const [p0, p1, p2, p3] = pts;
+
+      if (tool === "smear") {
+        const segDist = ptDist(p1, p2);
+        const steps = Math.max(4, Math.ceil(segDist / 1.0));
+        const interpolated = catmullRomPoints(p0, p1, p2, p3, steps);
+        renderSmearAlongPoints(
+          lc,
+          interpolated,
+          getActiveSize(),
+          settings.softness ?? 0,
+        );
+      } else if (tool === "brush" || tool === "eraser") {
+        {
+          const sbufCtxUp = strokeBufferRef.current?.getContext("2d");
+          // Compute fill style independently (sbufCtxUp is null on WebGL canvas)
+          const _colUp = colorRef.current;
+          const [_rUp, _gUp, _bUp] = hsvToRgb(_colUp.h, _colUp.s, _colUp.v);
+          const _upFillStyle =
+            tool === "eraser"
+              ? "rgba(0,0,0,1)"
+              : `rgb(${_rUp},${_gUp},${_bUp})`;
+          if (sbufCtxUp) {
+            sbufCtxUp.fillStyle = _upFillStyle;
+            sbufCtxUp.globalCompositeOperation = "source-over";
+          }
+          const segDist = ptDist(p1, p2);
+          const steps = Math.max(4, Math.ceil(segDist / 1.0));
+          const interpolated = catmullRomPoints(p0, p1, p2, p3, steps);
+          // For WebGL brush path sbufCtxUp is null; provide fake ctx with fillStyle
+          const _upCtx =
+            sbufCtxUp ??
+            ({
+              fillStyle: _upFillStyle,
+            } as unknown as CanvasRenderingContext2D);
+          renderBrushSegmentAlongPoints(
+            _upCtx,
+            interpolated,
+            p1.size,
+            p2.size,
+            p1.opacity,
+            p2.opacity,
+            settings,
+            tool,
+            true,
+            _upCapAlpha,
+          );
+          flushStrokeBuffer(lc, 1.0, tool);
+          composite();
+        }
+      }
+    } else {
+      // Flush stroke buffer for short strokes or no-smoothing mode, then composite
+      if (lc && (tool === "brush" || tool === "eraser")) {
+        flushStrokeBuffer(lc, 1.0, tool);
+      }
+      composite();
+    }
+
+    smoothedPressureRef.current = 0.5;
+    strokePointBufferRef.current = [];
+
+    const before = strokeStartSnapshotRef.current;
+    if (lc && before) {
+      const ctx = lc.getContext("2d");
+      if (ctx) {
+        const after = ctx.getImageData(0, 0, lc.width, lc.height);
+        undoStackRef.current.push({ layerId, before, after });
+        if (undoStackRef.current.length > 50) undoStackRef.current.shift();
+        redoStackRef.current = [];
+        setUndoCount(undoStackRef.current.length);
+        setRedoCount(0);
+      }
+    }
+    strokeStartSnapshotRef.current = null;
+    lastPosRef.current = null;
+
+    const col = colorRef.current;
+    if (activeToolRef.current === "brush") {
+      const [r, g, b] = hsvToRgb(col.h, col.s, col.v);
+      const hex = rgbToHex(r, g, b);
+      setRecentColors((prev) =>
+        [hex, ...prev.filter((c) => c !== hex)].slice(0, 8),
+      );
+    }
+  }, [
+    renderBrushSegmentAlongPoints,
+    renderSmearAlongPoints,
+    getActiveSize,
+    flushStrokeBuffer,
+    composite,
+  ]);
+
+  const handleClear = useCallback(() => {
+    const layerId = activeLayerIdRef.current;
+    const lc = layerCanvasesRef.current.get(layerId);
+    if (!lc) return;
+    const ctx = lc.getContext("2d");
+    if (!ctx) return;
+    const before = ctx.getImageData(0, 0, lc.width, lc.height);
+    ctx.clearRect(0, 0, lc.width, lc.height);
+    const after = ctx.getImageData(0, 0, lc.width, lc.height);
+    undoStackRef.current.push({ layerId, before, after });
+    redoStackRef.current = [];
+    setUndoCount(undoStackRef.current.length);
+    setRedoCount(0);
+    composite();
+  }, [composite]);
+
+  const handleExportBrushes = () => {
+    const data = JSON.stringify(
+      {
+        version: 1,
+        presets: {
+          brush: presets.brush,
+          smear: presets.smear,
+          eraser: presets.eraser,
+        },
+      },
+      null,
+      2,
+    );
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "brushes.hbrush";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportBrushes = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const json = JSON.parse(e.target?.result as string);
+        if (!json.version || !json.presets) throw new Error("Invalid format");
+        const parsed = json.presets as typeof DEFAULT_PRESETS;
+        setImportParsed(parsed);
+        setShowMergeDialog(true);
+      } catch {
+        toast.error("Invalid .hbrush file");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const processImportAppend = (parsed: typeof DEFAULT_PRESETS) => {
+    const merged: typeof DEFAULT_PRESETS = {
+      brush: [...presets.brush],
+      smear: [...presets.smear],
+      eraser: [...presets.eraser],
+    };
+    const conflicts: Array<{
+      toolType: "brush" | "smear" | "eraser";
+      preset: Preset;
+    }> = [];
+    for (const toolType of ["brush", "smear", "eraser"] as const) {
+      for (const incoming of parsed[toolType] || []) {
+        const exists = merged[toolType].some((p) => p.name === incoming.name);
+        if (exists) {
+          conflicts.push({ toolType, preset: incoming });
+        } else {
+          merged[toolType] = [
+            ...merged[toolType],
+            { ...incoming, id: `${toolType}-${Date.now()}-${Math.random()}` },
+          ];
+        }
+      }
+    }
+    if (conflicts.length > 0) {
+      setPendingMerged(merged);
+      setConflictQueue(conflicts.slice(1));
+      setCurrentConflict(conflicts[0]);
+    } else {
+      setPresets(merged);
+      toast.success("Brushes imported successfully!");
+    }
+  };
+
+  const resolveConflict = (action: "overwrite" | "rename" | "skip") => {
+    if (!currentConflict || !pendingMerged) return;
+    const { toolType, preset } = currentConflict;
+    let nextMerged = {
+      ...pendingMerged,
+      [toolType]: [...pendingMerged[toolType]],
+    };
+
+    if (action === "overwrite") {
+      nextMerged[toolType] = nextMerged[toolType].map((p) =>
+        p.name === preset.name ? { ...preset, id: p.id } : p,
+      );
+    } else if (action === "rename") {
+      let suffix = 2;
+      let newName = `${preset.name} ${suffix}`;
+      while (nextMerged[toolType].some((p) => p.name === newName)) {
+        suffix++;
+        newName = `${preset.name} ${suffix}`;
+      }
+      nextMerged[toolType] = [
+        ...nextMerged[toolType],
+        {
+          ...preset,
+          name: newName,
+          id: `${toolType}-${Date.now()}-${Math.random()}`,
+        },
+      ];
+    }
+    // skip: do nothing
+
+    setPendingMerged(nextMerged);
+
+    if (conflictQueue.length > 0) {
+      setCurrentConflict(conflictQueue[0]);
+      setConflictQueue(conflictQueue.slice(1));
+    } else {
+      setPresets(nextMerged);
+      setCurrentConflict(null);
+      setPendingMerged(null);
+      toast.success("Brushes imported successfully!");
+    }
+  };
+
+  const handleExport = useCallback(() => {
+    const display = displayCanvasRef.current;
+    if (!display) return;
+    const exportCanvas = document.createElement("canvas");
+    exportCanvas.width = display.width;
+    exportCanvas.height = display.height;
+    const ctx = exportCanvas.getContext("2d");
+    if (!ctx) return;
+    ctx.fillStyle = backgroundColorRef.current;
+    ctx.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+    ctx.drawImage(display, 0, 0);
+    const link = document.createElement("a");
+    link.href = exportCanvas.toDataURL("image/png");
+    link.download = `painting-${Date.now()}.png`;
+    link.click();
+    toast.success("Exported as PNG!");
+  }, []);
+
+  const handleSave = useCallback(async () => {
+    const display = displayCanvasRef.current;
+    if (!display) return;
+    const exportCanvas = document.createElement("canvas");
+    exportCanvas.width = display.width;
+    exportCanvas.height = display.height;
+    const ctx = exportCanvas.getContext("2d");
+    if (!ctx) return;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+    ctx.drawImage(display, 0, 0);
+    exportCanvas.toBlob((blob) => {
+      if (!blob) return;
+      toast.success("Painting saved!");
+    }, "image/png");
+  }, []);
+
+  const handleRecentColorClick = useCallback((hex: string) => {
+    const rgb = hexToRgb(hex);
+    if (!rgb) return;
+    const [r, g, b] = rgb;
+    const [h, s, v] = rgbToHsv(r, g, b);
+    setColor((prev) => ({ ...prev, h, s, v }));
+  }, []);
+
+  const getCursorStyle = () => {
+    if (isPanningRef.current) return "grabbing";
+    if (zoomLocked || zoomModeRef.current) return "zoom-in";
+    if (rotateLocked || rKeyDownRef.current) return "crosshair";
+    if (spaceDownRef.current) return "grab";
+    if (activeTool === "fill") return "cell";
+    return "crosshair";
+  };
+
+  const handleAddLayer = useCallback(() => {
+    const layer = newLayer();
+    setLayers((prev) => [layer, ...prev]);
+    setActiveLayerId(layer.id);
+  }, []);
+
+  const handleDeleteLayer = useCallback(
+    (id: string) => {
+      if (id === "layer-background") return;
+      setLayers((prev) => {
+        const nonBgLayers = prev.filter((l) => l.id !== "layer-background");
+        if (nonBgLayers.length <= 1) return prev;
+        return prev.filter((l) => l.id !== id);
+      });
+      setActiveLayerId((prev) => {
+        if (prev === id) {
+          const remaining = layers.filter((l) => l.id !== id);
+          return remaining[0]?.id ?? "";
+        }
+        return prev;
+      });
+      layerCanvasesRef.current.delete(id);
+      composite();
+    },
+    [layers, composite],
+  );
+
+  const handleToggleVisible = useCallback((id: string) => {
+    setLayers((prev) =>
+      prev.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)),
+    );
+  }, []);
+
+  const handleSetOpacity = useCallback((id: string, opacity: number) => {
+    setLayers((prev) => prev.map((l) => (l.id === id ? { ...l, opacity } : l)));
+  }, []);
+
+  const handleMoveLayer = useCallback(
+    (id: string, direction: "up" | "down") => {
+      if (id === "layer-background") return;
+      setLayers((prev) => {
+        const idx = prev.findIndex((l) => l.id === id);
+        if (idx === -1) return prev;
+        const next = [...prev];
+        // Prevent moving into background layer position (last)
+        if (direction === "up" && idx > 0) {
+          [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+        } else if (direction === "down" && idx < prev.length - 2) {
+          [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const handleZoomLockToggle = useCallback(() => {
+    setZoomLocked((prev) => {
+      if (!prev) setRotateLocked(false);
+      return !prev;
+    });
+  }, []);
+
+  const handleRotateLockToggle = useCallback(() => {
+    setRotateLocked((prev) => {
+      if (!prev) setZoomLocked(false);
+      return !prev;
+    });
+  }, []);
+
+  const { panX, panY, zoom, rotation } = viewTransform;
+  const isDefaultTransform =
+    panX === 0 && panY === 0 && zoom === 1 && rotation === 0;
+
+  // Current tool's size for BottomBar
+  const currentBrushSize =
+    activeTool === "eraser" ? brushSizes.eraser : brushSizes.brush;
+
+  return (
+    <div className="flex h-screen w-screen bg-background overflow-hidden select-none">
+      {/* Left toolbar */}
+      <Toolbar
+        activeTool={activeTool}
+        onToolChange={(tool) => {
+          setActiveTool(tool);
+          if (
+            activeSubpanel !== null &&
+            (tool === "brush" || tool === "smear" || tool === "eraser")
+          ) {
+            setActiveSubpanel(tool as "brush" | "smear" | "eraser");
+          } else {
+            setActiveSubpanel(null);
+          }
+        }}
+        onToolReselect={(tool) => {
+          if (tool === "brush" || tool === "smear" || tool === "eraser") {
+            setActiveSubpanel((prev) => (prev === tool ? null : tool));
+          }
+        }}
+        zoomLocked={zoomLocked}
+        rotateLocked={rotateLocked}
+        isFlipped={isFlipped}
+        onZoomLockToggle={handleZoomLockToggle}
+        onRotateLockToggle={handleRotateLockToggle}
+        onFlipToggle={() => setIsFlipped((f) => !f)}
+        onAdminOpen={() => setSettingsOpen(true)}
+      />
+
+      {/* Tool Presets subpanel */}
+      {(activeSubpanel === "brush" ||
+        activeSubpanel === "smear" ||
+        activeSubpanel === "eraser") && (
+        <ToolPresetsPanel
+          tool={activeSubpanel}
+          presets={presets[activeSubpanel]}
+          activePresetId={activePresetIds[activeSubpanel] ?? null}
+          currentSettings={brushSettings}
+          onSelectPreset={(preset: Preset) => {
+            setActivePresetIds((prev) => ({
+              ...prev,
+              [activeSubpanel]: preset.id,
+            }));
+            setBrushSettings(preset.settings);
+          }}
+          onUpdatePreset={(updated: Preset) => {
+            setPresets((prev) => ({
+              ...prev,
+              [activeSubpanel]: prev[activeSubpanel].map((p) =>
+                p.id === updated.id ? updated : p,
+              ),
+            }));
+            if (activePresetIds[activeSubpanel] === updated.id) {
+              setBrushSettings(updated.settings);
+            }
+          }}
+          onAddPreset={(tipImageData?: string) => {
+            const newId = `${activeSubpanel}-custom-${Date.now()}`;
+            const newPreset: Preset = {
+              id: newId,
+              name: "New Preset",
+              settings: {
+                ...brushSettings,
+                ...(tipImageData !== undefined ? { tipImageData } : {}),
+              },
+            };
+            setPresets((prev) => ({
+              ...prev,
+              [activeSubpanel]: [...prev[activeSubpanel], newPreset],
+            }));
+            setActivePresetIds((prev) => ({
+              ...prev,
+              [activeSubpanel]: newId,
+            }));
+            setBrushSettings(newPreset.settings);
+          }}
+          onDeletePreset={(presetId: string) => {
+            setPresets((prev) => ({
+              ...prev,
+              [activeSubpanel]: prev[activeSubpanel].filter(
+                (p) => p.id !== presetId,
+              ),
+            }));
+            if (activePresetIds[activeSubpanel] === presetId) {
+              setActivePresetIds((prev) => ({
+                ...prev,
+                [activeSubpanel]: null,
+              }));
+            }
+          }}
+          onActivate={() => {
+            setActiveTool(activeSubpanel as "brush" | "smear" | "eraser");
+          }}
+          onClose={() => setActiveSubpanel(null)}
+        />
+      )}
+
+      {/* Hidden layer canvases */}
+      <div
+        style={{
+          position: "absolute",
+          left: -9999,
+          top: -9999,
+          pointerEvents: "none",
+        }}
+      >
+        {layers.map((layer) => (
+          <canvas
+            key={layer.id}
+            ref={(el) => {
+              if (el) layerCanvasesRef.current.set(layer.id, el);
+              else layerCanvasesRef.current.delete(layer.id);
+            }}
+          />
+        ))}
+      </div>
+
+      {/* Canvas + bottom bar */}
+      <div className="flex flex-col flex-1 min-w-0">
+        <div
+          ref={containerRef}
+          className="flex-1 relative overflow-hidden canvas-workspace-bg"
+          style={{ cursor: getCursorStyle() }}
+        >
+          {/* Transform wrapper with optional horizontal flip */}
+          <div
+            ref={canvasWrapperRef}
+            style={{
+              position: "absolute",
+              width: CANVAS_WIDTH,
+              height: CANVAS_HEIGHT,
+              left: "50%",
+              top: "50%",
+              marginLeft: -CANVAS_WIDTH / 2,
+              marginTop: -CANVAS_HEIGHT / 2,
+              transform: `scaleX(${isFlipped ? -1 : 1}) translate(${panX}px, ${panY}px) rotate(${rotation}deg) scale(${zoom})`,
+              transformOrigin: "center center",
+              backgroundImage:
+                "linear-gradient(45deg, #ccc 25%, transparent 25%), linear-gradient(-45deg, #ccc 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #ccc 75%), linear-gradient(-45deg, transparent 75%, #ccc 75%)",
+              backgroundSize: "16px 16px",
+              backgroundPosition: "0 0, 0 8px, 8px -8px, -8px 0px",
+              backgroundColor: "#fff",
+              boxShadow:
+                "0 0 0 1px rgba(0,0,0,0.25), 0 8px 32px rgba(0,0,0,0.4)",
+            }}
+          >
+            <canvas
+              ref={displayCanvasRef}
+              data-ocid="canvas.canvas_target"
+              style={{
+                display: "block",
+                width: "100%",
+                height: "100%",
+                touchAction: "none",
+              }}
+              onPointerDown={handlePointerDown}
+              onPointerMove={handlePointerMove}
+              onPointerUp={handlePointerUp}
+              onPointerLeave={handlePointerUp}
+            />
+          </div>
+
+          {/* View HUD */}
+          <div
+            data-ocid="canvas.panel"
+            style={{
+              position: "absolute",
+              bottom: 12,
+              left: 12,
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              background: "rgba(0,0,0,0.55)",
+              backdropFilter: "blur(6px)",
+              borderRadius: 6,
+              padding: "4px 8px",
+              fontSize: 11,
+              color: "rgba(255,255,255,0.85)",
+              fontFamily: "monospace",
+              pointerEvents: "auto",
+              userSelect: "none",
+              zIndex: 10,
+            }}
+          >
+            <span title="Zoom: Ctrl+Space drag or scroll">
+              {Math.round(zoom * 100)}%
+            </span>
+            <span style={{ opacity: 0.4 }}>|</span>
+            <span title="Rotation: R + drag">{Math.round(rotation)}°</span>
+            {isFlipped && (
+              <>
+                <span style={{ opacity: 0.4 }}>|</span>
+                <span style={{ color: "rgba(255,200,100,0.9)" }}>Flipped</span>
+              </>
+            )}
+            {!isDefaultTransform && (
+              <>
+                <span style={{ opacity: 0.4 }}>|</span>
+                <button
+                  type="button"
+                  data-ocid="canvas.reset_button"
+                  onClick={resetView}
+                  title="Reset view (press 0)"
+                  style={{
+                    background: "rgba(255,255,255,0.15)",
+                    border: "none",
+                    borderRadius: 4,
+                    color: "rgba(255,255,255,0.9)",
+                    cursor: "pointer",
+                    fontSize: 11,
+                    padding: "1px 6px",
+                    fontFamily: "monospace",
+                  }}
+                >
+                  ⌂ Reset
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        <BottomBar
+          brushSize={currentBrushSize}
+          brushOpacity={color.a}
+          brushFlow={brushSettings.flow ?? 1}
+          activeTool={activeTool}
+          onBrushSizeChange={(v) =>
+            setBrushSizes((prev) => ({
+              ...prev,
+              [activeTool === "eraser" ? "eraser" : "brush"]: v,
+            }))
+          }
+          onBrushOpacityChange={(v) => setColor((prev) => ({ ...prev, a: v }))}
+          onBrushFlowChange={(v) =>
+            setBrushSettings((prev) => ({ ...prev, flow: v }))
+          }
+          canUndo={undoCount > 0}
+          canRedo={redoCount > 0}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
+          onClear={handleClear}
+          onExport={handleExport}
+          onSave={handleSave}
+        />
+      </div>
+
+      {/* Right panel */}
+      <div
+        className="flex flex-col border-l border-border bg-card overflow-hidden"
+        style={{ width: 220, minWidth: 220 }}
+      >
+        <ColorPickerPanel
+          color={color}
+          onColorChange={setColor}
+          recentColors={recentColors}
+          onRecentColorClick={handleRecentColorClick}
+        />
+        <LayersPanel
+          layers={layers}
+          activeLayerId={activeLayerId}
+          onSetActive={setActiveLayerId}
+          onToggleVisible={handleToggleVisible}
+          onSetOpacity={handleSetOpacity}
+          onAddLayer={handleAddLayer}
+          onDeleteLayer={handleDeleteLayer}
+          onMoveLayer={handleMoveLayer}
+          onClearLayer={handleClear}
+          backgroundColor={backgroundColor}
+          onBackgroundColorChange={setBackgroundColor}
+          backgroundLayerId="layer-background"
+        />
+      </div>
+
+      {/* Settings Panel */}
+      <SettingsPanel
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onExportBrushes={handleExportBrushes}
+        onImportBrushes={handleImportBrushes}
+      />
+
+      {/* Merge Strategy Dialog */}
+      <AlertDialog open={showMergeDialog} onOpenChange={setShowMergeDialog}>
+        <AlertDialogContent data-ocid="settings.dialog">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Import Brushes</AlertDialogTitle>
+            <AlertDialogDescription>
+              How would you like to merge the imported brushes with your current
+              presets?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel data-ocid="settings.cancel_button">
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              data-ocid="settings.secondary_button"
+              onClick={() => {
+                setShowMergeDialog(false);
+                if (importParsed) processImportAppend(importParsed);
+              }}
+            >
+              Append
+            </AlertDialogAction>
+            <AlertDialogAction
+              data-ocid="settings.primary_button"
+              onClick={() => {
+                setShowMergeDialog(false);
+                if (importParsed) {
+                  const merged: typeof DEFAULT_PRESETS = {
+                    brush: importParsed.brush || [],
+                    smear: importParsed.smear || [],
+                    eraser: importParsed.eraser || [],
+                  };
+                  setPresets(merged);
+                  toast.success("Brushes replaced successfully!");
+                }
+              }}
+            >
+              Replace All
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Conflict Resolution Dialog */}
+      <AlertDialog
+        open={!!currentConflict}
+        onOpenChange={(open) => {
+          if (!open) {
+            setCurrentConflict(null);
+            setPendingMerged(null);
+            setConflictQueue([]);
+          }
+        }}
+      >
+        <AlertDialogContent data-ocid="settings.conflict_dialog">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Brush Conflict</AlertDialogTitle>
+            <AlertDialogDescription>
+              A brush named &ldquo;{currentConflict?.preset.name}&rdquo; already
+              exists. What would you like to do?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel
+              data-ocid="settings.conflict_cancel_button"
+              onClick={() => resolveConflict("skip")}
+            >
+              Skip
+            </AlertDialogCancel>
+            <AlertDialogAction
+              data-ocid="settings.conflict_rename_button"
+              onClick={() => resolveConflict("rename")}
+            >
+              Rename
+            </AlertDialogAction>
+            <AlertDialogAction
+              data-ocid="settings.conflict_overwrite_button"
+              onClick={() => resolveConflict("overwrite")}
+            >
+              Overwrite
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}
