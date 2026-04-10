@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+
 import {
   Dialog,
   DialogContent,
@@ -7,15 +8,21 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+
 import { Label } from "@/components/ui/label";
+
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+
 import { ScrollArea } from "@/components/ui/scroll-area";
+
 import { Slider } from "@/components/ui/slider";
+
 import { Switch } from "@/components/ui/switch";
+
 import {
   ChevronDown,
   ChevronRight,
@@ -26,6 +33,7 @@ import {
   Spline,
   Square,
 } from "lucide-react";
+
 import React, { useCallback, useEffect, useRef, useState } from "react";
 
 export interface BrushSettings {
@@ -40,8 +48,12 @@ export interface BrushSettings {
   rotateMode: "fixed" | "follow";
   softness: number;
   strokeSmoothing: number;
+  stabilizationMode: "basic" | "smooth" | "elastic" | "smooth+elastic";
+  smoothStrength: number;
+  elasticStrength: number;
   minSize: number;
   minOpacity: number;
+  pressureCurve: number;
   smearStrength: number;
   pressureStrength: boolean;
   minStrength: number;
@@ -58,7 +70,6 @@ export interface BrushSettings {
   dualTipSpacing: number;
   dualTipSizeJitter: number;
   dualTipRotationJitter: number;
-  dualTipColorJitter: number;
 }
 
 export const DEFAULT_BRUSH_SETTINGS: BrushSettings = {
@@ -73,8 +84,12 @@ export const DEFAULT_BRUSH_SETTINGS: BrushSettings = {
   rotateMode: "fixed",
   softness: 0,
   strokeSmoothing: 10,
+  stabilizationMode: "basic",
+  smoothStrength: 5,
+  elasticStrength: 20,
   minSize: 0,
   minOpacity: 0,
+  pressureCurve: 2.0,
   smearStrength: 0.8,
   pressureStrength: false,
   minStrength: 0,
@@ -90,15 +105,14 @@ export const DEFAULT_BRUSH_SETTINGS: BrushSettings = {
   dualTipSpacing: 5,
   dualTipSizeJitter: 0,
   dualTipRotationJitter: 0,
-  dualTipColorJitter: 0,
 };
 
-interface BrushSettingsPanelProps {
+type BrushSettingsPanelProps = {
   brushSettings: BrushSettings;
   onBrushSettingsChange: (settings: BrushSettings) => void;
   availableTips?: { id: string; name: string; tipImageData?: string }[];
   activeTool?: string;
-}
+};
 
 type ScratchpadTool = "draw" | "erase" | "lasso" | "gradient";
 type GradientMode = "linear" | "radial";
@@ -124,7 +138,6 @@ export function ScratchpadDialog({
   const lassoPointsRef = useRef<{ x: number; y: number }[]>([]);
   const gradientStartRef = useRef<{ x: number; y: number } | null>(null);
   const lastDrawPosRef = useRef<{ x: number; y: number } | null>(null);
-
   const clearScratchpad = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -133,7 +146,6 @@ export function ScratchpadDialog({
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, 128, 128);
   }, []);
-
   const clearOverlay = useCallback(() => {
     const overlay = overlayCanvasRef.current;
     if (!overlay) return;
@@ -141,13 +153,11 @@ export function ScratchpadDialog({
     if (!ctx) return;
     ctx.clearRect(0, 0, overlay.width, overlay.height);
   }, []);
-
   useEffect(() => {
     if (open) {
       setTimeout(() => clearScratchpad(), 10);
     }
   }, [open, clearScratchpad]);
-
   const getCanvasPos = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
@@ -185,7 +195,6 @@ export function ScratchpadDialog({
     e.currentTarget.setPointerCapture(e.pointerId);
     isDrawingRef.current = true;
     const pos = getCanvasPos(e);
-
     if (activeTool === "draw" || activeTool === "erase") {
       lastDrawPosRef.current = null;
       drawAt(e);
@@ -198,15 +207,27 @@ export function ScratchpadDialog({
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!isDrawingRef.current) return;
-
-    if (activeTool === "draw" || activeTool === "erase") {
-      lastDrawPosRef.current = null;
-      drawAt(e);
-    } else if (activeTool === "lasso") {
-      const pos = getCanvasPos(e);
-      lassoPointsRef.current.push(pos);
-      drawLassoOverlay(lassoPointsRef.current, lassoMode);
+    const coalescedEvents = e.nativeEvent.getCoalescedEvents?.() ?? [
+      e.nativeEvent,
+    ];
+    for (const evt of coalescedEvents) {
+      const syntheticLike = {
+        ...e,
+        clientX: evt.clientX,
+        clientY: evt.clientY,
+      };
+      if (activeTool === "draw" || activeTool === "erase") {
+        lastDrawPosRef.current = null;
+        drawAt(syntheticLike as React.PointerEvent<HTMLCanvasElement>);
+      } else if (activeTool === "lasso") {
+        const pos = getCanvasPos(
+          syntheticLike as React.PointerEvent<HTMLCanvasElement>,
+        );
+        lassoPointsRef.current.push(pos);
+      }
     }
+    if (activeTool === "lasso")
+      drawLassoOverlay(lassoPointsRef.current, lassoMode);
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -218,7 +239,6 @@ export function ScratchpadDialog({
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-
     if (activeTool === "lasso") {
       const pts = lassoPointsRef.current;
       clearOverlay();
@@ -240,12 +260,10 @@ export function ScratchpadDialog({
       const dx = pos.x - start.x;
       const dy = pos.y - start.y;
       const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-
       const tempCanvas = document.createElement("canvas");
       tempCanvas.width = canvas.width;
       tempCanvas.height = canvas.height;
       const tempCtx = tempCanvas.getContext("2d")!;
-
       let grad: CanvasGradient;
       if (gradientMode === "radial") {
         grad = tempCtx.createRadialGradient(
@@ -263,7 +281,6 @@ export function ScratchpadDialog({
       grad.addColorStop(1, "rgba(0,0,0,0)");
       tempCtx.fillStyle = grad;
       tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
-
       ctx.save();
       ctx.globalCompositeOperation = "source-over";
       ctx.drawImage(tempCanvas, 0, 0);
@@ -284,7 +301,6 @@ export function ScratchpadDialog({
     ctx.lineWidth = scratchpadSize * 2;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-
     const last = lastDrawPosRef.current;
     if (last) {
       ctx.beginPath();
@@ -384,7 +400,6 @@ export function ScratchpadDialog({
       label: "Oval",
     },
   ];
-
   const defaultTrigger = (
     <Button
       type="button"
@@ -396,14 +411,15 @@ export function ScratchpadDialog({
       Draw Tip
     </Button>
   );
-
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={setOpen} modal={false}>
       <DialogTrigger asChild>{trigger ?? defaultTrigger}</DialogTrigger>
+
       <DialogContent data-ocid="brush_settings.tip_dialog" className="max-w-sm">
         <DialogHeader>
           <DialogTitle className="text-sm">Draw Brush Tip</DialogTitle>
         </DialogHeader>
+
         <div className="flex flex-col items-center gap-3">
           <p className="text-xs text-muted-foreground text-center">
             Draw black shapes to paint, white to erase.
@@ -454,6 +470,7 @@ export function ScratchpadDialog({
             <Label className="text-xs text-muted-foreground shrink-0 w-8">
               Size
             </Label>
+
             <Slider
               data-ocid="scratchpad.size_slider"
               min={2}
@@ -463,6 +480,7 @@ export function ScratchpadDialog({
               onValueChange={([v]) => setScratchpadSize(v)}
               className="flex-1"
             />
+
             <span className="text-xs text-muted-foreground w-5 text-right">
               {scratchpadSize}
             </span>
@@ -482,6 +500,7 @@ export function ScratchpadDialog({
               >
                 Fill
               </button>
+
               <button
                 type="button"
                 data-ocid="scratchpad.lasso_erase.toggle"
@@ -511,6 +530,7 @@ export function ScratchpadDialog({
               >
                 Linear
               </button>
+
               <button
                 type="button"
                 data-ocid="scratchpad.gradient_radial.toggle"
@@ -542,6 +562,7 @@ export function ScratchpadDialog({
               onPointerUp={handlePointerUp}
               onPointerLeave={handlePointerUp}
             />
+
             <canvas
               ref={overlayCanvasRef}
               width={128}
@@ -551,6 +572,7 @@ export function ScratchpadDialog({
             />
           </div>
         </div>
+
         <DialogFooter className="flex gap-2 sm:justify-between">
           <Button
             type="button"
@@ -560,6 +582,7 @@ export function ScratchpadDialog({
           >
             Clear
           </Button>
+
           <div className="flex gap-2">
             <Button
               type="button"
@@ -570,6 +593,7 @@ export function ScratchpadDialog({
             >
               Cancel
             </Button>
+
             <Button
               type="button"
               size="sm"
@@ -606,6 +630,7 @@ function SliderRow({
   ocid: string;
 }) {
   const [inputVal, setInputVal] = React.useState(String(value));
+
   React.useEffect(() => {
     setInputVal(String(value));
   }, [value]);
@@ -652,28 +677,30 @@ function SliderRow({
   );
 }
 
-// Collapsible subpanel header
-function SubpanelHeader({
+// Collapsible section
+function CollapsibleSection({
   title,
-  open,
-  onToggle,
-  ocid,
-}: {
-  title: string;
-  open: boolean;
-  onToggle: () => void;
-  ocid: string;
-}) {
+  children,
+}: { title: string; children: React.ReactNode }) {
+  const [open, setOpen] = useState(false);
   return (
-    <button
-      type="button"
-      data-ocid={ocid}
-      onClick={onToggle}
-      className="flex items-center justify-between w-full py-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
-    >
-      <span>{title}</span>
-      {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-    </button>
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-1.5 w-full border-t border-border/60 mt-2 pt-2 cursor-pointer group"
+      >
+        {open ? (
+          <ChevronDown className="w-3 h-3 text-muted-foreground group-hover:text-foreground transition-colors" />
+        ) : (
+          <ChevronRight className="w-3 h-3 text-muted-foreground group-hover:text-foreground transition-colors" />
+        )}
+        <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground group-hover:text-foreground transition-colors">
+          {title}
+        </span>
+      </button>
+      {open && <div className="mt-2">{children}</div>}
+    </div>
   );
 }
 
@@ -693,6 +720,9 @@ export function BrushSettingsPanel({
     rotateMode,
     softness,
     strokeSmoothing,
+    stabilizationMode,
+    smoothStrength,
+    elasticStrength,
     minSize,
     minOpacity,
     scatter,
@@ -708,25 +738,19 @@ export function BrushSettingsPanel({
     dualTipSpacing,
     dualTipSizeJitter,
     dualTipRotationJitter,
-    dualTipColorJitter,
     smearStrength,
     pressureStrength,
     minStrength,
     pressureFlow,
     minFlow,
   } = brushSettings;
-  const isSmear = parentActiveTool === "smear";
+
+  const isSmudge = parentActiveTool === "smudge";
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dualFileInputRef = useRef<HTMLInputElement>(null);
   const [tipPickerOpen, setTipPickerOpen] = useState(false);
-  const [dualSectionOpen, setDualSectionOpen] = useState(false);
   const [dualTipPickerOpen, setDualTipPickerOpen] = useState(false);
-
-  // Subpanel open states — all open by default
-  const [brushTipOpen, setBrushTipOpen] = useState(true);
-  const [pressureOpen, setPressureOpen] = useState(true);
-  const [noiseOpen, setNoiseOpen] = useState(true);
 
   const update = (partial: Partial<BrushSettings>) =>
     onBrushSettingsChange({ ...brushSettings, ...partial });
@@ -791,195 +815,183 @@ export function BrushSettingsPanel({
         Brush
       </span>
 
-      {/* ── Subpanel 1: Brush Tip ── */}
-      <div className="flex flex-col min-w-0">
-        <SubpanelHeader
-          title="Brush Tip"
-          open={brushTipOpen}
-          onToggle={() => setBrushTipOpen((o) => !o)}
-          ocid="brush_settings.brush_tip_panel.toggle"
-        />
-        {brushTipOpen && (
-          <div className="flex flex-col gap-2 pt-0.5 pl-1 border-l border-border/40 ml-1 mb-2">
-            {/* Tip image picker */}
-            <div className="flex items-center gap-2">
-              {thumbnailClickable ? (
-                <Popover open={tipPickerOpen} onOpenChange={setTipPickerOpen}>
-                  <PopoverTrigger asChild>{thumbnailEl}</PopoverTrigger>
-                  <PopoverContent
-                    data-ocid="brush_settings.tip_picker.popover"
-                    className="w-64 p-3"
-                    side="right"
-                    align="start"
-                  >
-                    <p className="text-xs font-semibold mb-2">Choose Tip</p>
-                    <ScrollArea className="max-h-48">
-                      <div className="grid grid-cols-3 gap-2 pr-1">
-                        {availableTips.map((tip, idx) => (
-                          <button
-                            key={tip.id}
-                            type="button"
-                            data-ocid={`brush_settings.tip_picker.item.${idx + 1}`}
-                            title={tip.name}
-                            onClick={() => {
-                              update({ tipImageData: tip.tipImageData });
-                              setTipPickerOpen(false);
-                            }}
-                            className="flex flex-col items-center gap-1 group"
-                          >
-                            <div
-                              className="w-14 h-14 rounded border border-border overflow-hidden transition-all group-hover:border-primary group-hover:scale-105"
-                              style={{ background: "#1a1a1a" }}
-                            >
-                              {tip.tipImageData ? (
-                                <img
-                                  src={tip.tipImageData}
-                                  alt={tip.name}
-                                  className="w-full h-full object-cover"
-                                  style={{ imageRendering: "pixelated" }}
-                                />
-                              ) : (
-                                <div className="w-full h-full flex items-center justify-center">
-                                  <div className="w-8 h-8 rounded-full bg-white opacity-80" />
-                                </div>
-                              )}
-                            </div>
-                            <span className="text-[10px] text-muted-foreground truncate w-full text-center">
-                              {tip.name}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    </ScrollArea>
-                  </PopoverContent>
-                </Popover>
-              ) : (
-                thumbnailEl
-              )}
-              <div className="flex gap-1 flex-1 flex-col">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  data-ocid="brush_settings.upload_tip_button"
-                  className="w-full text-xs h-7"
-                  onClick={() => fileInputRef.current?.click()}
+      {/* ─────────── Section: Tip ─────────── */}
+      <CollapsibleSection title="Tip">
+        <div className="flex flex-col gap-2">
+          {/* Tip image picker */}
+          <div className="flex items-center gap-2">
+            {thumbnailClickable ? (
+              <Popover open={tipPickerOpen} onOpenChange={setTipPickerOpen}>
+                <PopoverTrigger asChild>{thumbnailEl}</PopoverTrigger>
+                <PopoverContent
+                  data-ocid="brush_settings.tip_picker.popover"
+                  className="w-64 p-3"
+                  side="right"
+                  align="start"
                 >
-                  Upload
-                </Button>
-                <ScratchpadDialog
-                  onSave={(dataUrl) => update({ tipImageData: dataUrl })}
-                />
-              </div>
-            </div>
-            {tipImageData && (
+                  <p className="text-xs font-semibold mb-2">Choose Tip</p>
+                  <ScrollArea className="max-h-48">
+                    <div className="grid grid-cols-3 gap-2 pr-1">
+                      {availableTips.map((tip, idx) => (
+                        <button
+                          key={tip.id}
+                          type="button"
+                          data-ocid={`brush_settings.tip_picker.item.${idx + 1}`}
+                          title={tip.name}
+                          onClick={() => {
+                            update({ tipImageData: tip.tipImageData });
+                            setTipPickerOpen(false);
+                          }}
+                          className="flex flex-col items-center gap-1 group"
+                        >
+                          <div
+                            className="w-14 h-14 rounded border border-border overflow-hidden transition-all group-hover:border-primary group-hover:scale-105"
+                            style={{ background: "#1a1a1a" }}
+                          >
+                            {tip.tipImageData ? (
+                              <img
+                                src={tip.tipImageData}
+                                alt={tip.name}
+                                className="w-full h-full object-cover"
+                                style={{ imageRendering: "pixelated" }}
+                              />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center">
+                                <div className="w-8 h-8 rounded-full bg-white opacity-80" />
+                              </div>
+                            )}
+                          </div>
+                          <span className="text-[10px] text-muted-foreground truncate w-full text-center">
+                            {tip.name}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                </PopoverContent>
+              </Popover>
+            ) : (
+              thumbnailEl
+            )}
+            <div className="flex gap-1 flex-1 flex-col">
               <Button
                 type="button"
-                variant="ghost"
+                variant="outline"
                 size="sm"
-                data-ocid="brush_settings.clear_tip_button"
-                className="text-xs h-6 text-destructive hover:text-destructive w-full"
-                onClick={() => update({ tipImageData: undefined })}
+                data-ocid="brush_settings.upload_tip_button"
+                className="w-full text-xs h-7"
+                onClick={() => fileInputRef.current?.click()}
               >
-                Clear Tip
+                Upload
               </Button>
-            )}
-
-            {/* Softness */}
-            <SliderRow
-              label="Softness"
-              value={Math.round(softness * 100)}
-              min={0}
-              max={100}
-              step={1}
-              display={`${Math.round(softness * 100)}%`}
-              onChange={(v) => update({ softness: v / 100 })}
-              ocid="brush_settings.softness_slider"
-            />
-
-            {/* Spacing */}
-            <SliderRow
-              label="Spacing"
-              value={spacing}
-              min={1}
-              max={200}
-              step={1}
-              display={`${spacing}%`}
-              onChange={(v) => update({ spacing: v })}
-              ocid="brush_settings.spacing_slider"
-            />
-            {/* Count */}
-            <SliderRow
-              label="Count"
-              value={count ?? 1}
-              min={1}
-              max={10}
-              step={0.1}
-              display={`${(count ?? 1).toFixed(1)}x`}
-              onChange={(v) => update({ count: v })}
-              ocid="brush_settings.count_slider"
-            />
-
-            {/* Rotation */}
-            <div className="flex flex-col gap-1 min-w-0 w-full">
-              <div className="flex items-center justify-between min-w-0">
-                <Label className="text-xs text-muted-foreground">
-                  Rotation
-                </Label>
-                <span className="text-xs text-muted-foreground">
-                  {rotation}°
-                </span>
-              </div>
-              <Slider
-                data-ocid="brush_settings.rotation_slider"
-                min={0}
-                max={360}
-                step={1}
-                value={[rotation]}
-                onValueChange={([v]) => update({ rotation: v })}
-                className="w-full"
+              <ScratchpadDialog
+                onSave={(dataUrl) => update({ tipImageData: dataUrl })}
               />
-              <div className="flex gap-1 mt-0.5">
-                <button
-                  type="button"
-                  data-ocid="brush_settings.rotate_fixed_button"
-                  onClick={() => update({ rotateMode: "fixed" })}
-                  className={`flex-1 text-[10px] py-1 rounded transition-all duration-100 ${
-                    rotateMode === "fixed"
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
-                  }`}
-                >
-                  Fixed
-                </button>
-                <button
-                  type="button"
-                  data-ocid="brush_settings.rotate_follow_button"
-                  onClick={() => update({ rotateMode: "follow" })}
-                  className={`flex-1 text-[10px] py-1 rounded transition-all duration-100 ${
-                    rotateMode === "follow"
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
-                  }`}
-                >
-                  Follow Stroke
-                </button>
-              </div>
             </div>
+          </div>
 
-            {/* Smoothing */}
-            <SliderRow
-              label="Smoothing"
-              value={strokeSmoothing}
+          {tipImageData && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              data-ocid="brush_settings.clear_tip_button"
+              className="text-xs h-6 text-destructive hover:text-destructive w-full"
+              onClick={() => update({ tipImageData: undefined })}
+            >
+              Clear Tip
+            </Button>
+          )}
+
+          <SliderRow
+            label="Softness"
+            value={Math.round(softness * 100)}
+            min={0}
+            max={100}
+            step={1}
+            display={`${Math.round(softness * 100)}%`}
+            onChange={(v) => update({ softness: v / 100 })}
+            ocid="brush_settings.softness_slider"
+          />
+
+          <SliderRow
+            label="Spacing"
+            value={spacing}
+            min={1}
+            max={200}
+            step={1}
+            display={`${spacing}%`}
+            onChange={(v) => update({ spacing: v })}
+            ocid="brush_settings.spacing_slider"
+          />
+
+          <SliderRow
+            label="Count"
+            value={count ?? 1}
+            min={1}
+            max={10}
+            step={0.1}
+            display={`${(count ?? 1).toFixed(1)}x`}
+            onChange={(v) => update({ count: v })}
+            ocid="brush_settings.count_slider"
+          />
+
+          <SliderRow
+            label="Scatter"
+            value={scatter}
+            min={0}
+            max={100}
+            step={1}
+            display={`${scatter}px`}
+            onChange={(v) => update({ scatter: v })}
+            ocid="brush_settings.scatter_slider"
+          />
+
+          {/* Rotation */}
+          <div className="flex flex-col gap-1 min-w-0 w-full">
+            <div className="flex items-center justify-between min-w-0">
+              <Label className="text-xs text-muted-foreground">Rotation</Label>
+              <span className="text-xs text-muted-foreground">{rotation}°</span>
+            </div>
+            <Slider
+              data-ocid="brush_settings.rotation_slider"
               min={0}
-              max={100}
+              max={360}
               step={1}
-              display={`${strokeSmoothing}`}
-              onChange={(v) => update({ strokeSmoothing: v })}
-              ocid="brush_settings.smoothing_slider"
+              value={[rotation]}
+              onValueChange={([v]) => update({ rotation: v })}
+              className="w-full"
             />
+            <div className="flex gap-1 mt-0.5">
+              <button
+                type="button"
+                data-ocid="brush_settings.rotate_fixed_button"
+                onClick={() => update({ rotateMode: "fixed" })}
+                className={`flex-1 text-[10px] py-1 rounded transition-all duration-100 ${
+                  rotateMode === "fixed"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                }`}
+              >
+                Fixed
+              </button>
+              <button
+                type="button"
+                data-ocid="brush_settings.rotate_follow_button"
+                onClick={() => update({ rotateMode: "follow" })}
+                className={`flex-1 text-[10px] py-1 rounded transition-all duration-100 ${
+                  rotateMode === "follow"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                }`}
+              >
+                Follow Stroke
+              </button>
+            </div>
+          </div>
 
-            {/* Flow */}
+          {/* Flow (hidden for smear tool) */}
+          {!isSmudge && (
             <SliderRow
               label="Flow"
               value={Math.round((flow ?? 1.0) * 100)}
@@ -990,209 +1002,487 @@ export function BrushSettingsPanel({
               onChange={(v) => update({ flow: v / 100 })}
               ocid="brush_settings.flow_slider"
             />
+          )}
 
-            {/* Strength (smear tool only) */}
-            {isSmear && (
+          {/* Strength (smudge tool only) */}
+          {isSmudge && (
+            <SliderRow
+              label="Strength"
+              value={Math.round((smearStrength ?? 0.8) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              display={`${Math.round((smearStrength ?? 0.8) * 100)}%`}
+              onChange={(v) => update({ smearStrength: v / 100 })}
+              ocid="brush_settings.smudge_strength_slider"
+            />
+          )}
+        </div>
+      </CollapsibleSection>
+
+      {/* ─────────── Section: Texture ─────────── */}
+      <CollapsibleSection title="Texture">
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <Label
+              className="text-xs text-muted-foreground cursor-pointer"
+              htmlFor="dual-tip-enabled"
+            >
+              Enable Texture
+            </Label>
+            <Switch
+              id="dual-tip-enabled"
+              data-ocid="brush_settings.dual_tip_enabled_switch"
+              checked={dualTipEnabled}
+              onCheckedChange={(v) => update({ dualTipEnabled: v })}
+            />
+          </div>
+
+          {dualTipEnabled && (
+            <>
+              <div className="flex flex-col gap-1.5">
+                <Label className="text-xs text-muted-foreground">
+                  Brush Texture
+                </Label>
+                <div className="flex items-center gap-2">
+                  {availableTips && availableTips.length > 0 ? (
+                    <Popover
+                      open={dualTipPickerOpen}
+                      onOpenChange={setDualTipPickerOpen}
+                    >
+                      <PopoverTrigger asChild>
+                        <div
+                          data-ocid="brush_settings.dual_tip_thumbnail"
+                          className="w-12 h-12 rounded border border-border flex-shrink-0 overflow-hidden cursor-pointer hover:border-primary hover:scale-105 transition-all"
+                          style={{ background: "#1a1a1a" }}
+                          title="Click to change secondary brush tip"
+                        >
+                          {dualTipImageData ? (
+                            <img
+                              src={dualTipImageData}
+                              alt="Dual tip"
+                              className="w-full h-full object-cover"
+                              style={{ imageRendering: "pixelated" }}
+                            />
+                          ) : (
+                            <div className="w-full h-full flex items-center justify-center">
+                              <div className="w-7 h-7 rounded-full bg-white opacity-40" />
+                            </div>
+                          )}
+                        </div>
+                      </PopoverTrigger>
+                      <PopoverContent
+                        data-ocid="brush_settings.dual_tip_picker.popover"
+                        className="w-64 p-3"
+                        side="right"
+                        align="start"
+                      >
+                        <p className="text-xs font-semibold mb-2">
+                          Choose Brush Texture
+                        </p>
+                        <ScrollArea className="max-h-48">
+                          <div className="grid grid-cols-3 gap-2 pr-1">
+                            {availableTips.map((tip, idx) => (
+                              <button
+                                key={tip.id}
+                                type="button"
+                                data-ocid={`brush_settings.dual_tip_picker.item.${idx + 1}`}
+                                title={tip.name}
+                                onClick={() => {
+                                  update({
+                                    dualTipImageData: tip.tipImageData,
+                                  });
+                                  setDualTipPickerOpen(false);
+                                }}
+                                className="flex flex-col items-center gap-1 group"
+                              >
+                                <div
+                                  className="w-14 h-14 rounded border border-border overflow-hidden transition-all group-hover:border-primary group-hover:scale-105"
+                                  style={{ background: "#1a1a1a" }}
+                                >
+                                  {tip.tipImageData ? (
+                                    <img
+                                      src={tip.tipImageData}
+                                      alt={tip.name}
+                                      className="w-full h-full object-cover"
+                                      style={{ imageRendering: "pixelated" }}
+                                    />
+                                  ) : (
+                                    <div className="w-full h-full flex items-center justify-center">
+                                      <div className="w-8 h-8 rounded-full bg-white opacity-80" />
+                                    </div>
+                                  )}
+                                </div>
+                                <span className="text-[10px] text-muted-foreground truncate w-full text-center">
+                                  {tip.name}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        </ScrollArea>
+                      </PopoverContent>
+                    </Popover>
+                  ) : (
+                    <div
+                      data-ocid="brush_settings.dual_tip_thumbnail"
+                      className="w-12 h-12 rounded border border-border flex-shrink-0 overflow-hidden"
+                      style={{ background: "#1a1a1a" }}
+                    >
+                      {dualTipImageData ? (
+                        <img
+                          src={dualTipImageData}
+                          alt="Dual tip"
+                          className="w-full h-full object-cover"
+                          style={{ imageRendering: "pixelated" }}
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center">
+                          <div className="w-7 h-7 rounded-full bg-white opacity-40" />
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="flex gap-1 flex-1 flex-col">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      data-ocid="brush_settings.dual_upload_tip_button"
+                      className="w-full text-xs h-7"
+                      onClick={() => dualFileInputRef.current?.click()}
+                    >
+                      Upload
+                    </Button>
+                    <ScratchpadDialog
+                      onSave={(dataUrl) =>
+                        update({ dualTipImageData: dataUrl })
+                      }
+                      trigger={
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="flex-1 text-xs h-7 w-full"
+                        >
+                          Draw Tip
+                        </Button>
+                      }
+                    />
+                  </div>
+                </div>
+
+                {dualTipImageData && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    data-ocid="brush_settings.clear_dual_tip_button"
+                    className="text-xs h-6 text-destructive hover:text-destructive w-full"
+                    onClick={() => update({ dualTipImageData: undefined })}
+                  >
+                    Clear Brush Texture
+                  </Button>
+                )}
+              </div>
+
+              {/* Blend Mode */}
+              <div className="flex flex-col gap-1 min-w-0 w-full">
+                <Label className="text-xs text-muted-foreground">
+                  Blend Mode
+                </Label>
+                <select
+                  data-ocid="brush_settings.dual_blend_mode_select"
+                  value={dualTipBlendMode}
+                  onChange={(e) =>
+                    update({
+                      dualTipBlendMode: e.target
+                        .value as BrushSettings["dualTipBlendMode"],
+                    })
+                  }
+                  className="w-full text-xs rounded border border-border bg-background px-2 py-1 h-7 focus:outline-none focus:ring-1 focus:ring-primary"
+                >
+                  <option value="multiply">Multiply</option>
+                  <option value="screen">Screen</option>
+                  <option value="overlay">Overlay</option>
+                  <option value="darken">Darken</option>
+                  <option value="lighten">Lighten</option>
+                </select>
+              </div>
+
               <SliderRow
-                label="Strength"
-                value={Math.round((smearStrength ?? 0.8) * 100)}
+                label="Scatter"
+                value={dualTipScatter ?? 0}
                 min={0}
                 max={100}
                 step={1}
-                display={`${Math.round((smearStrength ?? 0.8) * 100)}%`}
-                onChange={(v) => update({ smearStrength: v / 100 })}
-                ocid="brush_settings.smear_strength_slider"
+                display={`${dualTipScatter ?? 0}px`}
+                onChange={(v) => update({ dualTipScatter: v })}
+                ocid="brush_settings.dual_scatter_slider"
               />
-            )}
-          </div>
-        )}
-      </div>
+              <SliderRow
+                label="Spacing"
+                value={dualTipSpacing ?? 5}
+                min={1}
+                max={200}
+                step={1}
+                display={`${dualTipSpacing ?? 5}%`}
+                onChange={(v) => update({ dualTipSpacing: v })}
+                ocid="brush_settings.dual_spacing_slider"
+              />
+              <SliderRow
+                label="Size Jitter"
+                value={Math.round((dualTipSizeJitter ?? 0) * 100)}
+                min={0}
+                max={100}
+                step={1}
+                display={`${Math.round((dualTipSizeJitter ?? 0) * 100)}%`}
+                onChange={(v) => update({ dualTipSizeJitter: v / 100 })}
+                ocid="brush_settings.dual_size_jitter_slider"
+              />
+              <SliderRow
+                label="Rotation Jitter"
+                value={dualTipRotationJitter ?? 0}
+                min={0}
+                max={360}
+                step={1}
+                display={`${dualTipRotationJitter ?? 0}°`}
+                onChange={(v) => update({ dualTipRotationJitter: v })}
+                ocid="brush_settings.dual_rotation_jitter_slider"
+              />
+            </>
+          )}
+        </div>
+      </CollapsibleSection>
 
-      {/* ── Subpanel 2: Pressure ── */}
-      <div className="flex flex-col min-w-0">
-        <SubpanelHeader
-          title="Pressure"
-          open={pressureOpen}
-          onToggle={() => setPressureOpen((o) => !o)}
-          ocid="brush_settings.pressure_panel.toggle"
-        />
-        {pressureOpen && (
-          <div className="flex flex-col gap-2 pt-0.5 pl-1 border-l border-border/40 ml-1 mb-2">
-            {/* Pressure → Size */}
-            <div className="flex items-center justify-between gap-2">
-              <Label
-                className="text-xs text-muted-foreground cursor-pointer"
-                htmlFor="pressure-size"
+      {/* ─────────── Section: Pen Pressure ─────────── */}
+      <CollapsibleSection title="Pen Pressure">
+        <div className="flex flex-col gap-2">
+          {/* Pressure → Size */}
+          <div className="flex items-center justify-between gap-2">
+            <Label
+              className="text-xs text-muted-foreground cursor-pointer"
+              htmlFor="pressure-size"
+            >
+              Pressure → Size
+            </Label>
+            <Switch
+              id="pressure-size"
+              data-ocid="brush_settings.pressure_size_switch"
+              checked={pressureSize}
+              onCheckedChange={(v) => update({ pressureSize: v })}
+            />
+          </div>
+          {pressureSize && (
+            <SliderRow
+              label="Min Size"
+              value={minSize}
+              min={0}
+              max={100}
+              step={1}
+              display={`${minSize}%`}
+              onChange={(v) => update({ minSize: v })}
+              ocid="brush_settings.min_size_slider"
+            />
+          )}
+
+          {/* Pressure → Opacity / Strength (smudge) */}
+          {isSmudge ? (
+            <>
+              <div className="flex items-center justify-between gap-2">
+                <Label
+                  className="text-xs text-muted-foreground cursor-pointer"
+                  htmlFor="pressure-strength"
+                >
+                  Pressure → Strength
+                </Label>
+                <Switch
+                  id="pressure-strength"
+                  data-ocid="brush_settings.pressure_strength_switch"
+                  checked={pressureStrength ?? false}
+                  onCheckedChange={(v) => update({ pressureStrength: v })}
+                />
+              </div>
+              {pressureStrength && (
+                <SliderRow
+                  label="Min Strength"
+                  value={Math.round((minStrength ?? 0) * 100)}
+                  min={0}
+                  max={100}
+                  step={1}
+                  display={`${Math.round((minStrength ?? 0) * 100)}%`}
+                  onChange={(v) => update({ minStrength: v / 100 })}
+                  ocid="brush_settings.min_strength_slider"
+                />
+              )}
+            </>
+          ) : (
+            <>
+              <div className="flex items-center justify-between gap-2">
+                <Label
+                  className="text-xs text-muted-foreground cursor-pointer"
+                  htmlFor="pressure-opacity"
+                >
+                  Pressure → Opacity
+                </Label>
+                <Switch
+                  id="pressure-opacity"
+                  data-ocid="brush_settings.pressure_opacity_switch"
+                  checked={pressureOpacity}
+                  onCheckedChange={(v) => update({ pressureOpacity: v })}
+                />
+              </div>
+              {pressureOpacity && (
+                <SliderRow
+                  label="Min Opacity"
+                  value={Math.round(minOpacity * 100)}
+                  min={0}
+                  max={100}
+                  step={1}
+                  display={`${Math.round(minOpacity * 100)}%`}
+                  onChange={(v) => update({ minOpacity: v / 100 })}
+                  ocid="brush_settings.min_opacity_slider"
+                />
+              )}
+            </>
+          )}
+
+          {/* Pressure → Flow (non-smudge only) */}
+          {!isSmudge && (
+            <>
+              <div className="flex items-center justify-between gap-2">
+                <Label
+                  className="text-xs text-muted-foreground cursor-pointer"
+                  htmlFor="pressure-flow"
+                >
+                  Pressure → Flow
+                </Label>
+                <Switch
+                  id="pressure-flow"
+                  data-ocid="brush_settings.pressure_flow_switch"
+                  checked={pressureFlow ?? false}
+                  onCheckedChange={(v) => update({ pressureFlow: v })}
+                />
+              </div>
+              {pressureFlow && (
+                <SliderRow
+                  label="Min Flow"
+                  value={Math.round((minFlow ?? 0) * 100)}
+                  min={0}
+                  max={100}
+                  step={1}
+                  display={`${Math.round((minFlow ?? 0) * 100)}%`}
+                  onChange={(v) => update({ minFlow: v / 100 })}
+                  ocid="brush_settings.min_flow_slider"
+                />
+              )}
+            </>
+          )}
+        </div>
+      </CollapsibleSection>
+
+      {/* ─────────── Section: Smoothing ─────────── */}
+      <CollapsibleSection title="Smoothing">
+        <div className="flex flex-col gap-2">
+          <div className="grid grid-cols-2 gap-0.5">
+            {(
+              [
+                ["basic", "Basic"],
+                ["smooth", "Smooth"],
+                ["elastic", "Elastic"],
+                ["smooth+elastic", "Smooth+Elastic"],
+              ] as const
+            ).map(([mode, label]) => (
+              <button
+                key={mode}
+                type="button"
+                data-ocid={`brush_settings.stab_${mode}_button`}
+                onClick={() => update({ stabilizationMode: mode })}
+                className={`text-[9px] py-1 rounded transition-all duration-100 ${
+                  stabilizationMode === mode
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                }`}
               >
-                Pressure → Size
-              </Label>
-              <Switch
-                id="pressure-size"
-                data-ocid="brush_settings.pressure_size_switch"
-                checked={pressureSize}
-                onCheckedChange={(v) => update({ pressureSize: v })}
-              />
-            </div>
-            {pressureSize && (
-              <SliderRow
-                label="Min Size"
-                value={minSize}
-                min={0}
-                max={100}
-                step={1}
-                display={`${minSize}%`}
-                onChange={(v) => update({ minSize: v })}
-                ocid="brush_settings.min_size_slider"
-              />
-            )}
-
-            {/* Pressure → Opacity (non-smear tools) / Pressure → Strength (smear) */}
-            {isSmear ? (
-              <>
-                <div className="flex items-center justify-between gap-2">
-                  <Label
-                    className="text-xs text-muted-foreground cursor-pointer"
-                    htmlFor="pressure-strength"
-                  >
-                    Pressure → Strength
-                  </Label>
-                  <Switch
-                    id="pressure-strength"
-                    data-ocid="brush_settings.pressure_strength_switch"
-                    checked={pressureStrength ?? false}
-                    onCheckedChange={(v) => update({ pressureStrength: v })}
-                  />
-                </div>
-                {pressureStrength && (
-                  <SliderRow
-                    label="Min Strength"
-                    value={Math.round((minStrength ?? 0) * 100)}
-                    min={0}
-                    max={100}
-                    step={1}
-                    display={`${Math.round((minStrength ?? 0) * 100)}%`}
-                    onChange={(v) => update({ minStrength: v / 100 })}
-                    ocid="brush_settings.min_strength_slider"
-                  />
-                )}
-              </>
-            ) : (
-              <>
-                <div className="flex items-center justify-between gap-2">
-                  <Label
-                    className="text-xs text-muted-foreground cursor-pointer"
-                    htmlFor="pressure-opacity"
-                  >
-                    Pressure → Opacity
-                  </Label>
-                  <Switch
-                    id="pressure-opacity"
-                    data-ocid="brush_settings.pressure_opacity_switch"
-                    checked={pressureOpacity}
-                    onCheckedChange={(v) => update({ pressureOpacity: v })}
-                  />
-                </div>
-                {pressureOpacity && (
-                  <SliderRow
-                    label="Min Opacity"
-                    value={Math.round(minOpacity * 100)}
-                    min={0}
-                    max={100}
-                    step={1}
-                    display={`${Math.round(minOpacity * 100)}%`}
-                    onChange={(v) => update({ minOpacity: v / 100 })}
-                    ocid="brush_settings.min_opacity_slider"
-                  />
-                )}
-              </>
-            )}
-
-            {/* Pressure → Flow (all non-smear tools) */}
-            {!isSmear && (
-              <>
-                <div className="flex items-center justify-between gap-2">
-                  <Label
-                    className="text-xs text-muted-foreground cursor-pointer"
-                    htmlFor="pressure-flow"
-                  >
-                    Pressure → Flow
-                  </Label>
-                  <Switch
-                    id="pressure-flow"
-                    data-ocid="brush_settings.pressure_flow_switch"
-                    checked={pressureFlow ?? false}
-                    onCheckedChange={(v) => update({ pressureFlow: v })}
-                  />
-                </div>
-                {pressureFlow && (
-                  <SliderRow
-                    label="Min Flow"
-                    value={Math.round((minFlow ?? 0) * 100)}
-                    min={0}
-                    max={100}
-                    step={1}
-                    display={`${Math.round((minFlow ?? 0) * 100)}%`}
-                    onChange={(v) => update({ minFlow: v / 100 })}
-                    ocid="brush_settings.min_flow_slider"
-                  />
-                )}
-              </>
-            )}
+                {label}
+              </button>
+            ))}
           </div>
-        )}
-      </div>
+          <p className="text-[9px] text-muted-foreground leading-tight">
+            {stabilizationMode === "basic" &&
+              "Brush snaps ahead — crisp lines, low lag"}
+            {stabilizationMode === "smooth" &&
+              "Averages recent positions — smooth curves"}
+            {stabilizationMode === "elastic" &&
+              "Elastic follow — organic, flowing lines"}
+            {stabilizationMode === "smooth+elastic" &&
+              "Smooth then elastic — maximum smoothing"}
+          </p>
+          {stabilizationMode === "basic" && (
+            <SliderRow
+              label="Smoothing"
+              value={strokeSmoothing}
+              min={0}
+              max={100}
+              step={1}
+              display={`${strokeSmoothing}`}
+              onChange={(v) => update({ strokeSmoothing: v })}
+              ocid="brush_settings.smoothing_slider"
+            />
+          )}
+          {(stabilizationMode === "smooth" ||
+            stabilizationMode === "smooth+elastic") && (
+            <SliderRow
+              label="Smooth Strength"
+              value={smoothStrength}
+              min={0}
+              max={100}
+              step={1}
+              display={`${smoothStrength}`}
+              onChange={(v) => update({ smoothStrength: v })}
+              ocid="brush_settings.smooth_strength_slider"
+            />
+          )}
+          {(stabilizationMode === "elastic" ||
+            stabilizationMode === "smooth+elastic") && (
+            <SliderRow
+              label="Elastic Tension"
+              value={elasticStrength}
+              min={0}
+              max={100}
+              step={1}
+              display={`${elasticStrength}`}
+              onChange={(v) => update({ elasticStrength: v })}
+              ocid="brush_settings.elastic_tension_slider"
+            />
+          )}
+        </div>
+      </CollapsibleSection>
 
-      {/* ── Subpanel 3: Noise ── */}
-      <div className="flex flex-col min-w-0">
-        <SubpanelHeader
-          title="Noise"
-          open={noiseOpen}
-          onToggle={() => setNoiseOpen((o) => !o)}
-          ocid="brush_settings.noise_panel.toggle"
-        />
-        {noiseOpen && (
-          <div className="flex flex-col gap-2 pt-0.5 pl-1 border-l border-border/40 ml-1 mb-2">
-            <SliderRow
-              label="Scatter"
-              value={scatter}
-              min={0}
-              max={100}
-              step={1}
-              display={`${scatter}px`}
-              onChange={(v) => update({ scatter: v })}
-              ocid="brush_settings.scatter_slider"
-            />
-            <SliderRow
-              label="Color Jitter"
-              value={colorJitter ?? 0}
-              min={0}
-              max={100}
-              step={1}
-              display={`${colorJitter ?? 0}%`}
-              onChange={(v) => update({ colorJitter: v })}
-              ocid="brush_settings.color_jitter_slider"
-            />
-            <SliderRow
-              label="Size Jitter"
-              value={Math.round(sizeJitter * 100)}
-              min={0}
-              max={100}
-              step={1}
-              display={`${Math.round(sizeJitter * 100)}%`}
-              onChange={(v) => update({ sizeJitter: v / 100 })}
-              ocid="brush_settings.size_jitter_slider"
-            />
-
-            <SliderRow
-              label="Rotation Jitter"
-              value={rotationJitter ?? 0}
-              min={0}
-              max={360}
-              step={1}
-              display={`${rotationJitter ?? 0}°`}
-              onChange={(v) => update({ rotationJitter: v })}
-              ocid="brush_settings.rotation_jitter_slider"
-            />
+      {/* ─────────── Section: Jitter ─────────── */}
+      <CollapsibleSection title="Jitter">
+        <div className="flex flex-col gap-2">
+          <SliderRow
+            label="Size Jitter"
+            value={Math.round(sizeJitter * 100)}
+            min={0}
+            max={100}
+            step={1}
+            display={`${Math.round(sizeJitter * 100)}%`}
+            onChange={(v) => update({ sizeJitter: v / 100 })}
+            ocid="brush_settings.size_jitter_slider"
+          />
+          <SliderRow
+            label="Rotation Jitter"
+            value={rotationJitter ?? 0}
+            min={0}
+            max={360}
+            step={1}
+            display={`${rotationJitter ?? 0}°`}
+            onChange={(v) => update({ rotationJitter: v })}
+            ocid="brush_settings.rotation_jitter_slider"
+          />
+          {!isSmudge && (
             <SliderRow
               label="Flow Jitter"
               value={flowJitter ?? 0}
@@ -1203,277 +1493,21 @@ export function BrushSettingsPanel({
               onChange={(v) => update({ flowJitter: v })}
               ocid="brush_settings.flow_jitter_slider"
             />
-          </div>
-        )}
-      </div>
-
-      {/* ── Dual Brush Section ── */}
-      <div className="flex flex-col min-w-0">
-        <button
-          type="button"
-          data-ocid="brush_settings.dual_brush_toggle"
-          onClick={() => setDualSectionOpen((o) => !o)}
-          className="flex items-center justify-between w-full py-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
-        >
-          <span>Dual Brush</span>
-          <div className="flex items-center gap-1.5">
-            {dualTipEnabled && (
-              <span className="text-[9px] text-primary font-normal uppercase tracking-wide">
-                On
-              </span>
-            )}
-            {dualSectionOpen ? (
-              <ChevronDown size={11} />
-            ) : (
-              <ChevronRight size={11} />
-            )}
-          </div>
-        </button>
-
-        {dualSectionOpen && (
-          <div className="flex flex-col gap-2.5 pt-1 pl-1 border-l border-border/50 ml-1">
-            <div className="flex items-center justify-between gap-2">
-              <Label
-                className="text-xs text-muted-foreground cursor-pointer"
-                htmlFor="dual-tip-enabled"
-              >
-                Enable Dual Brush
-              </Label>
-              <Switch
-                id="dual-tip-enabled"
-                data-ocid="brush_settings.dual_tip_enabled_switch"
-                checked={dualTipEnabled}
-                onCheckedChange={(v) => update({ dualTipEnabled: v })}
-              />
-            </div>
-
-            {dualTipEnabled && (
-              <>
-                <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">
-                    Secondary Tip
-                  </Label>
-                  <div className="flex items-center gap-2">
-                    {availableTips && availableTips.length > 0 ? (
-                      <Popover
-                        open={dualTipPickerOpen}
-                        onOpenChange={setDualTipPickerOpen}
-                      >
-                        <PopoverTrigger asChild>
-                          <div
-                            data-ocid="brush_settings.dual_tip_thumbnail"
-                            className="w-12 h-12 rounded border border-border flex-shrink-0 overflow-hidden cursor-pointer hover:border-primary hover:scale-105 transition-all"
-                            style={{ background: "#1a1a1a" }}
-                            title="Click to change secondary brush tip"
-                          >
-                            {dualTipImageData ? (
-                              <img
-                                src={dualTipImageData}
-                                alt="Dual tip"
-                                className="w-full h-full object-cover"
-                                style={{ imageRendering: "pixelated" }}
-                              />
-                            ) : (
-                              <div className="w-full h-full flex items-center justify-center">
-                                <div className="w-7 h-7 rounded-full bg-white opacity-40" />
-                              </div>
-                            )}
-                          </div>
-                        </PopoverTrigger>
-                        <PopoverContent
-                          data-ocid="brush_settings.dual_tip_picker.popover"
-                          className="w-64 p-3"
-                          side="right"
-                          align="start"
-                        >
-                          <p className="text-xs font-semibold mb-2">
-                            Choose Secondary Tip
-                          </p>
-                          <ScrollArea className="max-h-48">
-                            <div className="grid grid-cols-3 gap-2 pr-1">
-                              {availableTips.map((tip, idx) => (
-                                <button
-                                  key={tip.id}
-                                  type="button"
-                                  data-ocid={`brush_settings.dual_tip_picker.item.${idx + 1}`}
-                                  title={tip.name}
-                                  onClick={() => {
-                                    update({
-                                      dualTipImageData: tip.tipImageData,
-                                    });
-                                    setDualTipPickerOpen(false);
-                                  }}
-                                  className="flex flex-col items-center gap-1 group"
-                                >
-                                  <div
-                                    className="w-14 h-14 rounded border border-border overflow-hidden transition-all group-hover:border-primary group-hover:scale-105"
-                                    style={{ background: "#1a1a1a" }}
-                                  >
-                                    {tip.tipImageData ? (
-                                      <img
-                                        src={tip.tipImageData}
-                                        alt={tip.name}
-                                        className="w-full h-full object-cover"
-                                        style={{ imageRendering: "pixelated" }}
-                                      />
-                                    ) : (
-                                      <div className="w-full h-full flex items-center justify-center">
-                                        <div className="w-8 h-8 rounded-full bg-white opacity-80" />
-                                      </div>
-                                    )}
-                                  </div>
-                                  <span className="text-[10px] text-muted-foreground truncate w-full text-center">
-                                    {tip.name}
-                                  </span>
-                                </button>
-                              ))}
-                            </div>
-                          </ScrollArea>
-                        </PopoverContent>
-                      </Popover>
-                    ) : (
-                      <div
-                        data-ocid="brush_settings.dual_tip_thumbnail"
-                        className="w-12 h-12 rounded border border-border flex-shrink-0 overflow-hidden"
-                        style={{ background: "#1a1a1a" }}
-                      >
-                        {dualTipImageData ? (
-                          <img
-                            src={dualTipImageData}
-                            alt="Dual tip"
-                            className="w-full h-full object-cover"
-                            style={{ imageRendering: "pixelated" }}
-                          />
-                        ) : (
-                          <div className="w-full h-full flex items-center justify-center">
-                            <div className="w-7 h-7 rounded-full bg-white opacity-40" />
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    <div className="flex gap-1 flex-1 flex-col">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        data-ocid="brush_settings.dual_upload_tip_button"
-                        className="w-full text-xs h-7"
-                        onClick={() => dualFileInputRef.current?.click()}
-                      >
-                        Upload
-                      </Button>
-                      <ScratchpadDialog
-                        onSave={(dataUrl) =>
-                          update({ dualTipImageData: dataUrl })
-                        }
-                        trigger={
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            className="flex-1 text-xs h-7 w-full"
-                          >
-                            Draw Tip
-                          </Button>
-                        }
-                      />
-                    </div>
-                  </div>
-                  {dualTipImageData && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      data-ocid="brush_settings.clear_dual_tip_button"
-                      className="text-xs h-6 text-destructive hover:text-destructive w-full"
-                      onClick={() => update({ dualTipImageData: undefined })}
-                    >
-                      Clear Secondary Tip
-                    </Button>
-                  )}
-                </div>
-
-                {/* Blend Mode */}
-                <div className="flex flex-col gap-1 min-w-0 w-full">
-                  <Label className="text-xs text-muted-foreground">
-                    Blend Mode
-                  </Label>
-                  <select
-                    data-ocid="brush_settings.dual_blend_mode_select"
-                    value={dualTipBlendMode}
-                    onChange={(e) =>
-                      update({
-                        dualTipBlendMode: e.target
-                          .value as BrushSettings["dualTipBlendMode"],
-                      })
-                    }
-                    className="w-full text-xs rounded border border-border bg-background px-2 py-1 h-7 focus:outline-none focus:ring-1 focus:ring-primary"
-                  >
-                    <option value="multiply">Multiply</option>
-                    <option value="screen">Screen</option>
-                    <option value="overlay">Overlay</option>
-                    <option value="darken">Darken</option>
-                    <option value="lighten">Lighten</option>
-                  </select>
-                </div>
-
-                {/* Dual tip noise settings */}
-                <SliderRow
-                  label="Scatter"
-                  value={dualTipScatter ?? 0}
-                  min={0}
-                  max={100}
-                  step={1}
-                  display={`${dualTipScatter ?? 0}px`}
-                  onChange={(v) => update({ dualTipScatter: v })}
-                  ocid="brush_settings.dual_scatter_slider"
-                />
-                <SliderRow
-                  label="Spacing"
-                  value={dualTipSpacing ?? 5}
-                  min={1}
-                  max={200}
-                  step={1}
-                  display={`${dualTipSpacing ?? 5}%`}
-                  onChange={(v) => update({ dualTipSpacing: v })}
-                  ocid="brush_settings.dual_spacing_slider"
-                />
-                <SliderRow
-                  label="Size Jitter"
-                  value={Math.round((dualTipSizeJitter ?? 0) * 100)}
-                  min={0}
-                  max={100}
-                  step={1}
-                  display={`${Math.round((dualTipSizeJitter ?? 0) * 100)}%`}
-                  onChange={(v) => update({ dualTipSizeJitter: v / 100 })}
-                  ocid="brush_settings.dual_size_jitter_slider"
-                />
-                <SliderRow
-                  label="Rotation Jitter"
-                  value={dualTipRotationJitter ?? 0}
-                  min={0}
-                  max={360}
-                  step={1}
-                  display={`${dualTipRotationJitter ?? 0}°`}
-                  onChange={(v) => update({ dualTipRotationJitter: v })}
-                  ocid="brush_settings.dual_rotation_jitter_slider"
-                />
-                <SliderRow
-                  label="Color Jitter"
-                  value={dualTipColorJitter ?? 0}
-                  min={0}
-                  max={100}
-                  step={1}
-                  display={`${dualTipColorJitter ?? 0}%`}
-                  onChange={(v) => update({ dualTipColorJitter: v })}
-                  ocid="brush_settings.dual_color_jitter_slider"
-                />
-              </>
-            )}
-          </div>
-        )}
-      </div>
+          )}
+          {!isSmudge && (
+            <SliderRow
+              label="Color Jitter"
+              value={colorJitter ?? 0}
+              min={0}
+              max={100}
+              step={1}
+              display={`${colorJitter ?? 0}%`}
+              onChange={(v) => update({ colorJitter: v })}
+              ocid="brush_settings.color_jitter_slider"
+            />
+          )}
+        </div>
+      </CollapsibleSection>
 
       <input
         ref={fileInputRef}

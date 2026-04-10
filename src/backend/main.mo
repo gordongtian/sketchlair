@@ -1,68 +1,82 @@
+import Principal "mo:core/Principal";
 import Map "mo:core/Map";
-import Nat "mo:core/Nat";
-import Text "mo:core/Text";
-import List "mo:core/List";
-import Iter "mo:core/Iter";
-import Storage "blob-storage/Storage";
-import MixinStorage "blob-storage/Mixin";
+import Runtime "mo:core/Runtime";
 
+import MixinAuthorization "mo:caffeineai-authorization/MixinAuthorization";
+import MixinObjectStorage "mo:caffeineai-object-storage/Mixin";
+import AccessControl "mo:caffeineai-authorization/access-control";
 
 
 actor {
-  type BrushPreset = {
+  // Initialize the access control system
+  let accessControlState = AccessControl.initState();
+  include MixinAuthorization(accessControlState);
+
+  // User profile type as required by frontend
+  public type UserProfile = {
     name : Text;
-    settings : Text;
-    tip : Storage.ExternalBlob;
   };
 
-  type UserSettings = {
-    darkMode : Bool;
-    accentColor : Text;
-  };
+  let userProfiles = Map.empty<Principal, UserProfile>();
 
-  let emptyList = List.empty<Storage.ExternalBlob>();
-
-  let emptyUserSettings = {
-    darkMode = false;
-    accentColor = "blue";
-  };
-
-  let brushPresetsMap = Map.empty<Nat, BrushPreset>();
-  let userSettingsMap = Map.empty<Text, UserSettings>();
-
-  public shared ({ caller }) func storeBrushPreset(userId : Text, presetId : Nat, name : Text, settings : Text, tip : Storage.ExternalBlob) : async () {
-    let brushPreset : BrushPreset = {
-      name;
-      settings;
-      tip;
+  // Required user profile functions
+  public query ({ caller }) func getCallerUserProfile() : async ?UserProfile {
+    if (not (AccessControl.hasPermission(accessControlState, caller, #user))) {
+      Runtime.trap("Unauthorized: Only users can access profiles");
     };
-    brushPresetsMap.add(presetId, brushPreset);
+    userProfiles.get(caller);
   };
 
-  public query ({ caller }) func getBrushPreset(userId : Text, presetId : Nat) : async ?BrushPreset {
-    brushPresetsMap.get(presetId);
-  };
-
-  public query ({ caller }) func getAllBrushPresetIds(userId : Text) : async [Nat] {
-    brushPresetsMap.keys().toArray();
-  };
-
-  public shared ({ caller }) func deleteBrushPreset(userId : Text, presetId : Nat) : async ?BrushPreset {
-    let deleted = brushPresetsMap.get(presetId);
-    brushPresetsMap.remove(presetId);
-    deleted;
-  };
-
-  public shared ({ caller }) func setUserSettings(userId : Text, settings : UserSettings) : async () {
-    userSettingsMap.add(userId, settings);
-  };
-
-  public query ({ caller }) func getUserSettings(userId : Text) : async UserSettings {
-    switch (userSettingsMap.get(userId)) {
-      case (null) { emptyUserSettings };
-      case (?settings) { settings };
+  public query ({ caller }) func getUserProfile(user : Principal) : async ?UserProfile {
+    if (caller != user and not AccessControl.isAdmin(accessControlState, caller)) {
+      Runtime.trap("Unauthorized: Can only view your own profile");
     };
+    userProfiles.get(user);
   };
 
-  include MixinStorage();
+  public shared ({ caller }) func saveCallerUserProfile(profile : UserProfile) : async () {
+    if (not (AccessControl.hasPermission(accessControlState, caller, #user))) {
+      Runtime.trap("Unauthorized: Only users can save profiles");
+    };
+    userProfiles.add(caller, profile);
+  };
+
+  // Canvas and settings storage
+  type CanvasSave = Text;
+  type SettingsSave = Text;
+  let canvasSaveMap = Map.empty<Principal, CanvasSave>();
+  let settingsMap = Map.empty<Principal, SettingsSave>();
+
+  // Canvas hash functions - require authenticated user
+  public shared ({ caller }) func saveCanvasHash(canvasHash : CanvasSave) : async () {
+    if (not (AccessControl.hasPermission(accessControlState, caller, #user))) {
+      Runtime.trap("Unauthorized: Only users can save canvas data");
+    };
+    canvasSaveMap.add(caller, canvasHash);
+  };
+
+  public query ({ caller }) func getCanvasHash() : async ?CanvasSave {
+    if (not (AccessControl.hasPermission(accessControlState, caller, #user))) {
+      Runtime.trap("Unauthorized: Only users can retrieve canvas data");
+    };
+    canvasSaveMap.get(caller);
+  };
+
+  // User settings functions - require authenticated user
+  public shared ({ caller }) func saveUserSettings(settings : SettingsSave) : async () {
+    if (not (AccessControl.hasPermission(accessControlState, caller, #user))) {
+      Runtime.trap("Unauthorized: Only users can save settings");
+    };
+    settingsMap.add(caller, settings);
+  };
+
+  public query ({ caller }) func getUserSettings() : async ?SettingsSave {
+    if (not (AccessControl.hasPermission(accessControlState, caller, #user))) {
+      Runtime.trap("Unauthorized: Only users can retrieve settings");
+    };
+    settingsMap.get(caller);
+  };
+
+  // INSTANT COMPONENT BLOB STORAGE
+  include MixinObjectStorage();
 };

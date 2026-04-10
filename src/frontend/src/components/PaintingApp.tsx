@@ -1,165 +1,144 @@
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import type { HSVAColor } from "@/utils/colorUtils";
-import { hexToRgb, hsvToRgb, rgbToHex, rgbToHsv } from "@/utils/colorUtils";
-import type { Preset } from "@/utils/toolPresets";
+import {
+  generateLayerThumbnail,
+  getLuminance,
+  hexToRgb,
+  hsvToRgb,
+  rgbToHex,
+  rgbToHsv,
+} from "@/utils/colorUtils";
+import {
+  type HotkeyAction,
+  loadHotkeys,
+  matchesBinding,
+} from "@/utils/hotkeyConfig";
 import { DEFAULT_PRESETS } from "@/utils/toolPresets";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Layers,
+  Palette,
+  SlidersHorizontal as PresetsIcon,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import { PaintingContextProvider } from "../context/PaintingContext";
+// Grouped ref type declarations (structural only — no logic)
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+import type {} from "../hooks/paintingRefs";
+import { use1pt2ptPerspectiveRuler } from "../hooks/use1pt2ptPerspectiveRuler";
+import { use3pt5ptPerspectiveRuler } from "../hooks/use3pt5ptPerspectiveRuler";
+import { useAdjustmentsSystem } from "../hooks/useAdjustmentsSystem";
+import { useAppInitialization } from "../hooks/useAppInitialization";
+import {
+  _aboveClipTmpCanvas,
+  _clipTmpCanvas,
+  _tempStrokeCanvas,
+  clearCompositeDoneCallback,
+  getBitmapOrCanvas,
+  invalidateAllLayerBitmaps,
+  invalidateCompositeContextCaches,
+  markCanvasDirty,
+  markLayerBitmapDirty,
+  registerCanvasDirtyCallbacks,
+  setActiveLayerIdForBitmap,
+  setCompositeDoneCallback,
+  useCompositing,
+} from "../hooks/useCompositing";
+import { useCropSystem } from "../hooks/useCropSystem";
+import { useCursorSystem } from "../hooks/useCursorSystem";
+import { useEllipseGridRuler } from "../hooks/useEllipseGridRuler";
+import { useFileIOSystem } from "../hooks/useFileIOSystem";
+import { useFillSystem } from "../hooks/useFillSystem";
+import { useHistory } from "../hooks/useHistory";
+import { useIsMobile } from "../hooks/useIsMobile";
+import { useLayerSystem } from "../hooks/useLayerSystem";
+import type { UndoEntry } from "../hooks/useLayerSystem";
+import { useLineRuler } from "../hooks/useLineRuler";
+import {
+  getLiquifySnapshot as _getLiquifySnapshot,
+  initLiquifyField as _initLiquifyField,
+  renderLiquifyFromSnapshot as _renderLiquifyFromSnapshot,
+  setLiquifySnapshot as _setLiquifySnapshot,
+  updateLiquifyDisplacementField as _updateLiquifyDisplacementField,
+  resetLiquifyField,
+  useLiquifySystem,
+} from "../hooks/useLiquifySystem";
+import { usePaintingCanvasEvents } from "../hooks/usePaintingCanvasEvents";
+import type { PaintingCanvasEventsCallbacks } from "../hooks/usePaintingCanvasEvents";
+import { usePresetSystem } from "../hooks/usePresetSystem";
+import type { BrushSizes } from "../hooks/usePresetSystem";
+import { useRulerUIHandlers } from "../hooks/useRulerUIHandlers";
+import { useSelectionSystem } from "../hooks/useSelectionSystem";
+import { useSnapSystem } from "../hooks/useSnapSystem";
+import {
+  PRESSURE_SMOOTHING as _PRESSURE_SMOOTHING,
+  applyColorJitter as _applyColorJitter,
+  evalPressureCurve as _evalPressureCurve,
+  resetSmudgeInitialized as _resetSmudgeInitialized,
+  useStrokeEngine,
+} from "../hooks/useStrokeEngine";
+import { useToolSwitchSystem } from "../hooks/useToolSwitchSystem";
+import { useTransformSystem } from "../hooks/useTransformSystem";
+import type { SelectionGeom, SelectionSnapshot } from "../selectionTypes";
+import type { ViewTransform } from "../types";
+import {
+  flattenTree as _flattenTree,
+  getEffectiveOpacity as _getEffectiveOpacity,
+  getEffectiveVisibility as _getEffectiveVisibility,
+  getEffectivelySelectedLayers as _getEffectivelySelectedLayers,
+  findNode,
+} from "../utils/layerTree";
+import {
+  bfsFloodFill as _bfsFloodFill,
+  computeMaskBounds,
+  growShrinkMask,
+} from "../utils/selectionUtils";
+import { getThumbCanvas, getThumbCtx } from "../utils/thumbnailCache";
 import { createWebGLBrushContext } from "../utils/webglBrush";
 import type { WebGLBrushContext } from "../utils/webglBrush";
-import { AdjustmentsPresetsPanel } from "./AdjustmentsPresetsPanel";
+import {
+  BrushConflictDialog,
+  CloudOverwriteDialog,
+  DeleteGroupDialog,
+  MergeStrategyDialog,
+} from "./AppDialogs";
 import { BottomBar } from "./BottomBar";
 import type { BrushSettings } from "./BrushSettingsPanel";
 import {
   BrushSettingsPanel,
   DEFAULT_BRUSH_SETTINGS,
 } from "./BrushSettingsPanel";
-import { ColorPickerPanel } from "./ColorPickerPanel";
-import { FillPresetsPanel } from "./FillPresetsPanel";
+import { CanvasArea } from "./CanvasArea";
+import {
+  BrushSizeOverlayCanvas,
+  RotateCrosshairOverlay,
+  SoftwareCursorCanvas,
+} from "./CanvasOverlays";
 import type { FillMode, FillSettings } from "./FillPresetsPanel";
-import { LassoPresetsPanel } from "./LassoPresetsPanel";
-import { LayersPanel } from "./LayersPanel";
 import type { Layer } from "./LayersPanel";
-import { NavigatorPanel } from "./NavigatorPanel";
+import { LeftSidebarArea } from "./LeftSidebarArea";
+import { MobileCanvasSliders } from "./MobileCanvasSliders";
+import { RightSidebarArea } from "./RightSidebarArea";
+import type { RulerPresetType } from "./RulerPresetsPanel";
 import { SettingsPanel } from "./SettingsPanel";
-import { ToolPresetsPanel } from "./ToolPresetsPanel";
-import { Toolbar } from "./Toolbar";
 import type { LassoMode, Tool } from "./Toolbar";
+import { ToolbarArea } from "./ToolbarArea";
+import { WebGL1WarningBanner } from "./WebGL1WarningBanner";
 
-// 2D line-segment intersection helper for lasso fill
-// biome-ignore lint/correctness/noUnusedVariables: kept for future use
-function segmentsIntersect(
-  p1: { x: number; y: number },
-  p2: { x: number; y: number },
-  p3: { x: number; y: number },
-  p4: { x: number; y: number },
-): { x: number; y: number } | null {
-  const d1x = p2.x - p1.x;
-  const d1y = p2.y - p1.y;
-  const d2x = p4.x - p3.x;
-  const d2y = p4.y - p3.y;
-  const cross = d1x * d2y - d1y * d2x;
-  if (Math.abs(cross) < 1e-10) return null;
-  const dx = p3.x - p1.x;
-  const dy = p3.y - p1.y;
-  const t = (dx * d2y - dy * d2x) / cross;
-  const u = (dx * d1y - dy * d1x) / cross;
-  if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
-    return { x: p1.x + t * d1x, y: p1.y + t * d1y };
-  }
-  return null;
-}
+// Per-stamp color jitter helper → now in useStrokeEngine.ts
+// evalPressureCurve → now in useStrokeEngine.ts
+// PRESSURE_SMOOTHING → now in useStrokeEngine.ts
+// applyColorJitter → now in useStrokeEngine.ts
 
-// Per-stamp color jitter helper — shifts HSV slightly then converts back to rgb()
-function applyColorJitter(fillStyle: string, colorJitter: number): string {
-  const m = /rgb\((\d+),\s*(\d+),\s*(\d+)\)/.exec(fillStyle);
-  if (!m) return fillStyle;
-  let r = Number.parseInt(m[1]) / 255;
-  let g = Number.parseInt(m[2]) / 255;
-  let b = Number.parseInt(m[3]) / 255;
-  // RGB to HSV
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const delta = max - min;
-  let h = 0;
-  let s = max === 0 ? 0 : delta / max;
-  let v = max;
-  if (delta > 0) {
-    if (max === r) h = ((g - b) / delta) % 6;
-    else if (max === g) h = (b - r) / delta + 2;
-    else h = (r - g) / delta + 4;
-    h *= 60;
-    if (h < 0) h += 360;
-  }
-  const jitterFactor = colorJitter / 100;
-  h = (h + (Math.random() - 0.5) * 2 * jitterFactor * 180 + 360) % 360;
-  s = Math.max(
-    0,
-    Math.min(1, s + (Math.random() - 0.5) * 2 * jitterFactor * 0.3),
-  );
-  // HSV to RGB (v unchanged - only hue and saturation jitter)
-  const c = v * s;
-  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
-  const mv = v - c;
-  let ro = 0;
-  let go = 0;
-  let bo = 0;
-  if (h < 60) {
-    ro = c;
-    go = x;
-    bo = 0;
-  } else if (h < 120) {
-    ro = x;
-    go = c;
-    bo = 0;
-  } else if (h < 180) {
-    ro = 0;
-    go = c;
-    bo = x;
-  } else if (h < 240) {
-    ro = 0;
-    go = x;
-    bo = c;
-  } else if (h < 300) {
-    ro = x;
-    go = 0;
-    bo = c;
-  } else {
-    ro = c;
-    go = 0;
-    bo = x;
-  }
-  return `rgb(${Math.round((ro + mv) * 255)},${Math.round((go + mv) * 255)},${Math.round((bo + mv) * 255)})`;
-}
+const isIPad =
+  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
-const PRESSURE_SMOOTHING = 0.15;
-
-const CANVAS_WIDTH = 1200;
-const CANVAS_HEIGHT = 900;
-
-type SelectionGeom = {
-  type: LassoMode;
-  points?: { x: number; y: number }[];
-  x?: number;
-  y?: number;
-  w?: number;
-  h?: number;
-} | null;
-
-type SelectionSnapshot = {
-  geometry: SelectionGeom;
-  maskDataURL: string | null;
-  active: boolean;
-  shapes: NonNullable<SelectionGeom>[];
-};
-
-type UndoEntry =
-  | { type: "pixels"; layerId: string; before: ImageData; after: ImageData }
-  | { type: "layer-add"; layer: Layer; index: number }
-  | { type: "layer-delete"; layer: Layer; pixels: ImageData; index: number }
-  | { type: "blend-mode"; layerId: string; before: string; after: string }
-  | { type: "selection"; before: SelectionSnapshot; after: SelectionSnapshot };
-
-interface ViewTransform {
-  panX: number;
-  panY: number;
-  zoom: number;
-  rotation: number;
-}
+const CANVAS_WIDTH = isIPad ? 1280 : 2560;
+const CANVAS_HEIGHT = isIPad ? 720 : 1440;
 
 type Point = { x: number; y: number };
-type StrokePoint = { x: number; y: number; size: number; opacity: number };
 
-let layerCounter = 1;
+let layerCounter = 2;
 function newLayer(): Layer {
   layerCounter++;
   return {
@@ -169,41 +148,8 @@ function newLayer(): Layer {
     opacity: 1,
     blendMode: "source-over",
     isClippingMask: false,
-    maskActive: false,
-    hasMask: false,
+    alphaLock: false,
   };
-}
-
-function getCanvasPosTransformed(
-  clientX: number,
-  clientY: number,
-  container: HTMLElement,
-  canvas: HTMLCanvasElement,
-  transform: ViewTransform,
-  isFlipped = false,
-) {
-  const cr = container.getBoundingClientRect();
-  const centerX = cr.left + cr.width / 2;
-  const centerY = cr.top + cr.height / 2;
-  const ox = clientX - centerX - transform.panX;
-  const oy = clientY - centerY - transform.panY;
-  const sx = ox / transform.zoom;
-  const sy = oy / transform.zoom;
-  const rad = (-transform.rotation * Math.PI) / 180;
-  let rx = sx * Math.cos(rad) - sy * Math.sin(rad);
-  const ry = sx * Math.sin(rad) + sy * Math.cos(rad);
-  // Mirror x when canvas is flipped
-  if (isFlipped) rx = -rx;
-  return {
-    x: rx + canvas.width / 2,
-    y: ry + canvas.height / 2,
-  };
-}
-
-function ptDist(a: Point, b: Point) {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  return Math.sqrt(dx * dx + dy * dy);
 }
 
 const DEFAULT_TRANSFORM: ViewTransform = {
@@ -213,68 +159,219 @@ const DEFAULT_TRANSFORM: ViewTransform = {
   rotation: 0,
 };
 
-// Module-level reusable tint canvas — avoids per-stamp canvas allocation
-const _tintCanvas = document.createElement("canvas");
-_tintCanvas.width = _tintCanvas.height = 128;
-const _tintCtx = _tintCanvas.getContext("2d", { willReadFrequently: true })!;
+// Module-level tint canvas, smudge buffers, stamp caches → now in useStrokeEngine.ts
 
-// Module-level reusable smear patch canvas — avoids per-stamp canvas allocation in renderSmearAlongPoints
-const _smearCanvas = document.createElement("canvas");
-_smearCanvas.width = _smearCanvas.height = 1;
-const _smearCtx = _smearCanvas.getContext("2d", { willReadFrequently: true })!;
+// Compositing temp canvases, ctx caches → now in useCompositing.ts
+// _overlayCtxCached lives here since it's used by the marching-ants loop below
+let _overlayCtxCached: CanvasRenderingContext2D | null = null;
 
-// Module-level smudge buffer canvas for HeavyPaint-style smudge
-const _smudgeBufferCanvas = document.createElement("canvas");
-_smudgeBufferCanvas.width = _smudgeBufferCanvas.height = 128;
-const _smudgeBufferCtx = _smudgeBufferCanvas.getContext("2d", {
-  willReadFrequently: true,
+// Pre-allocated canvases for thumbnail generation — avoids per-stroke canvas allocation
+// _cropThumbCanvas and _layerThumbCanvas are now provided by thumbnailCache.ts (getThumbCanvas/getThumbCtx)
+
+const NAV_THUMB_W = 1024;
+const NAV_THUMB_H = Math.round(NAV_THUMB_W * (CANVAS_HEIGHT / CANVAS_WIDTH)); // 90px for 2560×1440
+const _navThumbCanvas = document.createElement("canvas");
+_navThumbCanvas.width = NAV_THUMB_W;
+_navThumbCanvas.height = NAV_THUMB_H;
+const _navThumbCtx = _navThumbCanvas.getContext("2d", {
+  willReadFrequently: !isIPad,
 })!;
-let _smudgeInitialized = false;
 
-// Pre-allocated temp canvases for compositing — avoids per-frame allocation
-const _tempStrokeCanvas = document.createElement("canvas");
-_tempStrokeCanvas.width = _tempStrokeCanvas.height = 1;
-let _tempStrokeCtxCached: CanvasRenderingContext2D | null = null;
-const _clipTmpCanvas = document.createElement("canvas");
-_clipTmpCanvas.width = _clipTmpCanvas.height = 1;
-let _clipTmpCtxCached: CanvasRenderingContext2D | null = null;
+// Smear buffers, _smearOutputImageData, _smearSoftnessWeights, _smearTipCacheKey → now in useStrokeEngine.ts
 
-// Pre-allocated buffers for smear tool — avoids per-stamp heap allocation
-const SMEAR_BUF_SIZE = 1200 * 900 * 4;
-let _smearSoftnessWeights: Float32Array | null = null;
-let _smearPaintData: Uint8ClampedArray | null = null;
-let _smearBufData: Uint8ClampedArray | null = null;
+// Module-level cached canvas for selection boundary rebuild (avoids 60fps allocation)
+const _boundaryRebuildCanvas = document.createElement("canvas");
+_boundaryRebuildCanvas.width = _boundaryRebuildCanvas.height = 1;
+let _boundaryRebuildCtxCached: CanvasRenderingContext2D | null = null;
 
-type BrushSizes = { brush: number; eraser: number };
+// Shared helper: scan a selection mask at 1/4 scale and stitch boundary segments
+// into connected chains (polylines). Used by both the static idle-rebuild path and
+// the transform path so there is a single implementation with no duplication.
+const _buildChainsFromMask = (
+  mask: HTMLCanvasElement,
+  canvasW: number,
+  canvasH: number,
+  isIPadHint: boolean,
+): Array<Array<[number, number]>> => {
+  const SCALE = 4;
+  const sw = Math.ceil(canvasW / SCALE);
+  const sh = Math.ceil(canvasH / SCALE);
+  if (
+    _boundaryRebuildCanvas.width !== sw ||
+    _boundaryRebuildCanvas.height !== sh
+  ) {
+    _boundaryRebuildCanvas.width = sw;
+    _boundaryRebuildCanvas.height = sh;
+    _boundaryRebuildCtxCached = null;
+  }
+  if (!_boundaryRebuildCtxCached) {
+    _boundaryRebuildCtxCached = _boundaryRebuildCanvas.getContext("2d", {
+      willReadFrequently: !isIPadHint,
+    });
+  }
+  const tc = _boundaryRebuildCtxCached!;
+  tc.clearRect(0, 0, sw, sh);
+  tc.drawImage(mask, 0, 0, canvasW, canvasH, 0, 0, sw, sh);
+  const data = tc.getImageData(0, 0, sw, sh).data;
+  const isSel = (x: number, y: number) => {
+    if (x < 0 || x >= sw || y < 0 || y >= sh) return false;
+    return data[(y * sw + x) * 4 + 3] > 64;
+  };
+  type Seg4 = [number, number, number, number];
+  const segs: Seg4[] = [];
+  for (let y = 0; y < sh; y++) {
+    for (let x = 0; x < sw; x++) {
+      if (isSel(x, y)) {
+        if (!isSel(x, y - 1))
+          segs.push([x * SCALE, y * SCALE, (x + 1) * SCALE, y * SCALE]);
+        if (!isSel(x, y + 1))
+          segs.push([
+            x * SCALE,
+            (y + 1) * SCALE,
+            (x + 1) * SCALE,
+            (y + 1) * SCALE,
+          ]);
+        if (!isSel(x - 1, y))
+          segs.push([x * SCALE, y * SCALE, x * SCALE, (y + 1) * SCALE]);
+        if (!isSel(x + 1, y))
+          segs.push([
+            (x + 1) * SCALE,
+            y * SCALE,
+            (x + 1) * SCALE,
+            (y + 1) * SCALE,
+          ]);
+      }
+    }
+  }
+  const ptKey = (x: number, y: number) => `${x},${y}`;
+  const adj = new Map<string, Seg4[]>();
+  for (const s of segs) {
+    const k0 = ptKey(s[0], s[1]);
+    const k1 = ptKey(s[2], s[3]);
+    if (!adj.has(k0)) adj.set(k0, []);
+    if (!adj.has(k1)) adj.set(k1, []);
+    adj.get(k0)!.push(s);
+    adj.get(k1)!.push([s[2], s[3], s[0], s[1]]);
+  }
+  const used = new Set<string>();
+  const chains: Array<Array<[number, number]>> = [];
+  for (const s of segs) {
+    const fk = `${s[0]},${s[1]}->${s[2]},${s[3]}`;
+    if (used.has(fk)) continue;
+    const chain: Array<[number, number]> = [
+      [s[0], s[1]],
+      [s[2], s[3]],
+    ];
+    used.add(fk);
+    used.add(`${s[2]},${s[3]}->${s[0]},${s[1]}`);
+    let cur: [number, number] = [s[2], s[3]];
+    for (;;) {
+      const nexts = adj.get(ptKey(cur[0], cur[1])) ?? [];
+      let ext = false;
+      for (const n of nexts) {
+        const nk = `${n[0]},${n[1]}->${n[2]},${n[3]}`;
+        if (!used.has(nk)) {
+          used.add(nk);
+          used.add(`${n[2]},${n[3]}->${n[0]},${n[1]}`);
+          chain.push([n[2], n[3]]);
+          cur = [n[2], n[3]];
+          ext = true;
+          break;
+        }
+      }
+      if (!ext) break;
+    }
+    chains.push(chain);
+  }
+  return chains;
+};
 
-export function PaintingApp() {
+// Synchronously rebuild boundary chains from the current selection mask.
+// Called at every state transition that produces a new mask-type selection,
+// so the drawAnts loop always has correct chain data immediately.
+const _rebuildChainsNow = (
+  mask: HTMLCanvasElement,
+  bdRef: {
+    chains: Array<Array<[number, number]>>;
+    segments: Array<[number, number, number, number]>;
+    dirty: boolean;
+  },
+  canvasW: number,
+  canvasH: number,
+  isIPadHint: boolean,
+) => {
+  const chains = _buildChainsFromMask(mask, canvasW, canvasH, isIPadHint);
+  bdRef.chains = chains;
+  bdRef.segments = [];
+  bdRef.dirty = false;
+};
+
+// ---- ImageBitmap cache functions are now in useCompositing.ts ----
+// markLayerBitmapDirty, invalidateAllLayerBitmaps, getBitmapOrCanvas imported at top
+// ---- Liquify displacement field functions are now in useLiquifySystem.ts ----
+// updateLiquifyDisplacementField, renderLiquifyFromSnapshot, initLiquifyField, resetLiquifyField imported at top
+// ---- evalPressureCurve, applyColorJitter, PRESSURE_SMOOTHING → now in useStrokeEngine.ts ----
+
+// BrushSizes type is imported from usePresetSystem
+
+// Stamp color parse cache → now in useStrokeEngine.ts
+
+interface PaintingAppProps {
+  isLoggedIn?: boolean;
+  identity?: { getPrincipal(): { toString(): string; isAnonymous(): boolean } };
+  onLogin?: () => void;
+  onLogout?: () => void;
+  cloudSave?: (getBlob: () => Promise<Blob>) => Promise<void>;
+  getCanvasHash?: () => Promise<string | null>;
+  registerGetSktchBlob?: (fn: () => Promise<Blob>) => void;
+  registerLoadFile?: (fn: (file: File) => Promise<void>) => void;
+  /** Initial canvas size chosen from the splash screen */
+  initialCanvasWidth?: number;
+  initialCanvasHeight?: number;
+}
+
+export function PaintingApp({
+  isLoggedIn = false,
+  identity,
+  onLogin,
+  onLogout,
+  cloudSave,
+  getCanvasHash,
+  registerGetSktchBlob,
+  registerLoadFile,
+  initialCanvasWidth,
+  initialCanvasHeight,
+}: PaintingAppProps = {}) {
   // UI state
   const [activeTool, setActiveTool] = useState<Tool>("brush");
-  const [brushSizes, setBrushSizes] = useState<BrushSizes>({
-    brush: 24,
-    eraser: 24,
-  });
-  // Per-tool size/opacity: stored independently from presets
-  const [toolSizes, setToolSizes] = useState<Record<string, number>>({
-    brush: 24,
-    eraser: 24,
-    smear: 24,
-  });
-  const [toolOpacities, setToolOpacities] = useState<Record<string, number>>({
-    brush: 1,
-    eraser: 1,
-    smear: 1,
-  });
-  const toolSizesRef = useRef<Record<string, number>>({
-    brush: 24,
-    eraser: 24,
-    smear: 24,
-  });
-  const toolOpacitiesRef = useRef<Record<string, number>>({
-    brush: 1,
-    eraser: 1,
-    smear: 1,
-  });
+  const [activeRulerPresetType, setActiveRulerPresetType] =
+    useState<RulerPresetType>("perspective-1pt");
+  const activeRulerPresetTypeRef = useRef<RulerPresetType>("perspective-1pt");
+  const isLoggedInRef = useRef(isLoggedIn);
+  const cloudSaveRef = useRef(cloudSave);
+  const getCanvasHashRef = useRef(getCanvasHash);
+  isLoggedInRef.current = isLoggedIn;
+  cloudSaveRef.current = cloudSave;
+  getCanvasHashRef.current = getCanvasHash;
+  const [brushSizes, setBrushSizes] = useState<BrushSizes>(() => ({
+    brush: DEFAULT_PRESETS.brush[0]?.defaultSize ?? 24,
+    eraser: DEFAULT_PRESETS.eraser[0]?.defaultSize ?? 24,
+  }));
+  // Liquify tool state — managed by useLiquifySystem
+  const {
+    liquifySize,
+    liquifyStrength,
+    liquifyScope,
+    setLiquifySize,
+    setLiquifyStrength,
+    setLiquifyScope,
+    liquifySizeRef,
+    liquifyStrengthRef,
+    liquifyScopeRef,
+    liquifyBeforeSnapshotRef,
+    liquifyMultiBeforeSnapshotsRef,
+    liquifyHoldIntervalRef,
+  } = useLiquifySystem();
   const [color, setColor] = useState<HSVAColor>({ h: 0, s: 0, v: 0.05, a: 1 });
   const [layers, setLayers] = useState<Layer[]>([
     {
@@ -284,430 +381,734 @@ export function PaintingApp() {
       opacity: 1,
       blendMode: "source-over",
       isClippingMask: false,
-      maskActive: false,
-      hasMask: false,
+      alphaLock: false,
     },
     {
-      id: "layer-background",
+      id: "layer-2",
       name: "Background",
       visible: true,
       opacity: 1,
       blendMode: "source-over",
       isClippingMask: false,
-      maskActive: false,
-      hasMask: false,
+      alphaLock: false,
     },
   ]);
   const [activeLayerId, setActiveLayerId] = useState("layer-1");
-  const [backgroundColor, setBackgroundColor] = useState("#ffffff");
   const [recentColors, setRecentColors] = useState<string[]>([]);
   const [undoCount, setUndoCount] = useState(0);
   const [redoCount, setRedoCount] = useState(0);
-  const [brushSettings, setBrushSettings] = useState<BrushSettings>(
-    DEFAULT_BRUSH_SETTINGS,
-  );
+  const [brushSettings, setBrushSettings] = useState<BrushSettings>(() => {
+    const _initPreset = DEFAULT_PRESETS.brush[0];
+    const _initSettings = _initPreset?.settings ?? DEFAULT_BRUSH_SETTINGS;
+    if (_initPreset?.defaultFlow !== undefined) {
+      return { ..._initSettings, flow: _initPreset.defaultFlow };
+    }
+    return _initSettings;
+  });
   const [viewTransform, setViewTransform] =
     useState<ViewTransform>(DEFAULT_TRANSFORM);
   const [zoomLocked, setZoomLocked] = useState(false);
   const [rotateLocked, setRotateLocked] = useState(false);
+
+  const [panLocked, setPanLocked] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [cursorType, setCursorType] = useState<"circle" | "brush-outline">(
-    () =>
-      (localStorage.getItem("sk-cursor-type") as "circle" | "brush-outline") ||
-      "circle",
-  );
-  const [cursorCrosshair, setCursorCrosshair] = useState(
-    () => localStorage.getItem("sk-cursor-crosshair") === "true",
-  );
-  // Ref to restore active subpanel after adjustments are applied
-  const preAdjustmentSubpanelRef = useRef<string | null>(null);
+
+  const DEFAULT_PRESSURE_CURVE: [number, number, number, number] = [
+    0.25, 0.25, 0.75, 0.75,
+  ];
+  const [universalPressureCurve, setUniversalPressureCurve] = useState<
+    [number, number, number, number]
+  >(() => {
+    try {
+      const stored = localStorage.getItem("sk-pressure-curve");
+      if (stored) return JSON.parse(stored);
+    } catch {}
+    return DEFAULT_PRESSURE_CURVE;
+  });
+  const universalPressureCurveRef = useRef(universalPressureCurve);
+  useEffect(() => {
+    universalPressureCurveRef.current = universalPressureCurve;
+  }, [universalPressureCurve]);
+
   const [isFlipped, setIsFlipped] = useState(false);
+  // Always start at a sensible default. The real dimensions from the splash
+  // screen arrive later via props and are applied in a dedicated useEffect.
+  // Using window.innerWidth here (before splash resolves) would result in the
+  // canvas being locked at viewport size regardless of the preset chosen.
+  const [canvasWidth, setCanvasWidth] = useState(CANVAS_WIDTH);
+  const [canvasHeight, setCanvasHeight] = useState(CANVAS_HEIGHT);
+  // canvasWidthRef, canvasHeightRef, splashDimsAppliedRef → now in uiRefs group (declared below)
+
+  const [webGLFallbackWarning, setWebGLFallbackWarning] = useState(false);
   const [activeSubpanel, setActiveSubpanel] = useState<Tool | null>("brush");
   const [leftSidebarCollapsed, setLeftSidebarCollapsed] = useState(false);
-  const [presets, setPresets] = useState(DEFAULT_PRESETS);
-  // Import dialog state
-  const [importParsed, setImportParsed] = useState<
-    typeof DEFAULT_PRESETS | null
-  >(null);
-  const [showMergeDialog, setShowMergeDialog] = useState(false);
-  interface ConflictItem {
-    toolType: "brush" | "smear" | "eraser";
-    preset: Preset;
-  }
-  const [conflictQueue, setConflictQueue] = useState<ConflictItem[]>([]);
-  const [pendingMerged, setPendingMerged] = useState<
-    typeof DEFAULT_PRESETS | null
-  >(null);
-  const [currentConflict, setCurrentConflict] = useState<ConflictItem | null>(
-    null,
-  );
-  const [activePresetIds, setActivePresetIds] = useState<
-    Record<string, string | null>
-  >({
-    brush: "brush-default",
-    smear: "smear-default",
-    eraser: "eraser-default",
+  const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(false);
+  // Mobile layout state
+  const { isMobile, forceDesktop, leftHanded, setForceDesktop, setLeftHanded } =
+    useIsMobile();
+  const [showMobileColorPanel, setShowMobileColorPanel] = useState(false);
+  const [showMobilePresetsPanel, setShowMobilePresetsPanel] = useState(false);
+
+  // ── Preset system ──────────────────────────────────────────────────────────
+  // Call here after brushSizes/setBrushSizes, brushSettings/setBrushSettings,
+  // color/setColor, activeTool, and activeSubpanel are all defined.
+  const {
+    presets,
+    activePresetIds,
+    brushSettingsSnapshotRef,
+    importParsed,
+    // setImportParsed — used internally by handleImportBrushes in the hook
+    showMergeDialog,
+    setShowMergeDialog,
+    // conflictQueue — managed internally by the hook; setConflictQueue used in JSX dialog
+    setConflictQueue,
+    // pendingMerged — managed internally by the hook; setPendingMerged used in JSX dialog
+    setPendingMerged,
+    currentConflict,
+    setCurrentConflict,
+    presetsRef,
+    // activePresetIdsRef is not needed in PaintingApp — the hook manages it internally
+    brushSizesRef,
+    brushOpacityRef,
+    toolSizesRef,
+    toolOpacitiesRef,
+    toolFlowsRef,
+    setPresets,
+    setActivePresetIds,
+    handleSelectPreset,
+    handleUpdatePreset,
+    handleAddPreset,
+    handleDeletePreset,
+    handleActivatePreset,
+    handleReorderPresets,
+    handleSaveCurrentToPreset,
+    handleExportBrushes,
+    handleImportBrushes,
+    processImportAppend,
+    resolveConflict,
+    handleCanvasBrushSizeChange,
+    handleCanvasBrushOpacityChange,
+    handleCanvasBrushFlowChange,
+  } = usePresetSystem({
+    activeTool,
+    activeSubpanel,
+    setBrushSizes,
+    setBrushSettings,
+    setColor,
+    setActiveTool: (t) => setActiveTool(t),
   });
+
+  // Import dialog state (cloud overwrite — preset import/conflict dialogs are in usePresetSystem)
+  const [showCloudOverwriteDialog, setShowCloudOverwriteDialog] =
+    useState(false);
+  const pendingCloudSaveRef = useRef<(() => void) | null>(null);
 
   // Selection & transform state
   const [lassoMode, setLassoMode] = useState<LassoMode>("free");
-  const [fillMode, setFillMode] = useState<FillMode>("flood");
-  const fillModeRef = useRef<FillMode>("flood");
-  const [fillSettings, setFillSettings] = useState<FillSettings>({
-    tolerance: 30,
-    gradientMode: "linear",
-    colorJitter: 0,
-  });
-  const fillSettingsRef = useRef<FillSettings>({
-    tolerance: 30,
-    gradientMode: "linear",
-    colorJitter: 0,
-  });
-  // Lasso fill state
-  const lassoFillOriginRef = useRef<{ x: number; y: number } | null>(null);
-  const lassoFillLastPtRef = useRef<{ x: number; y: number } | null>(null);
-  const isLassoFillDrawingRef = useRef(false);
-  const lassoFillSmoothedPtRef = useRef<{ x: number; y: number } | null>(null);
-  // Gradient fill drag state
-  const gradientDragStartRef = useRef<{ x: number; y: number } | null>(null);
-  const gradientDragEndRef = useRef<{ x: number; y: number } | null>(null);
-  const isGradientDraggingRef = useRef(false);
-  const [selectionActive, setSelectionActive] = useState(false);
+
+  // Crop tool state — owned by useCropSystem (initialized below, after canvas refs are declared)
+  // Fill state and refs are now owned by useFillSystem — initialized after hooks below.
+  const [isTransformActive, setIsTransformActive] = useState(false);
+  const [_isDraggingFloatState, setIsDraggingFloatState] = useState(false);
   const [brushBlendMode, setBrushBlendMode] = useState("source-over");
   const [rightPanelWidth, setRightPanelWidth] = useState(220);
   const [leftSidebarWidth, setLeftSidebarWidth] = useState(220);
-  const [wandTolerance, setWandTolerance] = useState(32);
+  const [wandTolerance, setWandTolerance] = useState(13);
   const [wandContiguous, setWandContiguous] = useState(true);
-  const wandToleranceRef = useRef(32);
-  const wandContiguousRef = useRef(true);
-  const brushBlendModeRef = useRef("source-over");
+  // wandToleranceRef, wandContiguousRef, wandGrowShrinkRef → now in toolRefs group (declared below)
+  const [wandGrowShrink, setWandGrowShrink] = useState(0);
+  // brushBlendModeRef → now in brushRefs group (declared below)
+  // Eyedropper settings UI state
+  const [eyedropperSampleSource, setEyedropperSampleSource] = useState<
+    "canvas" | "layer"
+  >("canvas");
+  const [eyedropperSampleSize, setEyedropperSampleSize] = useState<1 | 3 | 5>(
+    1,
+  );
   const [layerThumbnails, setLayerThumbnails] = useState<
     Record<string, string>
   >({});
-  const [navigatorThumbnail, setNavigatorThumbnail] = useState<string | null>(
-    null,
-  );
+  const [navigatorVersion, setNavigatorVersion] = useState(0);
+  const navigatorCanvasRef = useRef<HTMLCanvasElement>(_navThumbCanvas);
+  // Delete-group confirmation dialog state
+  const [deleteGroupConfirm, setDeleteGroupConfirm] = useState<{
+    groupId: string;
+    groupName: string;
+  } | null>(null);
 
-  // Canvas refs
-  const displayCanvasRef = useRef<HTMLCanvasElement>(null);
-  const layerCanvasesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
-  const layerMaskCanvasesRef = useRef<Map<string, HTMLCanvasElement>>(
-    new Map(),
-  );
-  const containerRef = useRef<HTMLDivElement>(null);
+  // ── Grouped canvas refs ───────────────────────────────────────────────────
+  // Each group is a plain const object whose values are individual useRef() calls.
+  // Hooks still receive each ref as an individual MutableRefObject — the grouping
+  // only changes how they are declared and accessed here in PaintingApp.
+  const canvasRefs = {
+    displayCanvasRef: useRef<HTMLCanvasElement>(null),
+    layerCanvasesRef: useRef<Map<string, HTMLCanvasElement>>(new Map()),
+    selectionOverlayCanvasRef: useRef<HTMLCanvasElement | null>(null),
+    strokeBufferRef: useRef<HTMLCanvasElement | null>(null),
+    webglBrushRef: useRef<WebGLBrushContext | null>(null),
+    belowActiveCanvasRef: useRef<HTMLCanvasElement | null>(null),
+    aboveActiveCanvasRef: useRef<HTMLCanvasElement | null>(null),
+    snapshotCanvasRef: useRef<HTMLCanvasElement | null>(null),
+    activePreviewCanvasRef: useRef<HTMLCanvasElement | null>(null),
+    rulerCanvasRef: useRef<HTMLCanvasElement | null>(null),
+    containerRef: useRef<HTMLDivElement>(null),
+    canvasWrapperRef: useRef<HTMLDivElement>(null),
+    brushSizeOverlayRef: useRef<HTMLCanvasElement | null>(null),
+    defaultTipCanvasRef: useRef<HTMLCanvasElement | null>(null),
+  } as const;
+  // Destructure for ergonomic local access (no behaviour change)
+  const {
+    displayCanvasRef,
+    layerCanvasesRef,
+    selectionOverlayCanvasRef,
+    strokeBufferRef,
+    webglBrushRef,
+    belowActiveCanvasRef,
+    aboveActiveCanvasRef,
+    snapshotCanvasRef,
+    activePreviewCanvasRef,
+    rulerCanvasRef,
+    containerRef,
+    canvasWrapperRef,
+    brushSizeOverlayRef,
+    defaultTipCanvasRef,
+  } = canvasRefs;
 
-  // Drawing engine refs
-  const isDrawingRef = useRef(false);
-  const lastPosRef = useRef<Point | null>(null);
-  const distAccumRef = useRef(0);
-  const strokePointBufferRef = useRef<StrokePoint[]>([]);
-  // Photoshop-style stabilizer refs
-  const stabBrushPosRef = useRef<StrokePoint | null>(null);
-  const rawStylusPosRef = useRef<StrokePoint | null>(null);
-  const smearRafRef = useRef<number | null>(null);
-  const smearDirtyRef = useRef(false);
+  // ── Grouped brush refs ────────────────────────────────────────────────────
+  const brushRefs = {
+    tipCanvasCacheRef: useRef<Map<string, HTMLCanvasElement>>(new Map()),
+    // Precomputed fill style string — updated on color change, avoids hsvToRgb in hot path
+    colorFillStyleRef: useRef<string>("rgb(0,0,0)"),
+    brushBlendModeRef: useRef("source-over"),
+    prevBrushBlendModeRef: useRef("source-over"),
+    isBrushSizeAdjustingRef: useRef(false),
+    brushSizeAdjustStartXRef: useRef(0),
+    brushSizeAdjustOriginRef: useRef(0),
+    brushSizeOverlayStartPosRef: useRef<{ x: number; y: number } | null>(null),
+  } as const;
+  const {
+    tipCanvasCacheRef,
+    colorFillStyleRef,
+    brushBlendModeRef,
+    prevBrushBlendModeRef,
+    isBrushSizeAdjustingRef,
+    brushSizeAdjustStartXRef,
+    brushSizeAdjustOriginRef,
+    brushSizeOverlayStartPosRef,
+  } = brushRefs;
+
+  // ── Grouped drawing refs ──────────────────────────────────────────────────
+  const drawingRefs = {
+    isDrawingRef: useRef(false),
+    // Guards undo/redo during the window between isDrawingRef=false and pushHistory completing
+    isCommittingRef: useRef(false),
+    lastPosRef: useRef<Point | null>(null),
+    distAccumRef: useRef(0),
+    dualDistAccumRef: useRef(0),
+    // Stabilizer refs, pressure refs, and smear/preview RAF refs are now owned by useStrokeEngine
+    strokeCanvasCacheKeyRef: useRef<number>(1),
+    strokeCanvasLastBuiltGenRef: useRef<number>(0),
+    // needsFullCompositeRef: when true, composite() skips the dirty-rect optimisation
+    // and does a full repaint. Set to true after any canvas resize (splash screen, crop)
+    // so the first composite after a resize always paints the full canvas correctly.
+    needsFullCompositeRef: useRef<boolean>(false),
+    compositeRef: useRef<() => void>(() => {}),
+    pendingLayerPixelsRef: useRef<Map<string, ImageData>>(new Map()),
+    layersBeingExtractedRef: useRef<Set<string>>(new Set()),
+  } as const;
+  const {
+    isDrawingRef,
+    isCommittingRef,
+    lastPosRef,
+    distAccumRef,
+    dualDistAccumRef,
+    strokeCanvasCacheKeyRef,
+    strokeCanvasLastBuiltGenRef,
+    needsFullCompositeRef,
+    compositeRef,
+    pendingLayerPixelsRef,
+    layersBeingExtractedRef,
+  } = drawingRefs;
+
+  // ── Grouped state refs ────────────────────────────────────────────────────
+  const stateRefs = {
+    activeToolRef: useRef(activeTool),
+    activeSubpanelRef: useRef(activeSubpanel),
+    colorRef: useRef(color),
+    // (pressure window / cap refs moved to useStrokeEngine)
+    activeLayerAlphaLockRef: useRef(false),
+    activeLayerIdRef: useRef(activeLayerId),
+    layersRef: useRef(layers),
+    brushSettingsRef: useRef(brushSettings),
+    viewTransformRef: useRef(viewTransform),
+    zoomLockedRef: useRef(zoomLocked),
+    rotateLockedRef: useRef(rotateLocked),
+    isFlippedRef: useRef(false),
+    panLockedRef: useRef(false),
+  } as const;
+  const {
+    activeToolRef,
+    activeSubpanelRef,
+    colorRef,
+    activeLayerAlphaLockRef,
+    activeLayerIdRef,
+    layersRef,
+    brushSettingsRef,
+    viewTransformRef,
+    zoomLockedRef,
+    rotateLockedRef,
+    isFlippedRef,
+    panLockedRef,
+  } = stateRefs;
+
+  // ── Grouped view-transform input refs ────────────────────────────────────
+  const viewTransformInputRefs = {
+    spaceDownRef: useRef(false),
+    zoomModeRef: useRef(false),
+    rKeyDownRef: useRef(false),
+    isPanningRef: useRef(false),
+    panStartRef: useRef({ x: 0, y: 0 }),
+    panOriginRef: useRef({ x: 0, y: 0 }),
+    isRotatingRef: useRef(false),
+    rotOriginRef: useRef(0),
+    rotAngleOriginRef: useRef(0),
+    rotCenterRef: useRef({ x: 0, y: 0 }),
+    isZoomDraggingRef: useRef(false),
+    zoomDragStartXRef: useRef(0),
+    zoomDragOriginRef: useRef(1),
+    zKeyDownRef: useRef(false),
+    zoomDragCursorStartRef: useRef({ x: 0, y: 0 }),
+    zoomDragPanOriginRef: useRef({ x: 0, y: 0 }),
+    rotDragCursorRef: useRef({ x: 0, y: 0 }),
+    rotDragCanvasPointRef: useRef({ x: 0, y: 0 }),
+    rotDragPanOriginRef: useRef({ x: 0, y: 0 }),
+    altSpaceModeRef: useRef(false),
+  } as const;
+  const {
+    spaceDownRef,
+    zoomModeRef,
+    rKeyDownRef,
+    isPanningRef,
+    panStartRef,
+    panOriginRef,
+    isRotatingRef,
+    rotOriginRef,
+    rotAngleOriginRef,
+    rotCenterRef,
+    isZoomDraggingRef,
+    zoomDragStartXRef,
+    zoomDragOriginRef,
+    zKeyDownRef,
+    zoomDragCursorStartRef,
+    zoomDragPanOriginRef,
+    rotDragCursorRef,
+    rotDragCanvasPointRef,
+    rotDragPanOriginRef,
+    altSpaceModeRef,
+  } = viewTransformInputRefs;
+
+  // ── Grouped tool refs ─────────────────────────────────────────────────────
+  const toolRefs = {
+    wandToleranceRef: useRef(13),
+    wandContiguousRef: useRef(true),
+    wandGrowShrinkRef: useRef(0),
+    eyedropperSampleSourceRef: useRef<"canvas" | "layer">("canvas"),
+    eyedropperSampleSizeRef: useRef<1 | 3 | 5>(1),
+    eyedropperIsPressedRef: useRef(false),
+    eyedropperHoverColorRef: useRef<{ r: number; g: number; b: number }>({
+      r: 0,
+      g: 0,
+      b: 0,
+    }),
+    altEyedropperActiveRef: useRef(false),
+    prevToolRef: useRef<Tool>("brush"),
+  } as const;
+  const {
+    wandToleranceRef,
+    wandContiguousRef,
+    wandGrowShrinkRef,
+    eyedropperSampleSourceRef,
+    eyedropperSampleSizeRef,
+    eyedropperIsPressedRef,
+    eyedropperHoverColorRef,
+    altEyedropperActiveRef,
+    prevToolRef,
+  } = toolRefs;
+
+  // ── Grouped UI refs ───────────────────────────────────────────────────────
+  const uiRefs = {
+    currentPointerTypeRef: useRef<string>("mouse"),
+    penDownCountRef: useRef(0),
+    pointerScreenPosRef: useRef<{ x: number; y: number }>({ x: 0, y: 0 }),
+    lastPaintLayerIdRef: useRef<string>(activeLayerId),
+    lastPaintToolRef2: useRef<Tool>("brush"),
+    cancelInProgressSelectionRef: useRef<() => void>(() => {}),
+    commitInProgressLassoRef: useRef<() => void>(() => {}),
+    updateNavigatorCanvasRef: useRef<() => void>(() => {}),
+    canvasWidthRef: useRef(CANVAS_WIDTH),
+    canvasHeightRef: useRef(CANVAS_HEIGHT),
+    // Guard: apply splash-screen dimensions exactly once after the canvas is ready
+    splashDimsAppliedRef: useRef(false),
+    _isIPadRef: useRef(
+      typeof navigator !== "undefined" &&
+        (/iPad/.test(navigator.userAgent) ||
+          (/Mac/.test(navigator.userAgent) && navigator.maxTouchPoints > 1)),
+    ),
+    // biome-ignore lint/correctness/noUnusedVariables: kept for potential future use in hotkey config
+    rotateHotkeyBehaviorRef: useRef<"hold" | "switch">("switch"),
+    wheelCommitTimerRef: useRef<number | null>(null),
+    opacityFirstDigitRef: useRef<number | null>(null),
+    opacityTimerRef: useRef<ReturnType<typeof setTimeout> | null>(null),
+    // Debounce refs for layer thumbnail updates — avoids React re-render on every stroke commit.
+    thumbDebounceRef: useRef<ReturnType<typeof setTimeout> | null>(null),
+    thumbDebounceLayerIdRef: useRef<string | null>(null),
+    thumbDebounceLcRef: useRef<HTMLCanvasElement | null>(null),
+    prewarmRafRef: useRef<number | null>(null),
+    hotkeysRef: useRef<Record<string, HotkeyAction>>(loadHotkeys()),
+    shiftHeldRef: useRef(false),
+    rulerEditHistoryDepthRef: useRef(0),
+    applyTransformToDOMRef: useRef<(vt: ViewTransform) => void>(() => {}),
+  } as const;
+  const {
+    currentPointerTypeRef,
+    penDownCountRef,
+    pointerScreenPosRef,
+    lastPaintLayerIdRef,
+    lastPaintToolRef2,
+    cancelInProgressSelectionRef,
+    commitInProgressLassoRef,
+    updateNavigatorCanvasRef,
+    canvasWidthRef,
+    canvasHeightRef,
+    splashDimsAppliedRef,
+    _isIPadRef,
+    // biome-ignore lint/correctness/noUnusedVariables: kept for potential future use in hotkey config
+    rotateHotkeyBehaviorRef,
+    wheelCommitTimerRef,
+    opacityFirstDigitRef,
+    opacityTimerRef,
+    thumbDebounceRef,
+    thumbDebounceLayerIdRef,
+    thumbDebounceLcRef,
+    prewarmRafRef,
+    hotkeysRef,
+    shiftHeldRef,
+    rulerEditHistoryDepthRef,
+    applyTransformToDOMRef,
+  } = uiRefs;
+
+  // Undo/redo stacks (not grouped — used directly as history primitives)
   const undoStackRef = useRef<UndoEntry[]>([]);
   const redoStackRef = useRef<UndoEntry[]>([]);
-  const strokeStartSnapshotRef = useRef<ImageData | null>(null);
-  const strokeBufferRef = useRef<HTMLCanvasElement | null>(null);
-  const webglBrushRef = useRef<WebGLBrushContext | null>(null);
-  const belowActiveCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const aboveActiveCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const snapshotCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const activePreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const activeToolRef = useRef(activeTool);
-  const activeSubpanelRef = useRef(activeSubpanel);
-  const presetsRef = useRef(presets);
-  const activePresetIdsRef = useRef(activePresetIds);
-  const brushSizesRef = useRef(brushSizes);
-  const colorRef = useRef(color);
-  const brushOpacityRef = useRef(color.a);
-  const strokeCommitOpacityRef = useRef(1.0);
-  const backgroundColorRef = useRef("#ffffff");
-  const activeLayerIdRef = useRef(activeLayerId);
-  const layersRef = useRef(layers);
-  const brushSettingsRef = useRef(brushSettings);
-  const viewTransformRef = useRef(viewTransform);
-  const zoomLockedRef = useRef(zoomLocked);
-  const rotateLockedRef = useRef(rotateLocked);
-  const smoothedPressureRef = useRef(0.5);
-  const tipCanvasCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
 
-  // Precomputed fill style string — updated on color change, avoids hsvToRgb in hot path
-  const colorFillStyleRef = useRef<string>("rgb(0,0,0)");
-  const wheelCommitTimerRef = useRef<number | null>(null);
-  const applyTransformToDOMRef = useRef<(vt: ViewTransform) => void>(() => {});
-  const defaultTipCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // ─── useStrokeEngine: stroke lifecycle, stampWebGL, smudge, tail RAF ──────
+  const {
+    tailRafIdRef,
+    tailDoCommitRef,
+    strokeStartSnapshotRef,
+    strokeDirtyRectRef,
+    strokeSnapLayerRef,
+    strokeSnapshotPendingRef,
+    strokeStampsPlacedRef,
+    strokeWarmRawDistRef,
+    // Pressure tracking refs (moved from PaintingApp)
+    smoothedPressureRef,
+    prevPrimaryPressureRef,
+    lastCompositeOpacityRef,
+    flushDisplayCapRef,
+    strokeCommitOpacityRef,
+    // Stabilizer state refs (moved from PaintingApp)
+    stabBrushPosRef,
+    smoothBufferRef,
+    elasticPosRef,
+    elasticVelRef,
+    elasticRawPrevRef,
+    // Glide-to-finish / smear / preview RAF refs (moved from PaintingApp)
+    rawStylusPosRef,
+    smearDirtyRef,
+    smearRafRef,
+    strokePreviewRafRef,
+    strokePreviewPendingWorkRef,
+    // Stamp functions
+    stampDot,
+    stampWebGL,
+    renderBrushSegmentAlongPoints,
+    renderSmearAlongPoints,
+    initSmudgeBuffer,
+  } = useStrokeEngine({
+    webglBrushRef,
+    strokeBufferRef,
+    defaultTipCanvasRef,
+    tipCanvasCacheRef,
+    activeLayerIdRef,
+    distAccumRef,
+    dualDistAccumRef,
+    markLayerBitmapDirty,
+  });
 
-  // Direct-DOM transform for pan/zoom/rotate (avoids React re-renders during gesture)
-  const canvasWrapperRef = useRef<HTMLDivElement>(null);
-  const isFlippedRef = useRef(false);
+  // ── Ruler sub-hooks ────────────────────────────────────────────────────────
+  // scheduleRulerOverlay and pushHistory are defined later in this component;
+  // we forward them via stable callback refs to avoid forward-reference issues.
+  const scheduleRulerOverlayRef = useRef<() => void>(() => {});
+  const scheduleRulerOverlayForHooks = useCallback(() => {
+    scheduleRulerOverlayRef.current();
+  }, []);
 
-  // Alt-eyedropper refs
-  const prevToolRef = useRef<Tool>("brush");
-  const altEyedropperActiveRef = useRef(false);
+  const pushHistoryRef = useRef<(entry: UndoEntry) => void>(() => {});
+  const pushHistoryForHooks = useCallback((entry: UndoEntry) => {
+    pushHistoryRef.current(entry);
+  }, []);
 
-  // Selection refs
+  // ── Selection animation + lasso refs (not grouped) ─────────────────────────
   const lassoModeRef = useRef<LassoMode>("free");
-  const selectionActiveRef = useRef(false);
-  const selectionGeometryRef = useRef<{
-    type: LassoMode;
-    points?: { x: number; y: number }[];
-    x?: number;
-    y?: number;
-    w?: number;
-    h?: number;
-  } | null>(null);
-  const selectionShapesRef = useRef<NonNullable<SelectionGeom>[]>([]);
-  const selectionBoundaryPathRef = useRef<{
-    segments: Array<[number, number, number, number]>;
-    chains: Array<Array<[number, number]>>;
-    dirty: boolean;
-  }>({ segments: [], chains: [], dirty: true });
-  const selectionMaskRef = useRef<HTMLCanvasElement | null>(null);
-  const selectionOverlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lassoIsDraggingRef = useRef(false);
+  const lassoHasPolyPointsRef = useRef(false);
+  const lassoStrokeStartRef = useRef<{ x: number; y: number } | null>(null);
+  const lassoLastTapTimeRef = useRef<number>(0);
+  const lassoLastTapPosRef = useRef<{ x: number; y: number } | null>(null);
+  const lassoFreeLastPtRef = useRef<{ x: number; y: number } | null>(null);
   const marchingAntsOffsetRef = useRef(0);
   const marchingAntsRafRef = useRef<number | null>(null);
-  // In-progress selection drawing
-  const isDrawingSelectionRef = useRef(false);
-  const selectionPolyClosingRef = useRef(false);
-  const selectionDraftPointsRef = useRef<{ x: number; y: number }[]>([]);
-  const selectionDraftCursorRef = useRef<{ x: number; y: number } | null>(null);
-  const selectionDraftBoundsRef = useRef<{
-    sx: number;
-    sy: number;
-    ex: number;
-    ey: number;
+  const marchingAntsLastDrawRef = useRef(0);
+  const drawAntsRef = useRef<(() => void) | null>(null);
+  // Ruler animation ref
+  const rulerRafRef = useRef<number | null>(null);
+  // Snap refs (owned by PaintingApp, shared with all ruler sub-hooks)
+  const strokeSnapOriginRef = useRef<Point | null>(null);
+  const strokeSnapDirRef = useRef<{ cos: number; sin: number } | null>(null);
+  const gridSnapLineRef = useRef<{
+    ax: number;
+    ay: number;
+    bx: number;
+    by: number;
   } | null>(null);
-  // Move/Transform float
-  const moveFloatCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const moveFloatOriginBoundsRef = useRef<{
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-  } | null>(null);
-  const isDraggingFloatRef = useRef(false);
-  const floatDragStartRef = useRef<{
-    px: number;
-    py: number;
-    fx: number;
-    fy: number;
-    origBounds?: { x: number; y: number; w: number; h: number };
-    initRotation?: number;
-  } | null>(null);
-  // Unified transform state — replaces separate moveFloatPosRef / transformCurrentBoundsRef / transformRotationRef
-  const xfStateRef = useRef<{
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-    rotation: number;
-  } | null>(null);
-  // Transform-specific
-  const transformPreSnapshotRef = useRef<ImageData | null>(null);
-  const transformPreCommitSnapshotRef = useRef<ImageData | null>(null);
-  const transformOrigFloatCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const transformActiveRef = useRef(false);
-  const transformHandleRef = useRef<string | null>(null);
-  const lastToolBeforeTransformRef = useRef<Tool | null>(null);
-  // Captured at selection start for undo tracking
-  const selectionBeforeRef = useRef<SelectionSnapshot | null>(null);
+  const strokeHvAxisRef = useRef<"h" | "v" | null>(null);
+  const strokeHvPivotRef = useRef<Point | null>(null);
 
-  // View transform interaction refs
-  const spaceDownRef = useRef(false);
-  const zoomModeRef = useRef(false);
-  const rKeyDownRef = useRef(false);
-  const isPanningRef = useRef(false);
-  const panStartRef = useRef({ x: 0, y: 0 });
-  const panOriginRef = useRef({ x: 0, y: 0 });
-  const isRotatingRef = useRef(false);
-  const rotStartRef = useRef(0);
-  const rotStartXRef = useRef(0);
-  const rotOriginRef = useRef(0);
-  const isZoomDraggingRef = useRef(false);
-  const zoomDragStartXRef = useRef(0);
-  const zoomDragOriginRef = useRef(1);
-  const zKeyDownRef = useRef(false);
-  const zoomDragCursorStartRef = useRef({ x: 0, y: 0 });
-  const zoomDragPanOriginRef = useRef({ x: 0, y: 0 });
-  const rotDragCursorRef = useRef({ x: 0, y: 0 });
-  const rotDragCanvasPointRef = useRef({ x: 0, y: 0 });
-  const rotDragPanOriginRef = useRef({ x: 0, y: 0 });
+  const rulerSnapRefs = useMemo(
+    () => ({
+      strokeSnapDirRef: strokeSnapDirRef as React.MutableRefObject<{
+        cos: number;
+        sin: number;
+        throughVP: boolean;
+        vpAnchorX?: number;
+        vpAnchorY?: number;
+      } | null>,
+      strokeHvAxisRef,
+      strokeHvPivotRef,
+      strokeSnapOriginRef,
+      gridSnapLineRef,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  const lineRuler = useLineRuler({
+    canvasWidthRef,
+    canvasHeightRef,
+    layersRef,
+    setLayers,
+    pushHistory: pushHistoryForHooks,
+    rulerEditHistoryDepthRef,
+    scheduleRulerOverlay: scheduleRulerOverlayForHooks,
+    activeToolRef,
+    snapRefs: rulerSnapRefs,
+    isFlippedRef,
+  });
+
+  const ruler1pt2pt = use1pt2ptPerspectiveRuler({
+    canvasWidthRef,
+    canvasHeightRef,
+    layersRef,
+    setLayers,
+    pushHistory: pushHistoryForHooks,
+    rulerEditHistoryDepthRef,
+    scheduleRulerOverlay: scheduleRulerOverlayForHooks,
+    activeToolRef,
+    snapRefs: rulerSnapRefs,
+  });
+
+  const ruler3pt5pt = use3pt5ptPerspectiveRuler({
+    canvasWidthRef,
+    canvasHeightRef,
+    layersRef,
+    setLayers,
+    pushHistory: pushHistoryForHooks,
+    rulerEditHistoryDepthRef,
+    scheduleRulerOverlay: scheduleRulerOverlayForHooks,
+    activeToolRef,
+    snapRefs: rulerSnapRefs,
+    shared2ptDragRefs: ruler1pt2pt,
+  });
+
+  const ellipseGridRuler = useEllipseGridRuler({
+    canvasWidthRef,
+    canvasHeightRef,
+    layersRef,
+    setLayers,
+    pushHistory: pushHistoryForHooks,
+    rulerEditHistoryDepthRef,
+    scheduleRulerOverlay: scheduleRulerOverlayForHooks,
+    activeToolRef,
+    snapRefs: rulerSnapRefs,
+  });
+
+  // All ruler drag refs are now owned by the four ruler sub-hooks.
+  // PaintingApp accesses them exclusively through the hook methods (handleXxxPointerDown,
+  // handleXxxPointerMove, handleXxxPointerUp, isXxxDragging).
+
+  const { getSnapPosition } = useSnapSystem({
+    lineRuler,
+    ruler1pt2pt,
+    ruler3pt5pt,
+    ellipseGridRuler,
+    layersRef,
+    shiftHeldRef,
+    strokeHvPivotRef,
+    strokeHvAxisRef,
+  });
 
   // Sync refs with state
+  // biome-ignore lint/correctness/useExhaustiveDependencies: liquifyHoldIntervalRef is a stable ref
   useEffect(() => {
     activeToolRef.current = activeTool;
-  }, [activeTool]);
-  useEffect(() => {
-    activeSubpanelRef.current = activeSubpanel;
-  }, [activeSubpanel]);
-  useEffect(() => {
-    presetsRef.current = presets;
-  }, [presets]);
-  useEffect(() => {
-    activePresetIdsRef.current = activePresetIds;
-  }, [activePresetIds]);
-  useEffect(() => {
-    toolSizesRef.current = toolSizes;
-  }, [toolSizes]);
-  useEffect(() => {
-    toolOpacitiesRef.current = toolOpacities;
-  }, [toolOpacities]);
-  useEffect(() => {
-    if (
-      activeTool === "brush" ||
-      activeTool === "smear" ||
-      activeTool === "eraser"
-    ) {
-      const presetId = activePresetIdsRef.current[activeTool];
-      if (presetId) {
-        const preset = presetsRef.current[activeTool]?.find(
-          (p) => p.id === presetId,
+    // Clear liquify hold interval when switching away from liquify
+    if (activeTool !== "liquify" && liquifyHoldIntervalRef.current) {
+      clearInterval(liquifyHoldIntervalRef.current);
+      liquifyHoldIntervalRef.current = null;
+    }
+    // Crop tool activation — delegated to useCropSystem
+    if (activeTool === "crop" && !isCropActiveRef.current) {
+      activateCrop();
+    }
+    if (activeTool !== "crop" && isCropActiveRef.current) {
+      deactivateCrop();
+      // Layer switch based on new tool
+      const newTool = activeTool;
+      if (
+        newTool === "brush" ||
+        newTool === "eraser" ||
+        newTool === "smudge" ||
+        newTool === "fill" ||
+        newTool === "eyedropper"
+      ) {
+        const targetId = lastPaintLayerIdRef.current;
+        if (targetId) {
+          setActiveLayerId(targetId);
+          activeLayerIdRef.current = targetId;
+        }
+      } else if (newTool === "ruler") {
+        const rulerLayer = layersRef.current.find((l) => l.isRuler);
+        if (rulerLayer) {
+          setActiveLayerId(rulerLayer.id);
+          activeLayerIdRef.current = rulerLayer.id;
+        }
+      }
+    }
+    // If the user switches to any non-ruler tool while the active layer is a ruler layer,
+    // automatically redirect them to the last paint layer.
+    if (activeTool !== "ruler" && activeTool !== "crop") {
+      const currentLayer = layersRef.current.find(
+        (l) => l.id === activeLayerIdRef.current,
+      );
+      if (currentLayer?.isRuler) {
+        const fallbackId = lastPaintLayerIdRef.current;
+        const fallbackLayer = layersRef.current.find(
+          (l) => l.id === fallbackId && !l.isRuler,
         );
-        if (preset) {
-          setBrushSettings(preset.settings);
-          // Restore preset's stored size if defined, otherwise restore tool's stored size
-          const sizeKey = activeTool === "eraser" ? "eraser" : "brush";
-          const restoredSize = preset.size ?? toolSizesRef.current[activeTool];
-          if (restoredSize !== undefined) {
-            setBrushSizes((prev) => ({ ...prev, [sizeKey]: restoredSize }));
-          }
-          // Restore preset's stored opacity if defined, otherwise restore tool's stored opacity
-          const restoredOpacity =
-            preset.opacity ?? toolOpacitiesRef.current[activeTool];
-          if (restoredOpacity !== undefined) {
-            setColor((prev) => ({ ...prev, a: restoredOpacity }));
-          }
-        }
-      } else {
-        // No preset active - restore tool's stored size/opacity
-        const sizeKey = activeTool === "eraser" ? "eraser" : "brush";
-        const storedSize = toolSizesRef.current[activeTool];
-        if (storedSize !== undefined) {
-          setBrushSizes((prev) => ({ ...prev, [sizeKey]: storedSize }));
-        }
-        const storedOpacity = toolOpacitiesRef.current[activeTool];
-        if (storedOpacity !== undefined) {
-          setColor((prev) => ({ ...prev, a: storedOpacity }));
+        const targetId = fallbackLayer
+          ? fallbackId
+          : layersRef.current.find((l) => !l.isRuler)?.id;
+        if (targetId) {
+          setActiveLayerId(targetId);
+          activeLayerIdRef.current = targetId;
         }
       }
     }
   }, [activeTool]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeSubpanelRef is a stable ref
+  useEffect(() => {
+    activeSubpanelRef.current = activeSubpanel;
+  }, [activeSubpanel]);
+  // presetsRef and activePresetIdsRef are now kept in sync by usePresetSystem.
+  // brushSizesRef (from usePresetSystem) is kept in sync below.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: brushSizesRef is a stable ref from usePresetSystem
   useEffect(() => {
     brushSizesRef.current = brushSizes;
   }, [brushSizes]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: colorRef is a stable ref
   useEffect(() => {
     colorRef.current = color;
   }, [color]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: brushOpacityRef is a stable ref from usePresetSystem
   useEffect(() => {
     brushOpacityRef.current = color.a;
   }, [color.a]);
+  // Keep brushSettingsSnapshotRef current so handleAddPreset reads latest settings
+  useEffect(() => {
+    brushSettingsSnapshotRef.current = brushSettings;
+  }, [brushSettings, brushSettingsSnapshotRef]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: colorFillStyleRef is a stable ref
   useEffect(() => {
     const col = color;
     const [r, g, b] = hsvToRgb(col.h, col.s, col.v);
     colorFillStyleRef.current = `rgb(${r},${g},${b})`;
   }, [color]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
   useEffect(() => {
     activeLayerIdRef.current = activeLayerId;
+    const al = layersRef.current.find((l) => l.id === activeLayerId);
+    activeLayerAlphaLockRef.current = al?.alphaLock ?? false;
+    // Invalidate below/above stroke canvas cache when active layer changes
+    strokeCanvasCacheKeyRef.current++;
+    // Keep module-level active layer ID in sync so getBitmapOrCanvas can bypass cache for it
+    setActiveLayerIdForBitmap(activeLayerId);
   }, [activeLayerId]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
   useEffect(() => {
     layersRef.current = layers;
+    const al = layers.find((l) => l.id === activeLayerIdRef.current);
+    activeLayerAlphaLockRef.current = al?.alphaLock ?? false;
+    // Invalidate below/above stroke canvas cache whenever layer stack changes
+    strokeCanvasCacheKeyRef.current++;
   }, [layers]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: brushSettingsRef is a stable ref
   useEffect(() => {
     brushSettingsRef.current = brushSettings;
   }, [brushSettings]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: viewTransformRef is a stable ref
   useEffect(() => {
     viewTransformRef.current = viewTransform;
   }, [viewTransform]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: brushBlendModeRef is a stable ref
   useEffect(() => {
     brushBlendModeRef.current = brushBlendMode;
   }, [brushBlendMode]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: isFlippedRef is a stable ref
   useEffect(() => {
     isFlippedRef.current = isFlipped;
   }, [isFlipped]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: lassoModeRef is a stable ref
   useEffect(() => {
     lassoModeRef.current = lassoMode;
   }, [lassoMode]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: wandToleranceRef is a stable ref
   useEffect(() => {
     wandToleranceRef.current = wandTolerance;
   }, [wandTolerance]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: wandContiguousRef is a stable ref
   useEffect(() => {
     wandContiguousRef.current = wandContiguous;
   }, [wandContiguous]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: wandGrowShrinkRef is a stable ref
   useEffect(() => {
-    fillModeRef.current = fillMode;
-  }, [fillMode]);
-  useEffect(() => {
-    fillSettingsRef.current = fillSettings;
-  }, [fillSettings]);
-  useEffect(() => {
-    selectionActiveRef.current = selectionActive;
-  }, [selectionActive]);
+    wandGrowShrinkRef.current = wandGrowShrink;
+  }, [wandGrowShrink]);
+  // fillMode/fillSettings sync effects are now inside useFillSystem
+  // compositeRef is now in drawingRefs group (declared above); it allows the
+  // selection hook to call composite() without a circular dep.
 
-  // Actions ref to avoid forward-reference issues in keyboard handler
-  const selectionActionsRef = useRef({
-    clearSelection: () => {},
-    deleteSelection: () => {},
-    cutOrCopyToLayer: (_cut: boolean) => {},
-    commitFloat: (_opts?: { keepSelection?: boolean }) => {},
-    revertTransform: () => {},
-    rasterizeSelectionMask: () => {},
-    extractFloat: (_fromSel: boolean) => {},
-  });
-
-  // Helper: snapshot current selection state for undo
-  const snapshotSelection = useCallback((): SelectionSnapshot => {
-    const mc = selectionMaskRef.current;
-    let maskDataURL: string | null = null;
-    if (mc) {
-      maskDataURL = mc.toDataURL();
-    }
-    const geom = selectionGeometryRef.current;
-    return {
-      geometry: geom
-        ? { ...geom, points: geom.points ? [...geom.points] : undefined }
-        : null,
-      maskDataURL,
-      active: selectionActiveRef.current,
-      shapes: selectionShapesRef.current.map((s) => ({
-        ...s,
-        points: s.points ? [...s.points] : undefined,
-      })),
-    };
-  }, []);
-
-  // Helper: restore selection snapshot
-  const restoreSelectionSnapshot = useCallback((snap: SelectionSnapshot) => {
-    selectionGeometryRef.current = snap.geometry;
-    selectionShapesRef.current = snap.shapes ?? [];
-    selectionBoundaryPathRef.current.dirty = true;
-    if (snap.maskDataURL) {
-      const mc = document.createElement("canvas");
-      mc.width = CANVAS_WIDTH;
-      mc.height = CANVAS_HEIGHT;
-      const mctx = mc.getContext("2d", { willReadFrequently: true })!;
-      const img = new Image();
-      img.onload = () => {
-        mctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-        mctx.drawImage(img, 0, 0);
-      };
-      img.src = snap.maskDataURL;
-      selectionMaskRef.current = mc;
-    } else {
-      selectionMaskRef.current = null;
-    }
-    selectionActiveRef.current = snap.active;
-    setSelectionActive(snap.active);
-  }, []);
-  useEffect(() => {
-    zoomLockedRef.current = zoomLocked;
-  }, [zoomLocked]);
-  useEffect(() => {
-    rotateLockedRef.current = rotateLocked;
-  }, [rotateLocked]);
-
-  // Helper: get active tool's current size
+  // biome-ignore lint/correctness/useExhaustiveDependencies: brushSizesRef is a stable ref from usePresetSystem
   const getActiveSize = useCallback(() => {
     const tool = activeToolRef.current;
     return tool === "eraser"
@@ -715,154 +1116,714 @@ export function PaintingApp() {
       : brushSizesRef.current.brush;
   }, []);
 
-  // Composite all visible layers onto display canvas
-  const composite = useCallback(() => {
-    const display = displayCanvasRef.current;
-    if (!display) return;
-    const ctx = display.getContext("2d", { willReadFrequently: true });
-    if (!ctx) return;
-    ctx.clearRect(0, 0, display.width, display.height);
-    // Fill background color
-    const bgLayer = layersRef.current.find((l) => l.id === "layer-background");
-    if (!bgLayer || bgLayer.visible) {
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = backgroundColorRef.current;
-      ctx.fillRect(0, 0, display.width, display.height);
-    }
-    const ls = layersRef.current;
-    // Precompute mask canvases
-    for (let i = ls.length - 1; i >= 0; i--) {
-      const layer = ls[i];
-      if (layer.id === "layer-background") continue;
-      if (!layer.visible) continue;
-      const lc = layerCanvasesRef.current.get(layer.id);
-      if (!lc) continue;
-      const layerMaskCanvas = layerMaskCanvasesRef.current.get(layer.id);
-      // If clipping mask, apply clip to layer below
-      if (layer.isClippingMask && i < ls.length - 1) {
-        // Find the layer below (non-clipping, non-background)
-        let belowLayer: Layer | null = null;
-        for (let j = i + 1; j < ls.length; j++) {
-          if (ls[j].id !== "layer-background" && !ls[j].isClippingMask) {
-            belowLayer = ls[j];
-            break;
-          }
-        }
-        if (belowLayer) {
-          const belowLc = layerCanvasesRef.current.get(belowLayer.id);
-          if (belowLc) {
-            if (
-              _clipTmpCanvas.width !== lc.width ||
-              _clipTmpCanvas.height !== lc.height
-            ) {
-              _clipTmpCanvas.width = lc.width;
-              _clipTmpCanvas.height = lc.height;
-              _clipTmpCtxCached = null;
-            }
-            if (!_clipTmpCtxCached)
-              _clipTmpCtxCached = _clipTmpCanvas.getContext("2d", {
-                willReadFrequently: true,
-              });
-            const tmpCtx = _clipTmpCtxCached!;
-            tmpCtx.clearRect(0, 0, lc.width, lc.height);
-            tmpCtx.globalAlpha = layer.opacity;
-            tmpCtx.globalCompositeOperation = "source-over";
-            tmpCtx.drawImage(lc, 0, 0);
-            if (layerMaskCanvas) {
-              tmpCtx.globalCompositeOperation = "destination-in";
-              tmpCtx.drawImage(layerMaskCanvas, 0, 0);
-              tmpCtx.globalCompositeOperation = "source-over";
-            }
-            tmpCtx.globalCompositeOperation = "destination-in";
-            tmpCtx.drawImage(belowLc, 0, 0);
-            tmpCtx.globalCompositeOperation = "source-over";
-            ctx.globalAlpha = 1;
-            ctx.globalCompositeOperation = (layer.blendMode ||
-              "source-over") as GlobalCompositeOperation;
-            ctx.drawImage(_clipTmpCanvas, 0, 0);
-            ctx.globalCompositeOperation = "source-over";
-            continue;
-          }
-        }
-      }
-      ctx.globalAlpha = layer.opacity;
-      ctx.globalCompositeOperation = (layer.blendMode ||
-        "source-over") as GlobalCompositeOperation;
-      if (layerMaskCanvas) {
-        if (
-          _clipTmpCanvas.width !== lc.width ||
-          _clipTmpCanvas.height !== lc.height
-        ) {
-          _clipTmpCanvas.width = lc.width;
-          _clipTmpCanvas.height = lc.height;
-          _clipTmpCtxCached = null;
-        }
-        if (!_clipTmpCtxCached)
-          _clipTmpCtxCached = _clipTmpCanvas.getContext("2d", {
-            willReadFrequently: true,
-          });
-        const tmpCtx = _clipTmpCtxCached!;
-        tmpCtx.clearRect(0, 0, lc.width, lc.height);
-        tmpCtx.drawImage(lc, 0, 0);
-        tmpCtx.globalCompositeOperation = "destination-in";
-        tmpCtx.drawImage(layerMaskCanvas, 0, 0);
-        ctx.drawImage(_clipTmpCanvas, 0, 0);
-      } else {
-        ctx.drawImage(lc, 0, 0);
-      }
-      ctx.globalCompositeOperation = "source-over";
-    }
-    ctx.globalAlpha = 1;
-    // Draw move/transform float if active
-    if (
-      moveFloatCanvasRef.current &&
-      (isDraggingFloatRef.current || transformActiveRef.current)
-    ) {
-      ctx.globalAlpha = 1;
-      ctx.globalCompositeOperation = "source-over";
-      const xf = xfStateRef.current;
-      const ob = moveFloatOriginBoundsRef.current;
-      const origFloat =
-        transformOrigFloatCanvasRef.current || moveFloatCanvasRef.current;
-      if (xf && ob && origFloat) {
-        const cx = xf.x + xf.w / 2;
-        const cy = xf.y + xf.h / 2;
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.rotate(xf.rotation);
-        ctx.drawImage(
-          origFloat,
-          ob.x,
-          ob.y,
-          ob.w,
-          ob.h,
-          -xf.w / 2,
-          -xf.h / 2,
-          xf.w,
-          xf.h,
-        );
-        ctx.restore();
-      } else if (xf) {
-        ctx.drawImage(moveFloatCanvasRef.current, xf.x, xf.y);
-      } else {
-        ctx.drawImage(moveFloatCanvasRef.current, 0, 0);
-      }
-    }
-  }, []);
+  // Stable pushHistory for useSelectionSystem — defined before the hook call to avoid forward-reference errors.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
+  const pushHistoryForSelection = useCallback(
+    (entry: unknown) => {
+      (undoStackRef.current as UndoEntry[]).push(entry as UndoEntry);
+      if (undoStackRef.current.length > 50) undoStackRef.current.shift();
+      redoStackRef.current = [];
+      setUndoCount(undoStackRef.current.length);
+      setRedoCount(0);
+      setHasUnsavedChanges(true);
+      isDirtyRef.current = true;
+    },
+    [undoStackRef, redoStackRef, setUndoCount, setRedoCount],
+  );
 
+  // rebuildChainsNowRef: synchronously rebuilds boundary chains from the given mask.
+  // Declared here (before useSelectionSystem) so it can be passed into both hooks.
+  // The actual implementation is wired in a useEffect below (needs selectionBoundaryPathRef).
+  const rebuildChainsNowRef = useRef<(mask: HTMLCanvasElement) => void>(
+    () => {},
+  );
+  // Stable ref for updateNavigatorCanvas — now in uiRefs group (declared above).
+  // The .current is synced to the real callback after it is defined.
+
+  // ---- Selection system hook ----
+  const {
+    selectionActive,
+    setSelectionActive,
+    selectionActiveRef,
+    selectionGeometryRef,
+    selectionShapesRef,
+    selectionBoundaryPathRef,
+    selectionMaskRef,
+    isDrawingSelectionRef,
+    selectionPolyClosingRef,
+    selectionDraftPointsRef,
+    selectionDraftCursorRef,
+    selectionDraftBoundsRef,
+    selectionBeforeRef,
+    selectionActionsRef,
+    snapshotSelection,
+    restoreSelectionSnapshot,
+    rasterizeSelectionMask,
+    clearSelection,
+    handleCtrlClickLayer,
+    cancelBoundaryRebuildRef,
+  } = useSelectionSystem({
+    canvasWidth: canvasWidth,
+    canvasHeight: canvasHeight,
+    canvasWidthRef,
+    canvasHeightRef,
+    layersRef,
+    newLayerFn: newLayer,
+    pushHistory: pushHistoryForSelection,
+    layerCanvasesRef,
+    activeLayerIdRef,
+    pendingLayerPixelsRef,
+    setLayers,
+    setActiveLayerId,
+    setActiveTool,
+    selectionOverlayCanvasRef,
+    compositeRef,
+    markLayerBitmapDirty,
+    rebuildChainsNowRef,
+  });
+
+  // Wire cancelBoundaryRebuildRef — called by clearSelection() to clear stale chains.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: selectionBoundaryPathRef is a stable ref
   useEffect(() => {
-    backgroundColorRef.current = backgroundColor;
-    composite();
-    // biome-ignore lint/correctness/useExhaustiveDependencies: composite is stable
-  }, [backgroundColor, composite]);
+    cancelBoundaryRebuildRef.current = () => {
+      const bdRef = selectionBoundaryPathRef.current;
+      bdRef.chains = [];
+      bdRef.segments = [];
+      bdRef.dirty = true;
+    };
+  }, [selectionBoundaryPathRef]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
+  useEffect(() => {
+    rebuildChainsNowRef.current = (mask: HTMLCanvasElement) => {
+      _rebuildChainsNow(
+        mask,
+        selectionBoundaryPathRef.current,
+        canvasWidthRef.current,
+        canvasHeightRef.current,
+        isIPad,
+      );
+    };
+  }, [selectionBoundaryPathRef]);
+
+  // ---- Layer tree stable refs (declared early for useTransformSystem) ----
+  // These are populated/synced once useLayerSystem returns below.
+  const layerTreeRef = useRef<import("../types").LayerNode[]>([]);
+  const selectedLayerIdsRef = useRef<Set<string>>(new Set());
+  // Stable ref for setLayerTree — populated after useLayerSystem returns below.
+  const setLayerTreeRef = useRef<
+    React.Dispatch<React.SetStateAction<import("../types").LayerNode[]>>
+  >(() => {});
+
+  // BUG_3b: Stable ref to markLayerBitmapDirty so useTransformSystem can call it
+  const markLayerBitmapDirtyRef =
+    useRef<(id: string) => void>(markLayerBitmapDirty);
+  // BUG_3b: layersBeingExtractedRef is now in drawingRefs group (declared above).
+
+  // ---- Transform system hook ----
+  const {
+    moveFloatCanvasRef,
+    moveFloatOriginBoundsRef,
+    isDraggingFloatRef,
+    floatDragStartRef,
+    xfStateRef,
+    transformPreSnapshotRef,
+    transformPreCommitSnapshotRef,
+    transformOrigFloatCanvasRef,
+    transformActiveRef,
+    transformHandleRef,
+    lastToolBeforeTransformRef,
+    multiFloatCanvasesRef,
+    multiLayerResolvedIdsRef,
+    transformActionsRef,
+  } = useTransformSystem({
+    canvasWidth: canvasWidth,
+    canvasHeight: canvasHeight,
+    canvasWidthRef,
+    canvasHeightRef,
+    setActiveTool,
+    setActiveSubpanel,
+    setSelectionActive,
+    setIsTransformActive,
+    setIsDraggingFloatState,
+    setUndoCount,
+    setRedoCount,
+    layerCanvasesRef,
+    activeLayerIdRef,
+    layerTreeRef,
+    selectedLayerIdsRef,
+    undoStackRef,
+    redoStackRef,
+    selectionActiveRef,
+    selectionMaskRef,
+    selectionGeometryRef,
+    selectionShapesRef,
+    selectionBoundaryPathRef,
+    compositeRef,
+    rebuildChainsNowRef,
+    markLayerBitmapDirtyRef,
+    layersBeingExtractedRef,
+  });
+
+  // ─── useCompositing: composite, compositeWithStrokePreview, buildStrokeCanvases, etc. ──
+  const {
+    composite,
+    compositeWithStrokePreview,
+    buildStrokeCanvases,
+    flushStrokeBuffer,
+    scheduleComposite,
+    _strokeCommitDirty,
+  } = useCompositing({
+    displayCanvasRef,
+    belowActiveCanvasRef,
+    aboveActiveCanvasRef,
+    snapshotCanvasRef,
+    activePreviewCanvasRef,
+    strokeBufferRef,
+    layerCanvasesRef,
+    layerTreeRef,
+    layersRef,
+    activeLayerIdRef,
+    activeLayerAlphaLockRef,
+    brushBlendModeRef,
+    tailRafIdRef,
+    needsFullCompositeRef,
+    strokeDirtyRectRef,
+    strokeStartSnapshotRef,
+    strokeCanvasCacheKeyRef,
+    strokeCanvasLastBuiltGenRef,
+    selectionActiveRef,
+    selectionMaskRef,
+    layersBeingExtractedRef,
+    isDraggingFloatRef,
+    transformActiveRef,
+    multiFloatCanvasesRef,
+    multiLayerResolvedIdsRef,
+    moveFloatCanvasRef,
+    moveFloatOriginBoundsRef,
+    xfStateRef,
+    transformOrigFloatCanvasRef,
+    webglBrushRef,
+    getActiveSize,
+  });
+
+  // ---- History hook ----
+  // Stable ref pointing to the current revertTransform function (wired up after useTransformSystem)
+  const revertTransformRef = useRef<() => void>(() => {});
+  // Stable ref so useHistory's useEffect dependency doesn't re-trigger every render
+  // biome-ignore lint/correctness/useExhaustiveDependencies: displayCanvasRef is a stable ref
+  const updateNavigatorCanvas = useCallback(() => {
+    const display = displayCanvasRef.current;
+    if (display) {
+      const navH = _navThumbCanvas.height;
+      _navThumbCtx.clearRect(0, 0, NAV_THUMB_W, navH);
+      _navThumbCtx.drawImage(display, 0, 0, NAV_THUMB_W, navH);
+    }
+    setNavigatorVersion((v) => v + 1);
+  }, []);
+  // Keep the early ref in sync with the memoized callback
+  // biome-ignore lint/correctness/useExhaustiveDependencies: updateNavigatorCanvasRef is a stable ref
+  useEffect(() => {
+    updateNavigatorCanvasRef.current = updateNavigatorCanvas;
+  }, [updateNavigatorCanvas]);
+
+  // ── Canvas-dirty signal ───────────────────────────────────────────────────
+  // Register updateNavigatorCanvas as the composite-done callback so it fires
+  // automatically after every composite() call. This eliminates the need for
+  // scattered explicit updateNavigatorCanvas() calls after each operation.
+  useEffect(() => {
+    setCompositeDoneCallback(updateNavigatorCanvas);
+    return () => clearCompositeDoneCallback();
+  }, [updateNavigatorCanvas]);
+
+  // Register the centralised markCanvasDirty callbacks so hooks across the codebase
+  // can call markCanvasDirty(layerId) instead of scattering setLayerThumbnails /
+  // setNavigatorVersion calls everywhere.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: setLayerThumbnails and setNavigatorVersion are stable React dispatch fns
+  useEffect(() => {
+    registerCanvasDirtyCallbacks({
+      setLayerThumbnails,
+      setNavigatorVersion,
+      getLayerThumbnail: (layerId: string) => {
+        const lc = layerCanvasesRef.current.get(layerId);
+        if (!lc) return "";
+        return generateLayerThumbnail(lc, getThumbCanvas(), getThumbCtx());
+      },
+    });
+  }, [setLayerThumbnails, setNavigatorVersion]);
+  const {
+    handleUndo,
+    handleRedo,
+    pushHistory: _rawPushHistory,
+  } = useHistory({
+    setUndoCount,
+    setRedoCount,
+    canvasWidth: canvasWidth,
+    canvasHeight: canvasHeight,
+    layers,
+    setLayers,
+    setLayerTreeRef,
+    setActiveLayerId,
+    updateNavigatorCanvas,
+    composite,
+    restoreSelectionSnapshot,
+    moveFloatCanvasRef,
+    xfStateRef,
+    isDraggingFloatRef,
+    transformActiveRef,
+    transformPreSnapshotRef,
+    transformPreCommitSnapshotRef,
+    transformOrigFloatCanvasRef,
+    setIsTransformActive,
+    setIsDraggingFloatState,
+    revertTransformRef,
+    setCanvasWidth,
+    setCanvasHeight,
+    displayCanvasRef,
+    rulerCanvasRef,
+    webglBrushRef,
+    belowActiveCanvasRef,
+    aboveActiveCanvasRef,
+    snapshotCanvasRef,
+    activePreviewCanvasRef,
+    undoStackRef,
+    redoStackRef,
+    pendingLayerPixelsRef,
+    layerCanvasesRef,
+    selectionActiveRef,
+    selectionMaskRef,
+    canvasWidthRef,
+    canvasHeightRef,
+    markLayerBitmapDirty,
+    invalidateAllLayerBitmaps,
+  });
+
+  // Wire revertTransformRef to the current revertTransform from useTransformSystem
+  useEffect(() => {
+    revertTransformRef.current = transformActionsRef.current.revertTransform;
+  }, [transformActionsRef]);
+
+  // ─── File I/O system ────────────────────────────────────────────────────────
+  const {
+    hasUnsavedChanges,
+    setHasUnsavedChanges,
+    isDirtyRef,
+    fileLoadInputRef,
+    handleSaveFile,
+    handleSilentSave,
+    handleLoadFile,
+  } = useFileIOSystem({
+    layersRef,
+    layerCanvasesRef,
+    activeLayerIdRef,
+    canvasWidthRef,
+    canvasHeightRef,
+    undoStackRef,
+    redoStackRef,
+    pendingLayerPixelsRef,
+    transformActiveRef,
+    selectionActionsRef,
+    displayCanvasRef,
+    rulerCanvasRef,
+    webglBrushRef,
+    belowActiveCanvasRef,
+    aboveActiveCanvasRef,
+    snapshotCanvasRef,
+    activePreviewCanvasRef,
+    layerTreeRef,
+    setLayerTreeRef,
+    setCanvasWidth,
+    setCanvasHeight,
+    setLayers,
+    setActiveLayerId,
+    setUndoCount,
+    setRedoCount,
+    clearSelection,
+    registerGetSktchBlob,
+    registerLoadFile,
+  });
+
+  // App-level initialization: themes, beforeunload guard, preset loading, hotkey reload
+  useAppInitialization({
+    isDirtyRef,
+    hotkeysRef,
+    onPresetsLoaded: (loaded, loadedBrushSettings) => {
+      setPresets(loaded);
+      setBrushSettings(loadedBrushSettings);
+    },
+  });
+
+  // Wrapped pushHistory that marks unsaved changes
+  // biome-ignore lint/correctness/useExhaustiveDependencies: isDirtyRef and setHasUnsavedChanges are stable refs/setters
+  const pushHistory = useCallback(
+    (entry: Parameters<typeof _rawPushHistory>[0]) => {
+      _rawPushHistory(entry);
+      setHasUnsavedChanges(true);
+      isDirtyRef.current = true;
+    },
+    [_rawPushHistory],
+  );
+  // Wire the stable ref so ruler sub-hooks (instantiated earlier) get the
+  // real pushHistory with unsaved-changes tracking.
+  pushHistoryRef.current = pushHistory;
+
+  // ─── Adjustments system ────────────────────────────────────────────────────
+  const {
+    handleAdjustmentsToggle,
+    onAdjustmentsPreview,
+    onAdjustmentsComposite,
+    onAdjustmentsThumbnailUpdate,
+    onAdjustmentsMarkLayerDirty,
+    onAdjustmentsPushUndo,
+  } = useAdjustmentsSystem({
+    activeSubpanelRef,
+    setActiveSubpanel,
+    scheduleComposite,
+    composite,
+    markLayerBitmapDirty,
+    pushHistory,
+  });
+
+  // ─── Fill system ────────────────────────────────────────────────────────────
+  const {
+    fillMode,
+    setFillMode,
+    fillSettings,
+    setFillSettings,
+    fillModeRef,
+    fillSettingsRef,
+    lassoFillOriginRef,
+    isLassoFillDrawingRef,
+    lassoFillPointsRef,
+    gradientDragStartRef,
+    gradientDragEndRef,
+    isGradientDraggingRef,
+    handleFillPointerDown,
+    handleFillPointerMove,
+    handleFillPointerUp,
+  } = useFillSystem({
+    isIPad,
+    colorRef,
+    activeLayerIdRef,
+    layersRef,
+    layerCanvasesRef,
+    selectionMaskRef,
+    selectionActiveRef,
+    strokeStartSnapshotRef,
+    pushHistory,
+    composite,
+    scheduleComposite,
+  });
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: zoomLockedRef is a stable ref
+  useEffect(() => {
+    zoomLockedRef.current = zoomLocked;
+  }, [zoomLocked]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: rotateLockedRef is a stable ref
+  useEffect(() => {
+    rotateLockedRef.current = rotateLocked;
+  }, [rotateLocked]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: panLockedRef is a stable ref
+  useEffect(() => {
+    panLockedRef.current = panLocked;
+  }, [panLocked]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: eyedropperSampleSourceRef is a stable ref
+  useEffect(() => {
+    eyedropperSampleSourceRef.current = eyedropperSampleSource;
+  }, [eyedropperSampleSource]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: eyedropperSampleSizeRef is a stable ref
+  useEffect(() => {
+    eyedropperSampleSizeRef.current = eyedropperSampleSize;
+  }, [eyedropperSampleSize]);
+
+  // Helper: get active tool's current size
+
+  // Wire compositeRef so selection hook can call composite without circular dep
+  // biome-ignore lint/correctness/useExhaustiveDependencies: compositeRef is a stable ref
+  useEffect(() => {
+    compositeRef.current = composite;
+  }, [composite]);
+
+  // ─── Crop system ────────────────────────────────────────────────────────────
+  const {
+    isCropActive,
+    cropRectVersion,
+    isCropActiveRef,
+    cropRectRef,
+    cropDragRef,
+    cropPrevViewRef,
+    cropPrevToolRef,
+    setCropRectVersion,
+    activateCrop,
+    deactivateCrop,
+    commitCrop,
+    handleCropCancel,
+    handleCropHandlePointerDown,
+  } = useCropSystem({
+    canvasWidthRef,
+    canvasHeightRef,
+    setCanvasWidth,
+    setCanvasHeight,
+    layersRef,
+    layerCanvasesRef,
+    setLayers,
+    displayCanvasRef,
+    rulerCanvasRef,
+    belowActiveCanvasRef,
+    aboveActiveCanvasRef,
+    snapshotCanvasRef,
+    activePreviewCanvasRef,
+    webglBrushRef,
+    strokeCanvasCacheKeyRef,
+    needsFullCompositeRef,
+    onInvalidateOverlayCtx: () => {
+      _overlayCtxCached = null;
+    },
+    navThumbCanvasRef: navigatorCanvasRef,
+    navThumbW: NAV_THUMB_W,
+    composite,
+    viewTransformRef,
+    isFlippedRef,
+    setViewTransform,
+    setActiveTool,
+    containerRef,
+    pushHistory,
+    clearSelection,
+  });
+
+  // Reset the active ruler to canvas-center defaults (undoable)
+  const handleResetCurrentRuler = () => {
+    const ruler = layersRef.current.find((l) => l.isRuler);
+    if (!ruler) return;
+    const cx = canvasWidthRef.current / 2;
+    const cy = canvasHeightRef.current / 2;
+    const half =
+      Math.min(canvasWidthRef.current, canvasHeightRef.current) * 0.15;
+    const spread2pt = canvasWidthRef.current * 0.25;
+    const rtype = ruler.rulerPresetType ?? "perspective-1pt";
+    const isLine = rtype === "line";
+    const is2pt = rtype === "perspective-2pt";
+    const is3pt = rtype === "perspective-3pt";
+    const is5pt = rtype === "perspective-5pt";
+    const isOval = rtype === "oval";
+    const isGrid = rtype === "grid";
+
+    // Build the "after" (reset) state
+    const afterState: Record<string, unknown> = {
+      horizonAngle: 0,
+      rulerWarmupDist: 10,
+    };
+    if (!isLine && !is2pt && !is3pt && !is5pt) {
+      afterState.vpX = cx;
+      afterState.vpY = cy;
+    }
+    if (is2pt || is3pt) {
+      afterState.horizonCenterX = cx;
+      afterState.horizonCenterY = cy;
+      afterState.vp1X = cx - spread2pt;
+      afterState.vp1Y = cy;
+      afterState.vp2X = cx + spread2pt;
+      afterState.vp2Y = cy;
+      afterState.rulerGridBX = cx;
+      afterState.rulerGridBY = cy + 120;
+      if (is3pt) {
+        afterState.rulerVP3Y = cy - 200;
+        afterState.rulerHandleDX = cx - spread2pt / 4;
+        afterState.rulerHandleDY = cy - 70;
+      }
+    }
+    if (isLine) {
+      afterState.lineX1 = cx - half;
+      afterState.lineY1 = cy;
+      afterState.lineX2 = cx + half;
+      afterState.lineY2 = cy;
+    }
+    if (isOval) {
+      afterState.ovalCenterX = cx;
+      afterState.ovalCenterY = cy;
+      afterState.ovalAngle = 0;
+      afterState.ovalSemiMajor = 120;
+      afterState.ovalSemiMinor = 60;
+    }
+    if (is5pt) {
+      afterState.fivePtCenterX = cx;
+      afterState.fivePtCenterY = cy;
+      afterState.fivePtHandleADist = 40;
+      afterState.fivePtHandleBDist = 40;
+      afterState.fivePtRotation = 0;
+    }
+    if (isGrid) {
+      const half2 = 150;
+      afterState.gridCorners = [
+        { x: cx - half2, y: cy - half2 },
+        { x: cx + half2, y: cy - half2 },
+        { x: cx + half2, y: cy + half2 },
+        { x: cx - half2, y: cy + half2 },
+      ];
+    }
+
+    // Build before state from current ruler
+    const { isRuler: _ir, rulerActive: _ra, ...beforeState } = ruler;
+    pushHistory({
+      type: "ruler-edit",
+      layerId: ruler.id,
+      before: beforeState,
+      after: afterState as typeof beforeState,
+    });
+
+    setLayers((prev) =>
+      prev.map((l) => (l.id === ruler.id ? { ...l, ...afterState } : l)),
+    );
+    layersRef.current = layersRef.current.map((l) =>
+      l.id === ruler.id ? { ...l, ...afterState } : l,
+    );
+    scheduleRulerOverlay();
+  };
+
+  // Clear all ruler layers (undoable)
+  const handleClearAllRulers = () => {
+    const rulerLayers = layersRef.current.filter((l) => l.isRuler);
+    if (rulerLayers.length === 0) return;
+    const removedLayers = rulerLayers.map((layer) => ({
+      layer,
+      index: layersRef.current.findIndex((l) => l.id === layer.id),
+    }));
+    pushHistory({ type: "layers-clear-rulers", removedLayers });
+    const ids = new Set(rulerLayers.map((l) => l.id));
+    setLayers((prev) => prev.filter((l) => !ids.has(l.id)));
+    layersRef.current = layersRef.current.filter((l) => !ids.has(l.id));
+    scheduleRulerOverlay();
+  };
+
+  // scheduleComposite and _strokeCommitDirty are now from useCompositing hook above
+
+  // Cancel any in-progress selection drawing (lasso, rect, ellipse, wand)
+  // cancelInProgressSelectionRef is in uiRefs group (declared above); just wire its .current:
+  cancelInProgressSelectionRef.current = () => {
+    if (!isDrawingSelectionRef.current) return;
+    isDrawingSelectionRef.current = false;
+    selectionDraftPointsRef.current = [];
+    selectionDraftBoundsRef.current = null;
+    selectionDraftCursorRef.current = null;
+    lassoHasPolyPointsRef.current = false;
+    lassoIsDraggingRef.current = false;
+    lassoStrokeStartRef.current = null;
+    selectionPolyClosingRef.current = false;
+    scheduleComposite();
+  };
+
+  // Commit an in-progress lasso (freehand/polygon) selection
+  // commitInProgressLassoRef is in uiRefs group (declared above); just wire its .current:
+  commitInProgressLassoRef.current = () => {
+    if (!isDrawingSelectionRef.current) return;
+    const mode = lassoModeRef.current;
+    if (mode === "rect" || mode === "ellipse") {
+      const sb = selectionDraftBoundsRef.current;
+      if (sb) {
+        const x = Math.min(sb.sx, sb.ex);
+        const y = Math.min(sb.sy, sb.ey);
+        const w = Math.abs(sb.ex - sb.sx);
+        const h = Math.abs(sb.ey - sb.sy);
+        if (w > 1 && h > 1) {
+          if (mode === "rect") {
+            selectionGeometryRef.current = { type: "rect", x, y, w, h };
+            selectionShapesRef.current = [
+              { type: "rect" as LassoMode, x, y, w, h },
+            ];
+          } else {
+            selectionGeometryRef.current = { type: "ellipse", x, y, w, h };
+            selectionShapesRef.current = [
+              { type: "ellipse" as LassoMode, x, y, w, h },
+            ];
+          }
+          selectionBoundaryPathRef.current.dirty = true;
+          rasterizeSelectionMask();
+          setSelectionActive(true);
+        } else {
+          clearSelection();
+        }
+        selectionDraftBoundsRef.current = null;
+        isDrawingSelectionRef.current = false;
+        const afterSnap = snapshotSelection();
+        pushHistory({
+          type: "selection",
+          before: selectionBeforeRef.current ?? afterSnap,
+          after: afterSnap,
+        });
+        selectionBeforeRef.current = null;
+        scheduleComposite();
+      }
+      return;
+    }
+    if (mode === "wand") {
+      cancelInProgressSelectionRef.current();
+      return;
+    }
+    // Free/polygon lasso
+    const pts = selectionDraftPointsRef.current;
+    if (pts.length >= 3) {
+      selectionGeometryRef.current = { type: "free", points: [...pts] };
+      selectionShapesRef.current = [
+        { type: "free" as LassoMode, points: [...pts] },
+      ];
+      selectionBoundaryPathRef.current.dirty = true;
+      rasterizeSelectionMask();
+      setSelectionActive(true);
+      const afterSnap = snapshotSelection();
+      pushHistory({
+        type: "selection",
+        before: selectionBeforeRef.current ?? afterSnap,
+        after: afterSnap,
+      });
+      selectionBeforeRef.current = null;
+    } else {
+      clearSelection();
+    }
+    selectionDraftPointsRef.current = [];
+    selectionDraftCursorRef.current = null;
+    isDrawingSelectionRef.current = false;
+    lassoHasPolyPointsRef.current = false;
+    lassoIsDraggingRef.current = false;
+    lassoStrokeStartRef.current = null;
+    selectionPolyClosingRef.current = false;
+    scheduleComposite();
+  };
 
   // Marching ants animation loop
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable (useRef)
   useEffect(() => {
     const overlay = selectionOverlayCanvasRef.current;
     if (!overlay) return;
     const drawAnts = () => {
+      // Continue the loop while a selection is active OR while a selection is
+      // being drawn (lasso/rect/ellipse draft) so the in-progress preview is visible.
+      // BUG_3a FIX: Also keep the loop alive while a transform is active so the
+      // transform bounding box is drawn even when no selection is present.
+      if (
+        !selectionActiveRef.current &&
+        !isDrawingSelectionRef.current &&
+        !transformActiveRef.current
+      ) {
+        marchingAntsRafRef.current = null;
+        if (!_overlayCtxCached)
+          _overlayCtxCached = overlay.getContext("2d", {
+            willReadFrequently: !isIPad,
+          });
+        const ctx2 = _overlayCtxCached;
+        if (ctx2) ctx2.clearRect(0, 0, overlay.width, overlay.height);
+        return;
+      }
       marchingAntsRafRef.current = requestAnimationFrame(drawAnts);
-      const ctx = overlay.getContext("2d", { willReadFrequently: true });
+      // Throttle actual canvas work to ~60fps (~16ms interval) for performance.
+      const now = performance.now();
+      if (now - marchingAntsLastDrawRef.current < 16) return;
+      marchingAntsLastDrawRef.current = now;
+      if (!_overlayCtxCached)
+        _overlayCtxCached = overlay.getContext("2d", {
+          willReadFrequently: !isIPad,
+        });
+      const ctx = _overlayCtxCached;
       if (!ctx) return;
       ctx.clearRect(0, 0, overlay.width, overlay.height);
 
@@ -901,120 +1862,10 @@ export function PaintingApp() {
         geom: typeof selectionGeometryRef.current,
       ) => {
         if (!geom) return;
-        if (geom.type === "mask") {
-          const shapes = selectionShapesRef.current;
-          // Compute union boundary from mask if dirty
-          const bdRef = selectionBoundaryPathRef.current;
-          if (bdRef.dirty && selectionMaskRef.current) {
-            // Scan at 1/4 scale for efficiency
-            const SCALE = 4;
-            const sw = Math.ceil(CANVAS_WIDTH / SCALE);
-            const sh = Math.ceil(CANVAS_HEIGHT / SCALE);
-            const tmp = document.createElement("canvas");
-            tmp.width = sw;
-            tmp.height = sh;
-            const tc = tmp.getContext("2d", { willReadFrequently: true })!;
-            tc.drawImage(
-              selectionMaskRef.current,
-              0,
-              0,
-              CANVAS_WIDTH,
-              CANVAS_HEIGHT,
-              0,
-              0,
-              sw,
-              sh,
-            );
-            const data = tc.getImageData(0, 0, sw, sh).data;
-            const isSelected = (x: number, y: number) => {
-              if (x < 0 || x >= sw || y < 0 || y >= sh) return false;
-              return data[(y * sw + x) * 4 + 3] > 64;
-            };
-            const segs: Array<[number, number, number, number]> = [];
-            for (let y = 0; y < sh; y++) {
-              for (let x = 0; x < sw; x++) {
-                if (isSelected(x, y)) {
-                  if (!isSelected(x, y - 1))
-                    segs.push([
-                      x * SCALE,
-                      y * SCALE,
-                      (x + 1) * SCALE,
-                      y * SCALE,
-                    ]);
-                  if (!isSelected(x, y + 1))
-                    segs.push([
-                      x * SCALE,
-                      (y + 1) * SCALE,
-                      (x + 1) * SCALE,
-                      (y + 1) * SCALE,
-                    ]);
-                  if (!isSelected(x - 1, y))
-                    segs.push([
-                      x * SCALE,
-                      y * SCALE,
-                      x * SCALE,
-                      (y + 1) * SCALE,
-                    ]);
-                  if (!isSelected(x + 1, y))
-                    segs.push([
-                      (x + 1) * SCALE,
-                      y * SCALE,
-                      (x + 1) * SCALE,
-                      (y + 1) * SCALE,
-                    ]);
-                }
-              }
-            }
-            bdRef.segments = segs;
-            bdRef.dirty = false;
-            // Stitch segments into connected polylines so marching ants dash
-            // pattern flows continuously (avoids blinking from per-moveTo reset)
-            type Seg4 = [number, number, number, number];
-            const ptKey2 = (x: number, y: number) => `${x},${y}`;
-            // Build adjacency: each endpoint -> list of segments starting there
-            const adj = new Map<string, Seg4[]>();
-            for (const s of segs) {
-              const k0 = ptKey2(s[0], s[1]);
-              const k1 = ptKey2(s[2], s[3]);
-              if (!adj.has(k0)) adj.set(k0, []);
-              if (!adj.has(k1)) adj.set(k1, []);
-              adj.get(k0)!.push(s);
-              adj.get(k1)!.push([s[2], s[3], s[0], s[1]]);
-            }
-            const usedFwd = new Set<string>();
-            const chains: Array<Array<[number, number]>> = [];
-            for (const s of segs) {
-              const fk = `${s[0]},${s[1]}->${s[2]},${s[3]}`;
-              if (usedFwd.has(fk)) continue;
-              const chain: Array<[number, number]> = [
-                [s[0], s[1]],
-                [s[2], s[3]],
-              ];
-              usedFwd.add(fk);
-              usedFwd.add(`${s[2]},${s[3]}->${s[0]},${s[1]}`);
-              let cur: [number, number] = [s[2], s[3]];
-              for (;;) {
-                const nexts = adj.get(ptKey2(cur[0], cur[1])) ?? [];
-                let extended = false;
-                for (const n of nexts) {
-                  const nk = `${n[0]},${n[1]}->${n[2]},${n[3]}`;
-                  if (!usedFwd.has(nk)) {
-                    usedFwd.add(nk);
-                    usedFwd.add(`${n[2]},${n[3]}->${n[0]},${n[1]}`);
-                    chain.push([n[2], n[3]]);
-                    cur = [n[2], n[3]];
-                    extended = true;
-                    break;
-                  }
-                }
-                if (!extended) break;
-              }
-              chains.push(chain);
-            }
-            bdRef.chains = chains;
-          }
-          // Draw stitched chains — one moveTo per chain so dash pattern is continuous
-          // Apply 3-point moving average smoothing to eliminate "stepping" on diagonals
+        if (geom.type === "mask" || geom.type === "wand") {
+          // Chains are always up-to-date (rebuilt synchronously at every state transition).
+          // Just draw them directly — no async scheduling, no generation guards.
+          const chains = selectionBoundaryPathRef.current.chains;
           const smoothChain = (
             ch: Array<[number, number]>,
           ): Array<[number, number]> => {
@@ -1029,27 +1880,16 @@ export function PaintingApp() {
             out.push(ch[ch.length - 1]);
             return out;
           };
-          const chains = selectionBoundaryPathRef.current.chains;
-          if (chains.length > 0) {
-            for (const rawChain of chains) {
-              const chain = smoothChain(rawChain);
-              if (chain.length < 2) continue;
-              c.moveTo(chain[0][0], chain[0][1]);
-              for (let ci = 1; ci < chain.length; ci++) {
-                c.lineTo(chain[ci][0], chain[ci][1]);
-              }
-            }
-          } else {
-            // Fallback: draw each shape
-            for (const shape of shapes) {
-              buildGeomPath(c, shape);
+          for (const rawChain of chains) {
+            const chain = smoothChain(rawChain);
+            if (chain.length < 2) continue;
+            c.moveTo(chain[0][0], chain[0][1]);
+            for (let ci = 1; ci < chain.length; ci++) {
+              c.lineTo(chain[ci][0], chain[ci][1]);
             }
           }
         }
-        if (
-          (geom.type === "rect" || geom.type === "wand") &&
-          geom.w !== undefined
-        ) {
+        if (geom.type === "rect" && geom.w !== undefined) {
           const x = geom.w < 0 ? geom.x! + geom.w : geom.x!;
           const y = geom.h! < 0 ? geom.y! + geom.h! : geom.y!;
           const w = Math.abs(geom.w);
@@ -1071,6 +1911,9 @@ export function PaintingApp() {
       };
 
       // Draw committed selection with float-translation offset
+      // Generation guard: only draw committed geometry if the selection generation
+      // Draw committed selection geometry. Chains are always current (rebuilt synchronously
+      // at every state transition), so no generation guard is needed.
       const geom = selectionGeometryRef.current;
       if (geom && selectionActiveRef.current) {
         if (transformActiveRef.current) {
@@ -1136,129 +1979,20 @@ export function PaintingApp() {
                     c.lineTo(newPts[i].x, newPts[i].y);
                   c.closePath();
                 } else if (shape.type === "mask") {
-                  // For mask-type (subtract/intersect/union merged result),
-                  // transform the pre-computed boundary chains by the current
-                  // scale+translate so the ants track the float in real time.
+                  // Chains are always current — just draw them transformed.
                   const bdRef = selectionBoundaryPathRef.current;
-                  if (bdRef.dirty && selectionMaskRef.current) {
-                    // Re-compute chains now so we have something to draw
-                    const SCALE2 = 4;
-                    const sw2 = Math.ceil(CANVAS_WIDTH / SCALE2);
-                    const sh2 = Math.ceil(CANVAS_HEIGHT / SCALE2);
-                    const tmp2 = document.createElement("canvas");
-                    tmp2.width = sw2;
-                    tmp2.height = sh2;
-                    const tc2 = tmp2.getContext("2d", {
-                      willReadFrequently: true,
-                    })!;
-                    tc2.drawImage(
-                      selectionMaskRef.current,
-                      0,
-                      0,
-                      CANVAS_WIDTH,
-                      CANVAS_HEIGHT,
-                      0,
-                      0,
-                      sw2,
-                      sh2,
-                    );
-                    const data2 = tc2.getImageData(0, 0, sw2, sh2).data;
-                    const isSel2 = (px: number, py: number) => {
-                      if (px < 0 || px >= sw2 || py < 0 || py >= sh2)
-                        return false;
-                      return data2[(py * sw2 + px) * 4 + 3] > 64;
-                    };
-                    const segs2: Array<[number, number, number, number]> = [];
-                    for (let py = 0; py < sh2; py++) {
-                      for (let px = 0; px < sw2; px++) {
-                        if (isSel2(px, py)) {
-                          if (!isSel2(px, py - 1))
-                            segs2.push([
-                              px * SCALE2,
-                              py * SCALE2,
-                              (px + 1) * SCALE2,
-                              py * SCALE2,
-                            ]);
-                          if (!isSel2(px, py + 1))
-                            segs2.push([
-                              px * SCALE2,
-                              (py + 1) * SCALE2,
-                              (px + 1) * SCALE2,
-                              (py + 1) * SCALE2,
-                            ]);
-                          if (!isSel2(px - 1, py))
-                            segs2.push([
-                              px * SCALE2,
-                              py * SCALE2,
-                              px * SCALE2,
-                              (py + 1) * SCALE2,
-                            ]);
-                          if (!isSel2(px + 1, py))
-                            segs2.push([
-                              (px + 1) * SCALE2,
-                              py * SCALE2,
-                              (px + 1) * SCALE2,
-                              (py + 1) * SCALE2,
-                            ]);
-                        }
-                      }
+                  const chains = bdRef.chains;
+                  if (chains.length > 0) {
+                    for (const rawChain of chains) {
+                      if (rawChain.length < 2) continue;
+                      const tp = rawChain.map(([cx, cy]) => ({
+                        x: ob.x + (cx - ob.x) * scaleX + dx,
+                        y: ob.y + (cy - ob.y) * scaleY + dy,
+                      }));
+                      c.moveTo(tp[0].x, tp[0].y);
+                      for (let i = 1; i < tp.length; i++)
+                        c.lineTo(tp[i].x, tp[i].y);
                     }
-                    bdRef.segments = segs2;
-                    type Seg4b = [number, number, number, number];
-                    const ptKey3 = (px: number, py: number) => `${px},${py}`;
-                    const adj3 = new Map<string, Seg4b[]>();
-                    for (const s of segs2) {
-                      const k0 = ptKey3(s[0], s[1]);
-                      const k1 = ptKey3(s[2], s[3]);
-                      if (!adj3.has(k0)) adj3.set(k0, []);
-                      if (!adj3.has(k1)) adj3.set(k1, []);
-                      adj3.get(k0)!.push(s);
-                      adj3.get(k1)!.push([s[2], s[3], s[0], s[1]]);
-                    }
-                    const used3 = new Set<string>();
-                    const chains3: Array<Array<[number, number]>> = [];
-                    for (const s of segs2) {
-                      const fk = `${s[0]},${s[1]}->${s[2]},${s[3]}`;
-                      if (used3.has(fk)) continue;
-                      const chain3: Array<[number, number]> = [
-                        [s[0], s[1]],
-                        [s[2], s[3]],
-                      ];
-                      used3.add(fk);
-                      used3.add(`${s[2]},${s[3]}->${s[0]},${s[1]}`);
-                      let cur3: [number, number] = [s[2], s[3]];
-                      for (;;) {
-                        const nexts3 = adj3.get(ptKey3(cur3[0], cur3[1])) ?? [];
-                        let ext3 = false;
-                        for (const n of nexts3) {
-                          const nk = `${n[0]},${n[1]}->${n[2]},${n[3]}`;
-                          if (!used3.has(nk)) {
-                            used3.add(nk);
-                            used3.add(`${n[2]},${n[3]}->${n[0]},${n[1]}`);
-                            chain3.push([n[2], n[3]]);
-                            cur3 = [n[2], n[3]];
-                            ext3 = true;
-                            break;
-                          }
-                        }
-                        if (!ext3) break;
-                      }
-                      chains3.push(chain3);
-                    }
-                    bdRef.chains = chains3;
-                    bdRef.dirty = false;
-                  }
-                  // Draw boundary chains transformed by the current scale/translate
-                  const chains = selectionBoundaryPathRef.current.chains;
-                  for (const rawChain of chains) {
-                    if (rawChain.length < 2) continue;
-                    const tp = rawChain.map(([cx, cy]) => ({
-                      x: ob.x + (cx - ob.x) * scaleX + dx,
-                      y: ob.y + (cy - ob.y) * scaleY + dy,
-                    }));
-                    c.moveTo(tp[0].x, tp[0].y);
-                    for (let i = 1; i < tp.length; i++)
-                      c.lineTo(tp[i].x, tp[i].y);
                   }
                 }
               }
@@ -1345,32 +2079,83 @@ export function PaintingApp() {
             if (rx > 0 && ry > 0) c.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
           });
         }
-      } else if (draftPts.length > 0 && (mode === "free" || mode === "poly")) {
+      } else if (
+        draftPts.length > 0 &&
+        mode !== "wand" &&
+        isDrawingSelectionRef.current
+      ) {
         const cursor = selectionDraftCursorRef.current;
         strokeAnts(0, 0, (c) => {
           if (draftPts.length === 0) return;
           c.moveTo(draftPts[0].x, draftPts[0].y);
           for (let i = 1; i < draftPts.length; i++)
             c.lineTo(draftPts[i].x, draftPts[i].y);
-          // For poly, draw a line to the current cursor position
-          if (mode === "poly" && cursor) c.lineTo(cursor.x, cursor.y);
+          // Draw line to current cursor position for polygon vertex preview
+          if (cursor && !lassoIsDraggingRef.current)
+            c.lineTo(cursor.x, cursor.y);
         });
+        // Draw pip at start point when lasso session is open
+        if (
+          isDrawingSelectionRef.current &&
+          draftPts.length > 0 &&
+          (mode === "free" || mode === "poly")
+        ) {
+          const pip = draftPts[0];
+          ctx.save();
+          ctx.setLineDash([]);
+          // Dark background circle
+          ctx.beginPath();
+          ctx.arc(pip.x, pip.y, 7, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(0,0,0,0.5)";
+          ctx.fill();
+          // White filled circle
+          ctx.beginPath();
+          ctx.arc(pip.x, pip.y, 6, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(255,255,255,0.9)";
+          ctx.fill();
+          ctx.strokeStyle = "rgba(255,255,255,0.9)";
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+          ctx.restore();
+        }
       }
 
-      // Draw lasso fill in-progress preview (origin dot only — fill happens in real time)
+      // Draw lasso fill in-progress preview — path outline + semi-transparent fill (like scratchpad)
       if (
         isLassoFillDrawingRef.current &&
         activeToolRef.current === "fill" &&
         lassoFillOriginRef.current
       ) {
+        const lfPts = lassoFillPointsRef.current;
         const lfOrigin = lassoFillOriginRef.current;
         ctx.save();
+        if (lfPts.length >= 2) {
+          // Draw semi-transparent filled shape
+          ctx.beginPath();
+          ctx.moveTo(lfPts[0].x, lfPts[0].y);
+          for (let i = 1; i < lfPts.length; i++) {
+            ctx.lineTo(lfPts[i].x, lfPts[i].y);
+          }
+          ctx.closePath();
+          ctx.fillStyle = "rgba(0,120,255,0.12)";
+          ctx.fill();
+          // Draw outline
+          ctx.beginPath();
+          ctx.moveTo(lfPts[0].x, lfPts[0].y);
+          for (let i = 1; i < lfPts.length; i++) {
+            ctx.lineTo(lfPts[i].x, lfPts[i].y);
+          }
+          ctx.closePath();
+          ctx.strokeStyle = "rgba(0,120,255,0.85)";
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([]);
+          ctx.stroke();
+        }
+        // Draw origin pip
         ctx.beginPath();
         ctx.arc(lfOrigin.x, lfOrigin.y, 5, 0, Math.PI * 2);
-        ctx.strokeStyle = "rgba(0,120,255,0.8)";
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([]);
-        ctx.stroke();
+        ctx.fillStyle = "rgba(0,120,255,0.85)";
+        ctx.fill();
         ctx.restore();
       }
 
@@ -1463,29 +2248,63 @@ export function PaintingApp() {
         }
       }
     };
-    marchingAntsRafRef.current = requestAnimationFrame(drawAnts);
+    // Store drawAnts in a ref so the selectionActive restart effect can start it
+    drawAntsRef.current = drawAnts;
+    // Only start the loop immediately if a selection is already active at mount
+    if (selectionActiveRef.current) {
+      marchingAntsRafRef.current = requestAnimationFrame(drawAnts);
+    }
     return () => {
       if (marchingAntsRafRef.current !== null) {
         cancelAnimationFrame(marchingAntsRafRef.current);
         marchingAntsRafRef.current = null;
       }
+      drawAntsRef.current = null;
     };
-    // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Restart the marching ants loop when a selection becomes active.
+  // The loop self-terminates when selectionActiveRef goes false, so we only
+  // need to kick it off again when it transitions from inactive → active.
+  useEffect(() => {
+    if (
+      selectionActive &&
+      marchingAntsRafRef.current === null &&
+      drawAntsRef.current
+    ) {
+      marchingAntsRafRef.current = requestAnimationFrame(drawAntsRef.current);
+    }
+  }, [selectionActive]);
+
+  // FIX_5: Force-restart the overlay loop whenever transform becomes active.
+  // The previous guard (`marchingAntsRafRef.current === null`) meant the loop
+  // was never restarted when transform activated while a selection was already
+  // being drawn — so the blue bounding box never appeared for multi-layer transforms
+  // where a selection existed beforehand. Now we always cancel any in-flight RAF
+  // and immediately schedule a new frame so the bounding box appears right away.
+  useEffect(() => {
+    if (isTransformActive && drawAntsRef.current) {
+      // Cancel any existing loop frame before scheduling a fresh one
+      if (marchingAntsRafRef.current !== null) {
+        cancelAnimationFrame(marchingAntsRafRef.current);
+      }
+      marchingAntsRafRef.current = requestAnimationFrame(drawAntsRef.current);
+    }
+  }, [isTransformActive]);
+
   // Preload default circle tip
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable
   useEffect(() => {
     const img = new Image();
     img.onload = () => {
       const tc = document.createElement("canvas");
       tc.width = tc.height = 128;
-      const ctx = tc.getContext("2d", { willReadFrequently: true })!;
+      const ctx = tc.getContext("2d", { willReadFrequently: !isIPad })!;
       ctx.drawImage(img, 0, 0, 128, 128);
       const imgData = ctx.getImageData(0, 0, 128, 128);
       const d = imgData.data;
       for (let i = 0; i < d.length; i += 4) {
-        const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        const lum = getLuminance(d[i], d[i + 1], d[i + 2]);
         d[i] = 255;
         d[i + 1] = 255;
         d[i + 2] = 255;
@@ -1498,6 +2317,7 @@ export function PaintingApp() {
   }, []);
 
   // Preload tip image into cache whenever brushSettings.tipImageData changes
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable
   useEffect(() => {
     const tipImageData = brushSettings.tipImageData;
     if (!tipImageData) return;
@@ -1507,12 +2327,12 @@ export function PaintingApp() {
     img.onload = () => {
       const tc = document.createElement("canvas");
       tc.width = tc.height = 128;
-      const tcCtx = tc.getContext("2d", { willReadFrequently: true })!;
+      const tcCtx = tc.getContext("2d", { willReadFrequently: !isIPad })!;
       tcCtx.drawImage(img, 0, 0, 128, 128);
       const imgData = tcCtx.getImageData(0, 0, 128, 128);
       const d = imgData.data;
       for (let i = 0; i < d.length; i += 4) {
-        const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        const lum = getLuminance(d[i], d[i + 1], d[i + 2]);
         d[i] = 255;
         d[i + 1] = 255;
         d[i + 2] = 255;
@@ -1520,35 +2340,58 @@ export function PaintingApp() {
       }
       tcCtx.putImageData(imgData, 0, 0);
       tipCanvasCacheRef.current.set(cacheKey, tc);
+      webglBrushRef.current?.preloadTipTexture(tipImageData);
     };
     img.src = tipImageData;
+    // Also kick off WebGL texture preload immediately (will complete when image loads)
+    webglBrushRef.current?.preloadTipTexture(tipImageData);
   }, [brushSettings.tipImageData]);
 
   // Initialize fixed canvas size
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable
   useEffect(() => {
     const display = displayCanvasRef.current;
     if (!display) return;
-    display.width = CANVAS_WIDTH;
-    display.height = CANVAS_HEIGHT;
-    for (const [, lc] of layerCanvasesRef.current) {
-      lc.width = CANVAS_WIDTH;
-      lc.height = CANVAS_HEIGHT;
+    display.width = canvasWidthRef.current;
+    display.height = canvasHeightRef.current;
+    for (const [id, lc] of layerCanvasesRef.current) {
+      lc.width = canvasWidthRef.current;
+      lc.height = canvasHeightRef.current;
+      // Fill background layer (last layer, named "Background") with white
+      if (id === "layer-2") {
+        const bgCtx = lc.getContext("2d", { willReadFrequently: !isIPad });
+        if (bgCtx) {
+          bgCtx.fillStyle = "#ffffff";
+          bgCtx.fillRect(0, 0, canvasWidthRef.current, canvasHeightRef.current);
+          // Mark dirty so getBitmapOrCanvas doesn't serve a stale transparent bitmap
+          // that was cached before the white fill ran.
+          markLayerBitmapDirty(id);
+          // Generate initial thumbnail for the white background layer
+          markCanvasDirty(id);
+        }
+      }
     }
-    const glBrush = createWebGLBrushContext(CANVAS_WIDTH, CANVAS_HEIGHT);
+    const glBrush = createWebGLBrushContext(
+      canvasWidthRef.current,
+      canvasHeightRef.current,
+    );
     if (glBrush) {
       webglBrushRef.current = glBrush;
       strokeBufferRef.current = glBrush.canvas;
+      if (!glBrush.isWebGL2) {
+        setWebGLFallbackWarning(true);
+      }
     } else {
       const buf = document.createElement("canvas");
-      buf.width = CANVAS_WIDTH;
-      buf.height = CANVAS_HEIGHT;
+      buf.width = canvasWidthRef.current;
+      buf.height = canvasHeightRef.current;
       strokeBufferRef.current = buf;
     }
 
     const makeOffscreenCanvas = () => {
       const c = document.createElement("canvas");
-      c.width = CANVAS_WIDTH;
-      c.height = CANVAS_HEIGHT;
+      c.width = canvasWidthRef.current;
+      c.height = canvasHeightRef.current;
       return c;
     };
     belowActiveCanvasRef.current = makeOffscreenCanvas();
@@ -1556,1644 +2399,187 @@ export function PaintingApp() {
     snapshotCanvasRef.current = makeOffscreenCanvas();
     activePreviewCanvasRef.current = makeOffscreenCanvas();
 
-    composite();
-
-    // Take initial navigator snapshot after composite renders
-    requestAnimationFrame(() => {
-      const display = displayCanvasRef.current;
-      if (display) {
-        const navCanvas = document.createElement("canvas");
-        navCanvas.width = 160;
-        navCanvas.height = Math.round(160 * (CANVAS_HEIGHT / CANVAS_WIDTH));
-        const navCtx = navCanvas.getContext("2d", { willReadFrequently: true });
-        if (navCtx) {
-          navCtx.drawImage(display, 0, 0, navCanvas.width, navCanvas.height);
-          setNavigatorThumbnail(navCanvas.toDataURL("image/png"));
-        }
-      }
-    });
+    scheduleComposite();
+    // The composite-done callback (registered above) will update the navigator
+    // automatically after scheduleComposite fires composite().
 
     return () => {
       webglBrushRef.current?.dispose();
     };
-  }, [composite]);
+  }, [scheduleComposite]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: layers triggers re-run
+  // Apply exact dimensions chosen on the splash screen.
+  // PaintingApp is always mounted before the splash resolves, so we can't use
+  // useState(initialCanvasWidth) — it would capture `undefined`. Instead, we
+  // watch the prop and apply the resize once, after the canvas is fully set up.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: composite/updateNavigatorCanvas are stable refs
   useEffect(() => {
-    for (const [, lc] of layerCanvasesRef.current) {
-      if (lc.width !== CANVAS_WIDTH || lc.height !== CANVAS_HEIGHT) {
-        lc.width = CANVAS_WIDTH;
-        lc.height = CANVAS_HEIGHT;
-      }
-    }
-    composite();
-  }, [layers, composite]);
+    if (splashDimsAppliedRef.current) return;
+    if (!initialCanvasWidth || !initialCanvasHeight) return;
+    const display = displayCanvasRef.current;
+    if (!display) return;
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: restoreSelectionSnapshot is stable
-  const handleUndo = useCallback(() => {
-    const entry = undoStackRef.current.pop();
-    if (!entry) return;
-    if (entry.type === "pixels") {
-      const lc = layerCanvasesRef.current.get(entry.layerId);
-      if (lc) {
-        const ctx = lc.getContext("2d", { willReadFrequently: true });
-        if (ctx) ctx.putImageData(entry.before, 0, 0);
-      }
-      // Clear any active float/transform state so composite() doesn't draw stale pixels
-      moveFloatCanvasRef.current = null;
-      xfStateRef.current = null;
-      isDraggingFloatRef.current = false;
-      transformActiveRef.current = false;
-      transformPreSnapshotRef.current = null;
-      transformPreCommitSnapshotRef.current = null;
-      transformOrigFloatCanvasRef.current = null;
-      selectionActiveRef.current = false;
-      selectionMaskRef.current = null;
-    } else if (entry.type === "layer-add") {
-      setLayers((prev) => prev.filter((l) => l.id !== entry.layer.id));
-      layerCanvasesRef.current.delete(entry.layer.id);
-    } else if (entry.type === "layer-delete") {
-      const restoredCanvas = document.createElement("canvas");
-      restoredCanvas.width = CANVAS_WIDTH;
-      restoredCanvas.height = CANVAS_HEIGHT;
-      const rCtx = restoredCanvas.getContext("2d", {
-        willReadFrequently: true,
-      });
-      if (rCtx) rCtx.putImageData(entry.pixels, 0, 0);
-      layerCanvasesRef.current.set(entry.layer.id, restoredCanvas);
-      setLayers((prev) => {
-        const next = [...prev];
-        next.splice(entry.index, 0, entry.layer);
-        return next;
-      });
-      setActiveLayerId(entry.layer.id);
-    } else if (entry.type === "blend-mode") {
-      setLayers((prev) =>
-        prev.map((l) =>
-          l.id === entry.layerId ? { ...l, blendMode: entry.before } : l,
-        ),
-      );
-    } else if (entry.type === "selection") {
-      restoreSelectionSnapshot(entry.before);
-    }
-    redoStackRef.current.push(entry);
-    if (redoStackRef.current.length > 50) redoStackRef.current.shift();
-    composite();
-    if (displayCanvasRef.current) {
-      const navCanvas = document.createElement("canvas");
-      navCanvas.width = 160;
-      navCanvas.height = Math.round(160 * (CANVAS_HEIGHT / CANVAS_WIDTH));
-      const navCtx = navCanvas.getContext("2d", { willReadFrequently: true });
-      if (navCtx) {
-        navCtx.drawImage(
-          displayCanvasRef.current,
-          0,
-          0,
-          navCanvas.width,
-          navCanvas.height,
-        );
-        setNavigatorThumbnail(navCanvas.toDataURL("image/png"));
-      }
-    }
-    setUndoCount(undoStackRef.current.length);
-    setRedoCount(redoStackRef.current.length);
-  }, [composite]);
+    splashDimsAppliedRef.current = true;
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: restoreSelectionSnapshot is stable
-  const handleRedo = useCallback(() => {
-    const entry = redoStackRef.current.pop();
-    if (!entry) return;
-    if (entry.type === "pixels") {
-      const lc = layerCanvasesRef.current.get(entry.layerId);
-      if (lc) {
-        const ctx = lc.getContext("2d", { willReadFrequently: true });
-        if (ctx) ctx.putImageData(entry.after, 0, 0);
-      }
-      // Clear any active float/transform state so composite() doesn't draw stale pixels
-      moveFloatCanvasRef.current = null;
-      xfStateRef.current = null;
-      isDraggingFloatRef.current = false;
-      transformActiveRef.current = false;
-      transformPreSnapshotRef.current = null;
-      transformPreCommitSnapshotRef.current = null;
-      transformOrigFloatCanvasRef.current = null;
-      selectionActiveRef.current = false;
-      selectionMaskRef.current = null;
-    } else if (entry.type === "layer-add") {
-      const restoredCanvas = document.createElement("canvas");
-      restoredCanvas.width = CANVAS_WIDTH;
-      restoredCanvas.height = CANVAS_HEIGHT;
-      layerCanvasesRef.current.set(entry.layer.id, restoredCanvas);
-      setLayers((prev) => {
-        const next = [...prev];
-        next.splice(entry.index, 0, entry.layer);
-        return next;
-      });
-    } else if (entry.type === "layer-delete") {
-      setLayers((prev) => prev.filter((l) => l.id !== entry.layer.id));
-      layerCanvasesRef.current.delete(entry.layer.id);
-    } else if (entry.type === "blend-mode") {
-      setLayers((prev) =>
-        prev.map((l) =>
-          l.id === entry.layerId ? { ...l, blendMode: entry.after } : l,
-        ),
-      );
-    } else if (entry.type === "selection") {
-      restoreSelectionSnapshot(entry.after);
-    }
-    undoStackRef.current.push(entry);
-    if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-    composite();
-    if (displayCanvasRef.current) {
-      const navCanvas = document.createElement("canvas");
-      navCanvas.width = 160;
-      navCanvas.height = Math.round(160 * (CANVAS_HEIGHT / CANVAS_WIDTH));
-      const navCtx = navCanvas.getContext("2d", { willReadFrequently: true });
-      if (navCtx) {
-        navCtx.drawImage(
-          displayCanvasRef.current,
-          0,
-          0,
-          navCanvas.width,
-          navCanvas.height,
-        );
-        setNavigatorThumbnail(navCanvas.toDataURL("image/png"));
-      }
-    }
-    setUndoCount(undoStackRef.current.length);
-    setRedoCount(redoStackRef.current.length);
-  }, [composite]);
+    const newW = Math.max(1, Math.round(initialCanvasWidth));
+    const newH = Math.max(1, Math.round(initialCanvasHeight));
 
+    // Resize every layer canvas to the chosen dimensions, refilling the background white
+    const nonRulerLayers = layersRef.current.filter((l) => !l.isRuler);
+    const backgroundLayerId =
+      nonRulerLayers.length > 0
+        ? nonRulerLayers[nonRulerLayers.length - 1].id
+        : null;
+    for (const [id, lc] of layerCanvasesRef.current) {
+      lc.width = newW;
+      lc.height = newH;
+      if (id === backgroundLayerId) {
+        const bgCtx = lc.getContext("2d", { willReadFrequently: !isIPad });
+        if (bgCtx) {
+          bgCtx.fillStyle = "#ffffff";
+          bgCtx.fillRect(0, 0, newW, newH);
+          markLayerBitmapDirty(id);
+          markCanvasDirty(id);
+        }
+      }
+    }
+
+    // Resize display canvas
+    display.width = newW;
+    display.height = newH;
+
+    // Invalidate context caches (dimensions changed)
+    invalidateCompositeContextCaches();
+    _overlayCtxCached = null;
+
+    // Resize ruler overlay canvas
+    if (rulerCanvasRef.current) {
+      rulerCanvasRef.current.width = newW;
+      rulerCanvasRef.current.height = newH;
+    }
+
+    // Resize WebGL stroke buffer
+    if (webglBrushRef.current) {
+      webglBrushRef.current.resize(newW, newH);
+    }
+
+    // Resize offscreen compositing canvases
+    for (const canvasRef of [
+      belowActiveCanvasRef,
+      aboveActiveCanvasRef,
+      snapshotCanvasRef,
+      activePreviewCanvasRef,
+    ]) {
+      if (canvasRef.current) {
+        canvasRef.current.width = newW;
+        canvasRef.current.height = newH;
+      }
+    }
+
+    // Update navigator thumbnail canvas aspect ratio
+    _navThumbCanvas.width = NAV_THUMB_W;
+    _navThumbCanvas.height = Math.round(NAV_THUMB_W * (newH / newW));
+
+    // Sync state and refs to the new dimensions
+    canvasWidthRef.current = newW;
+    canvasHeightRef.current = newH;
+    setCanvasWidth(newW);
+    setCanvasHeight(newH);
+
+    // Invalidate the below/above stroke canvas cache — resizing those canvases cleared
+    // them to transparent. Without this bump the first stroke sees cacheValid=true and
+    // skips the rebuild, causing compositeWithStrokePreview to draw a transparent below.
+    strokeCanvasCacheKeyRef.current++;
+    // Force the next composite() to do a full repaint so dirty-rect optimisation
+    // cannot run against a just-cleared display canvas.
+    needsFullCompositeRef.current = true;
+
+    // Fit the canvas to the viewport
+    const container = containerRef.current;
+    if (container) {
+      const cw = container.clientWidth;
+      const ch = container.clientHeight;
+      const zoom = Math.min((cw * 0.85) / newW, (ch * 0.85) / newH, 1);
+      const vt = { zoom, panX: 0, panY: 0, rotation: 0 };
+      viewTransformRef.current = vt;
+      setViewTransform(vt);
+      applyTransformToDOMRef.current(vt);
+    }
+
+    composite();
+    updateNavigatorCanvas();
+  }, [
+    initialCanvasWidth,
+    initialCanvasHeight,
+    composite,
+    updateNavigatorCanvas,
+    markLayerBitmapDirty,
+  ]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: applyTransformToDOMRef is a stable ref
   const resetView = useCallback(() => {
+    applyTransformToDOMRef.current(DEFAULT_TRANSFORM);
     setViewTransform(DEFAULT_TRANSFORM);
   }, []);
 
-  // Keyboard shortcuts
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement).tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
-
-      // Alt key: temporary eyedropper
-      if (e.key === "Alt" && !altEyedropperActiveRef.current) {
-        e.preventDefault();
-        const currentTool = activeToolRef.current;
-        if (currentTool !== "eyedropper") {
-          prevToolRef.current = currentTool;
-          altEyedropperActiveRef.current = true;
-          setActiveTool("eyedropper");
-        }
-        return;
-      }
-
-      if (
-        (e.ctrlKey || e.metaKey) &&
-        e.shiftKey &&
-        e.key.toLowerCase() === "z"
-      ) {
-        e.preventDefault();
-        handleRedo();
-        return;
-      }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
-        e.preventDefault();
-        handleUndo();
-        return;
-      }
-      // Shift+E: merge layers down
-      if (
-        e.shiftKey &&
-        !e.ctrlKey &&
-        !e.metaKey &&
-        e.key.toLowerCase() === "e"
-      ) {
-        e.preventDefault();
-        handleMergeLayersRef.current();
-        return;
-      }
-      // Shift+G: toggle clipping mask
-      if (
-        e.shiftKey &&
-        !e.ctrlKey &&
-        !e.metaKey &&
-        e.key.toLowerCase() === "g"
-      ) {
-        e.preventDefault();
-        handleToggleClippingMaskRef.current();
-        return;
-      }
-      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
-        switch (e.key.toLowerCase()) {
-          case "b":
-            if (transformActiveRef.current)
-              selectionActionsRef.current.commitFloat({ keepSelection: true });
-            setActiveTool("brush");
-            setActiveSubpanel(
-              activeSubpanelRef.current !== null ? "brush" : null,
-            );
-            break;
-          case "e":
-            if (transformActiveRef.current)
-              selectionActionsRef.current.commitFloat({ keepSelection: true });
-            setActiveTool("eraser");
-            setActiveSubpanel(
-              activeSubpanelRef.current !== null ? "eraser" : null,
-            );
-            break;
-          case "s":
-            if (transformActiveRef.current)
-              selectionActionsRef.current.commitFloat({ keepSelection: true });
-            setActiveTool("smear");
-            setActiveSubpanel(
-              activeSubpanelRef.current !== null ? "smear" : null,
-            );
-            break;
-          case "f":
-            if (transformActiveRef.current)
-              selectionActionsRef.current.commitFloat({ keepSelection: true });
-            setActiveTool("fill");
-            setActiveSubpanel(null);
-            break;
-          case "i":
-            if (transformActiveRef.current)
-              selectionActionsRef.current.commitFloat({ keepSelection: true });
-            setActiveTool("eyedropper");
-            setActiveSubpanel(null);
-            break;
-          case "l": {
-            // Cycle lasso mode if already on lasso, else switch to lasso
-            const lassoCycle: LassoMode[] = [
-              "rect",
-              "ellipse",
-              "free",
-              "poly",
-              "wand",
-            ];
-            if (activeToolRef.current === "lasso") {
-              setLassoMode((prev) => {
-                const idx = lassoCycle.indexOf(prev);
-                return lassoCycle[(idx + 1) % lassoCycle.length];
-              });
-            } else {
-              setActiveTool("lasso");
-              setActiveSubpanel(null);
-            }
-            break;
-          }
-          case "v":
-            if (transformActiveRef.current)
-              selectionActionsRef.current.commitFloat({ keepSelection: true });
-            else {
-              // Track the tool we're switching away from
-              lastToolBeforeTransformRef.current = activeToolRef.current;
-            }
-            setActiveTool("move");
-            setActiveSubpanel(null);
-            break;
-          case "escape":
-            if (transformActiveRef.current) {
-              selectionActionsRef.current.revertTransform();
-            } else if (selectionActiveRef.current) {
-              selectionActionsRef.current.clearSelection();
-            } else if (viewTransformRef.current.rotation !== 0) {
-              // Reset canvas rotation to 0
-              const newVt = { ...viewTransformRef.current, rotation: 0 };
-              applyTransformToDOMRef.current(newVt);
-              setViewTransform(newVt);
-            }
-            break;
-          case "delete":
-          case "backspace":
-            if (selectionActiveRef.current) {
-              e.preventDefault();
-              selectionActionsRef.current.deleteSelection();
-            }
-            break;
-          case "j":
-            if (selectionActiveRef.current) {
-              e.preventDefault();
-              selectionActionsRef.current.cutOrCopyToLayer(!e.shiftKey);
-            }
-            break;
-          case "d":
-            if (
-              selectionActiveRef.current ||
-              transformActiveRef.current ||
-              isDraggingFloatRef.current
-            ) {
-              e.preventDefault();
-              selectionActionsRef.current.commitFloat({ keepSelection: false });
-              // clearSelection is called inside commitFloat when keepSelection=false
-            }
-            break;
-          case "enter":
-            if (isDraggingFloatRef.current || transformActiveRef.current) {
-              e.preventDefault();
-              selectionActionsRef.current.commitFloat({ keepSelection: true });
-            }
-            break;
-          case "[":
-            setBrushSizes((prev) => {
-              const key =
-                activeToolRef.current === "eraser" ? "eraser" : "brush";
-              const delta = Math.max(1, Math.round(prev[key] * 0.1));
-              return {
-                ...prev,
-                [key]: Math.max(1, prev[key] - delta),
-              };
-            });
-            break;
-          case "]":
-            setBrushSizes((prev) => {
-              const key =
-                activeToolRef.current === "eraser" ? "eraser" : "brush";
-              const delta = Math.max(1, Math.round(prev[key] * 0.1));
-              return {
-                ...prev,
-                [key]: Math.min(500, prev[key] + delta),
-              };
-            });
-            break;
-          case "0":
-            setViewTransform(DEFAULT_TRANSFORM);
-            break;
-        }
-      }
-    };
-
-    const upHandler = (e: KeyboardEvent) => {
-      if (e.key === "Alt" && altEyedropperActiveRef.current) {
-        altEyedropperActiveRef.current = false;
-        setActiveTool(prevToolRef.current);
-      }
-    };
-
-    window.addEventListener("keydown", handler);
-    window.addEventListener("keyup", upHandler);
-    return () => {
-      window.removeEventListener("keydown", handler);
-      window.removeEventListener("keyup", upHandler);
-    };
-    // biome-ignore lint/correctness/useExhaustiveDependencies: refs used intentionally
-  }, [handleUndo, handleRedo]);
-
-  // Space key (pan) + Ctrl+Space (zoom drag) + R key (rotate drag)
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement).tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
-
-      if (e.code === "Space") {
-        e.preventDefault();
-        // Always mark space as down, then determine mode based on Ctrl state
-        spaceDownRef.current = true;
-        zoomModeRef.current = !!(e.ctrlKey || e.metaKey);
-      }
-      // If Ctrl is pressed while Space is already held → upgrade to zoom mode
-      if ((e.key === "Control" || e.key === "Meta") && spaceDownRef.current) {
-        zoomModeRef.current = true;
-      }
-      if (
-        e.key.toLowerCase() === "r" &&
-        !e.ctrlKey &&
-        !e.metaKey &&
-        !e.altKey
-      ) {
-        rKeyDownRef.current = true;
-      }
-      if (
-        e.key.toLowerCase() === "z" &&
-        !e.ctrlKey &&
-        !e.metaKey &&
-        !e.altKey
-      ) {
-        zKeyDownRef.current = true;
-      }
-    };
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (e.code === "Space") {
-        spaceDownRef.current = false;
-        zoomModeRef.current = false;
-        isPanningRef.current = false;
-        isZoomDraggingRef.current = false;
-      }
-      // If Ctrl is released while Space is still held → downgrade to pan mode
-      if ((e.key === "Control" || e.key === "Meta") && spaceDownRef.current) {
-        zoomModeRef.current = false;
-      }
-      if (e.key.toLowerCase() === "r") {
-        rKeyDownRef.current = false;
-        isRotatingRef.current = false;
-      }
-      if (e.key.toLowerCase() === "z") {
-        zKeyDownRef.current = false;
-        isZoomDraggingRef.current = false;
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
-    };
-  }, []);
-
-  // Wheel zoom
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      const t = viewTransformRef.current;
-      const cr = container.getBoundingClientRect();
-      const centerX = cr.left + cr.width / 2;
-      const centerY = cr.top + cr.height / 2;
-      const cx = e.clientX - centerX;
-      const cy = e.clientY - centerY;
-      const factor = 1 - e.deltaY * 0.001;
-      const newZoom = Math.min(20, Math.max(0.05, t.zoom * factor));
-      const zoomRatio = newZoom / t.zoom;
-      const newPanX = cx - (cx - t.panX) * zoomRatio;
-      const newPanY = cy - (cy - t.panY) * zoomRatio;
-      const newTransform = {
-        ...viewTransformRef.current,
-        zoom: newZoom,
-        panX: newPanX,
-        panY: newPanY,
-      };
-      applyTransformToDOMRef.current(newTransform);
-      // Debounce React state commit — only triggers re-render after scrolling stops
-      if (wheelCommitTimerRef.current !== null)
-        clearTimeout(wheelCommitTimerRef.current);
-      wheelCommitTimerRef.current = window.setTimeout(() => {
-        wheelCommitTimerRef.current = null;
-        setViewTransform({ ...viewTransformRef.current });
-      }, 100);
-    };
-    container.addEventListener("wheel", onWheel, { passive: false });
-    return () => container.removeEventListener("wheel", onWheel);
-  }, []);
-
-  // Multi-touch gestures
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-
-    let prevDist = 0;
-    let prevAngle = 0;
-    let prevMidX = 0;
-    let prevMidY = 0;
-    let tapStartTime = 0;
-    let tapTouchCount = 0;
-    let tapStartX = 0;
-    let tapStartY = 0;
-
-    const getDist = (t1: Touch, t2: Touch) => {
-      const dx = t2.clientX - t1.clientX;
-      const dy = t2.clientY - t1.clientY;
-      return Math.sqrt(dx * dx + dy * dy);
-    };
-    const getAngle = (t1: Touch, t2: Touch) =>
-      Math.atan2(t2.clientY - t1.clientY, t2.clientX - t1.clientX);
-
-    const onTouchStart = (e: TouchEvent) => {
-      // Don't intercept scroll gestures on panel content
-      const target = e.target as Element;
-      const isInPanel = target.closest(
-        ".overflow-y-auto, [data-radix-scroll-area-viewport]",
-      );
-      if (isInPanel && e.touches.length < 2) return;
-      // Track tap start for multi-finger tap gestures (undo/redo)
-      tapStartTime = Date.now();
-      tapTouchCount = e.touches.length;
-      if (e.touches.length >= 2) {
-        tapStartX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-        tapStartY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-      }
-      if (e.touches.length === 3) {
-        // Prevent iOS screenshot gesture from interfering
-        e.preventDefault();
-      }
-      if (e.touches.length === 2) {
-        e.preventDefault();
-        const t1 = e.touches[0];
-        const t2 = e.touches[1];
-        prevDist = getDist(t1, t2);
-        prevAngle = getAngle(t1, t2);
-        prevMidX = (t1.clientX + t2.clientX) / 2;
-        prevMidY = (t1.clientY + t2.clientY) / 2;
-        isDrawingRef.current = false;
-        strokeStartSnapshotRef.current = null;
-        lastPosRef.current = null;
-        strokePointBufferRef.current = [];
-      }
-    };
-
-    const onTouchMove = (e: TouchEvent) => {
-      // Don't intercept scroll gestures on panel content
-      const target = e.target as Element;
-      const isInPanel = target.closest(
-        ".overflow-y-auto, [data-radix-scroll-area-viewport]",
-      );
-      if (isInPanel && e.touches.length < 2) return;
-      if (e.touches.length === 2) {
-        e.preventDefault();
-        const t1 = e.touches[0];
-        const t2 = e.touches[1];
-        const newDist = getDist(t1, t2);
-        const newAngle = getAngle(t1, t2);
-        const newMidX = (t1.clientX + t2.clientX) / 2;
-        const newMidY = (t1.clientY + t2.clientY) / 2;
-        const zoomFactor = prevDist > 0 ? newDist / prevDist : 1;
-        const angleDeltaDeg = ((newAngle - prevAngle) * 180) / Math.PI;
-        const panDX = newMidX - prevMidX;
-        const panDY = newMidY - prevMidY;
-        // When canvas is flipped (scaleX(-1)), pan and rotation directions are mirrored
-        const flipSign = isFlippedRef.current ? -1 : 1;
-        const newTouchTransform = {
-          ...viewTransformRef.current,
-          zoom: Math.min(
-            20,
-            Math.max(0.05, viewTransformRef.current.zoom * zoomFactor),
-          ),
-          rotation:
-            viewTransformRef.current.rotation + angleDeltaDeg * flipSign,
-          panX: viewTransformRef.current.panX + panDX * flipSign,
-          panY: viewTransformRef.current.panY + panDY,
-        };
-        applyTransformToDOMRef.current(newTouchTransform);
-        prevDist = newDist;
-        prevAngle = newAngle;
-        prevMidX = newMidX;
-        prevMidY = newMidY;
-      }
-    };
-
-    const onTouchEnd = (e: TouchEvent) => {
-      prevDist = 0;
-      // Commit DOM-only transform to React state so HUD (zoom%, rotation°) stays in sync
-      setViewTransform({ ...viewTransformRef.current });
-      // Multi-finger tap detection: 2-finger tap = undo, 3-finger tap = redo
-      const tapDuration = Date.now() - tapStartTime;
-      if (tapDuration < 250 && tapTouchCount >= 2) {
-        if (e.changedTouches.length >= 1) {
-          const endX = e.changedTouches[0].clientX;
-          const endY = e.changedTouches[0].clientY;
-          const moved = Math.hypot(endX - tapStartX, endY - tapStartY);
-          if (moved < 20) {
-            if (tapTouchCount === 2) {
-              handleUndo();
-            } else if (tapTouchCount >= 3) {
-              handleRedo();
-            }
-          }
-        }
-      }
-      tapStartTime = 0;
-      tapTouchCount = 0;
-    };
-
-    container.addEventListener("touchstart", onTouchStart, { passive: false });
-    container.addEventListener("touchmove", onTouchMove, { passive: false });
-    container.addEventListener("touchend", onTouchEnd, { passive: false });
-    return () => {
-      container.removeEventListener("touchstart", onTouchStart);
-      container.removeEventListener("touchmove", onTouchMove);
-      container.removeEventListener("touchend", onTouchEnd);
-    };
-  }, [handleUndo, handleRedo]);
-
-  // Flood fill
-  const floodFill = useCallback(
-    (
-      lc: HTMLCanvasElement,
-      px: number,
-      py: number,
-      fr: number,
-      fg: number,
-      fb: number,
-      fa: number,
-    ) => {
-      const ctx = lc.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return;
-      const { width, height } = lc;
-      const x = Math.round(px);
-      const y = Math.round(py);
-      if (x < 0 || x >= width || y < 0 || y >= height) return;
-      const imgData = ctx.getImageData(0, 0, width, height);
-      const data = imgData.data;
-      const idx = (y * width + x) * 4;
-      const tr = data[idx];
-      const tg = data[idx + 1];
-      const tb = data[idx + 2];
-      const _ta = data[idx + 3];
-      const tolerance = 30;
-      // RGB-only comparison (ignore alpha, _ta unused intentionally)
-      const colorMatch = (i: number) =>
-        Math.abs(data[i] - tr) <= tolerance &&
-        Math.abs(data[i + 1] - tg) <= tolerance &&
-        Math.abs(data[i + 2] - tb) <= tolerance;
-      if (
-        Math.abs(tr - fr) < 1 &&
-        Math.abs(tg - fg) < 1 &&
-        Math.abs(tb - fb) < 1
-      )
-        return;
-      const visited = new Uint8Array(width * height);
-      const stack: number[] = [x + y * width];
-      while (stack.length > 0) {
-        const pos = stack.pop()!;
-        const cx = pos % width;
-        const cy = Math.floor(pos / width);
-        if (cx < 0 || cx >= width || cy < 0 || cy >= height) continue;
-        if (visited[pos]) continue;
-        visited[pos] = 1;
-        const pi = pos * 4;
-        if (!colorMatch(pi)) continue;
-        data[pi] = fr;
-        data[pi + 1] = fg;
-        data[pi + 2] = fb;
-        data[pi + 3] = fa;
-        stack.push(pos + 1, pos - 1, pos + width, pos - width);
-      }
-      ctx.putImageData(imgData, 0, 0);
-    },
-    [],
-  );
-
-  const floodFillWithTolerance = useCallback(
-    (
-      lc: HTMLCanvasElement,
-      px: number,
-      py: number,
-      fr: number,
-      fg: number,
-      fb: number,
-      fa: number,
-      tolerance: number,
-    ) => {
-      const ctx = lc.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return;
-      const { width, height } = lc;
-      const x = Math.round(px);
-      const y = Math.round(py);
-      if (x < 0 || x >= width || y < 0 || y >= height) return;
-      const imgData = ctx.getImageData(0, 0, width, height);
-      const data = imgData.data;
-      const idx = (y * width + x) * 4;
-      const tr = data[idx];
-      const tg = data[idx + 1];
-      const tb = data[idx + 2];
-      const _ta = data[idx + 3];
-      const tol = (tolerance / 100) * 255;
-      // RGB-only comparison (ignore alpha, _ta unused intentionally)
-      const colorMatch = (i: number) =>
-        Math.abs(data[i] - tr) <= tol &&
-        Math.abs(data[i + 1] - tg) <= tol &&
-        Math.abs(data[i + 2] - tb) <= tol;
-      if (
-        Math.abs(tr - fr) < 1 &&
-        Math.abs(tg - fg) < 1 &&
-        Math.abs(tb - fb) < 1
-      )
-        return;
-      // Build selection mask if active
-      let selData: Uint8ClampedArray | null = null;
-      if (selectionMaskRef.current && selectionActiveRef.current) {
-        const selCtx = selectionMaskRef.current.getContext("2d", {
-          willReadFrequently: true,
-        });
-        if (selCtx) selData = selCtx.getImageData(0, 0, width, height).data;
-      }
-      const visited = new Uint8Array(width * height);
-      const stack: number[] = [x + y * width];
-      while (stack.length > 0) {
-        const pos = stack.pop()!;
-        const cx = pos % width;
-        const cy = Math.floor(pos / width);
-        if (cx < 0 || cx >= width || cy < 0 || cy >= height) continue;
-        if (visited[pos]) continue;
-        visited[pos] = 1;
-        const pi = pos * 4;
-        if (!colorMatch(pi)) continue;
-        if (selData && selData[pi + 3] < 128) continue; // outside selection
-        data[pi] = fr;
-        data[pi + 1] = fg;
-        data[pi + 2] = fb;
-        data[pi + 3] = fa;
-        stack.push(pos + 1, pos - 1, pos + width, pos - width);
-      }
-      ctx.putImageData(imgData, 0, 0);
-    },
-    [],
-  );
-
-  const applyLassoFill = useCallback(
-    (
-      lc: HTMLCanvasElement,
-      points: { x: number; y: number }[],
-      fr: number,
-      fg: number,
-      fb: number,
-    ) => {
-      if (points.length < 3) return;
-      const ctx = lc.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return;
-      ctx.save();
-      // Clip to selection if active
-      if (selectionMaskRef.current && selectionActiveRef.current) {
-        ctx.globalCompositeOperation = "source-over";
-        // Fill polygon on temp, mask with selection
-        const tempC = document.createElement("canvas");
-        tempC.width = lc.width;
-        tempC.height = lc.height;
-        const tempCtx = tempC.getContext("2d", { willReadFrequently: true })!;
-        tempCtx.imageSmoothingEnabled = true;
-        tempCtx.beginPath();
-        tempCtx.moveTo(points[0].x, points[0].y);
-        for (let i = 1; i < points.length; i++)
-          tempCtx.lineTo(points[i].x, points[i].y);
-        tempCtx.closePath();
-        tempCtx.fillStyle = `rgb(${fr},${fg},${fb})`;
-        tempCtx.fill();
-        tempCtx.globalCompositeOperation = "source-over";
-        tempCtx.strokeStyle = `rgb(${fr},${fg},${fb})`;
-        tempCtx.lineWidth = 2;
-        tempCtx.stroke();
-        // Smooth the outer edge specifically with a wider stroke
-        tempCtx.beginPath();
-        tempCtx.moveTo(points[1].x, points[1].y);
-        tempCtx.lineTo(points[2].x, points[2].y);
-        tempCtx.strokeStyle = `rgb(${fr},${fg},${fb})`;
-        tempCtx.lineWidth = 3;
-        tempCtx.stroke();
-        tempCtx.globalCompositeOperation = "destination-in";
-        tempCtx.drawImage(selectionMaskRef.current, 0, 0);
-        ctx.drawImage(tempC, 0, 0);
-      } else {
-        ctx.imageSmoothingEnabled = true;
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, points[0].y);
-        for (let i = 1; i < points.length; i++)
-          ctx.lineTo(points[i].x, points[i].y);
-        ctx.closePath();
-        ctx.fillStyle = `rgb(${fr},${fg},${fb})`;
-        ctx.fill();
-        ctx.strokeStyle = `rgb(${fr},${fg},${fb})`;
-        ctx.lineWidth = 2;
-        ctx.stroke();
-        // Smooth the outer edge specifically with a wider stroke
-        ctx.beginPath();
-        ctx.moveTo(points[1].x, points[1].y);
-        ctx.lineTo(points[2].x, points[2].y);
-        ctx.strokeStyle = `rgb(${fr},${fg},${fb})`;
-        ctx.lineWidth = 3;
-        ctx.stroke();
-      }
-      ctx.restore();
-    },
-    [],
-  );
-
-  const stampDot = useCallback(
-    (
-      ctx: CanvasRenderingContext2D,
-      x: number,
-      y: number,
-      size: number,
-      settings: BrushSettings,
-      strokeAngle: number,
-    ) => {
-      const r = size / 2;
-      const angle =
-        settings.rotateMode === "follow"
-          ? strokeAngle
-          : (settings.rotation * Math.PI) / 180;
-
-      // Image-based brush tip
-      if (settings.tipImageData) {
-        const cacheKey = settings.tipImageData.slice(0, 100);
-        let tipCanvas = tipCanvasCacheRef.current.get(cacheKey);
-
-        if (!tipCanvas) {
-          // Async load: trigger and fall through to primitive for this stamp
-          const img = new Image();
-          img.onload = () => {
-            const tc = document.createElement("canvas");
-            tc.width = tc.height = 128;
-            const tcCtx = tc.getContext("2d", { willReadFrequently: true })!;
-            tcCtx.drawImage(img, 0, 0, 128, 128);
-            const imgData = tcCtx.getImageData(0, 0, 128, 128);
-            const d = imgData.data;
-            for (let i = 0; i < d.length; i += 4) {
-              const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-              d[i] = 255;
-              d[i + 1] = 255;
-              d[i + 2] = 255;
-              d[i + 3] = 255 - lum;
-            }
-            tcCtx.putImageData(imgData, 0, 0);
-            tipCanvasCacheRef.current.set(cacheKey, tc);
-          };
-          img.src = settings.tipImageData;
-          // Fall through to primitive on first encounter
-        } else {
-          // Create tinted stamp: fill with brush color, mask with tip alpha (reuse module-level canvas)
-          _tintCtx.clearRect(0, 0, 128, 128);
-          _tintCtx.globalCompositeOperation = "source-over";
-          _tintCtx.fillStyle = ctx.fillStyle as string;
-          _tintCtx.fillRect(0, 0, 128, 128);
-          _tintCtx.globalCompositeOperation = "destination-in";
-          _tintCtx.drawImage(tipCanvas, 0, 0);
-          _tintCtx.globalCompositeOperation = "source-over";
-
-          ctx.save();
-          ctx.translate(x, y);
-          if (angle !== 0) ctx.rotate(angle);
-          ctx.drawImage(_tintCanvas, -size / 2, -size / 2, size, size);
-          ctx.restore();
-          return;
-        }
-      }
-
-      // Default tip fallback: use preloaded circle tip or arc (reuse module-level tint canvas)
-      const defTip = defaultTipCanvasRef.current;
-      if (defTip) {
-        _tintCtx.clearRect(0, 0, 128, 128);
-        _tintCtx.globalCompositeOperation = "source-over";
-        _tintCtx.filter =
-          settings.softness > 0
-            ? `blur(${Math.round(settings.softness * 20)}px)`
-            : "none";
-        _tintCtx.fillStyle = ctx.fillStyle as string;
-        _tintCtx.fillRect(0, 0, 128, 128);
-        _tintCtx.globalCompositeOperation = "destination-in";
-        _tintCtx.drawImage(defTip, 0, 0);
-        _tintCtx.globalCompositeOperation = "source-over";
-        _tintCtx.filter = "none";
-        ctx.save();
-        ctx.translate(x, y);
-        if (angle !== 0) ctx.rotate(angle);
-        ctx.drawImage(_tintCanvas, -size / 2, -size / 2, size, size);
-        ctx.restore();
-      } else {
-        ctx.save();
-        ctx.translate(x, y);
-        if (angle !== 0) ctx.rotate(angle);
-        if (settings.softness > 0) {
-          ctx.shadowBlur = settings.softness * size * 0.5;
-          ctx.shadowColor = ctx.fillStyle as string;
-        }
-        ctx.beginPath();
-        ctx.arc(0, 0, r, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.shadowBlur = 0;
-        ctx.restore();
-      }
-    },
-    [],
-  );
-
-  const normalizePressure = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (e.pointerType === "mouse") return 1.0;
-    return e.pressure > 0 ? e.pressure : 0.5;
-  };
-
-  const flushStrokeBuffer = useCallback(
-    (lc: HTMLCanvasElement, _opacity: number, tool: Tool) => {
-      const layerCtx = lc.getContext("2d", { willReadFrequently: true });
-      const snap = strokeStartSnapshotRef.current;
-      const sbuf = strokeBufferRef.current;
-      if (!layerCtx || !snap || !sbuf) return;
-      const selMask = selectionMaskRef.current;
-      if (selMask && selectionActiveRef.current) {
-        // Clip stroke to selection: draw stroke into a temp canvas, mask with selection, then composite
-        // Reuse pre-allocated canvas to avoid per-stroke-commit allocation
-        if (
-          _tempStrokeCanvas.width !== lc.width ||
-          _tempStrokeCanvas.height !== lc.height
-        ) {
-          _tempStrokeCanvas.width = lc.width;
-          _tempStrokeCanvas.height = lc.height;
-          _tempStrokeCtxCached = null;
-        }
-        if (!_tempStrokeCtxCached)
-          _tempStrokeCtxCached = _tempStrokeCanvas.getContext("2d", {
-            willReadFrequently: true,
-          });
-        const tmpCanvas = _tempStrokeCanvas;
-        const tmpCtx = _tempStrokeCtxCached!;
-        tmpCtx.clearRect(0, 0, tmpCanvas.width, tmpCanvas.height);
-        tmpCtx.globalAlpha = strokeCommitOpacityRef.current;
-        tmpCtx.globalCompositeOperation =
-          tool === "eraser" ? "source-over" : "source-over";
-        tmpCtx.drawImage(sbuf, 0, 0);
-        tmpCtx.globalAlpha = 1;
-        // Apply selection mask (destination-in keeps only selected pixels)
-        tmpCtx.globalCompositeOperation = "destination-in";
-        tmpCtx.drawImage(selMask, 0, 0);
-        tmpCtx.globalCompositeOperation = "source-over";
-        // Now apply to layer
-        layerCtx.putImageData(snap, 0, 0);
-        layerCtx.globalAlpha = 1;
-        layerCtx.globalCompositeOperation =
-          tool === "eraser" ? "destination-out" : "source-over";
-        layerCtx.drawImage(tmpCanvas, 0, 0);
-        layerCtx.globalAlpha = 1;
-        layerCtx.globalCompositeOperation = "source-over";
-      } else {
-        layerCtx.putImageData(snap, 0, 0);
-        // Apply stroke-level opacity (the "diluted ink" cap) when committing stroke to layer.
-        layerCtx.globalAlpha = strokeCommitOpacityRef.current;
-        layerCtx.globalCompositeOperation =
-          tool === "eraser"
-            ? "destination-out"
-            : (brushBlendModeRef.current as GlobalCompositeOperation);
-        layerCtx.drawImage(sbuf, 0, 0);
-        layerCtx.globalAlpha = 1;
-        layerCtx.globalCompositeOperation = "source-over";
-      }
-    },
-    [],
-  );
-
-  // Renders preview of active stroke to the display canvas WITHOUT modifying any layer canvas.
-  // Accepts an optional dirty rect — when provided, only composites that region (O(stampArea)
-  // instead of O(fullCanvas)), enabling synchronous per-event updates with negligible cost.
-  const compositeWithStrokePreview = useCallback(
-    (
-      _opacity: number,
-      tool: Tool,
-      dirty?: { minX: number; minY: number; maxX: number; maxY: number },
-    ) => {
-      const display = displayCanvasRef.current;
-      const below = belowActiveCanvasRef.current;
-      const above = aboveActiveCanvasRef.current;
-      const snap = snapshotCanvasRef.current;
-      const preview = activePreviewCanvasRef.current;
-      const sbuf = strokeBufferRef.current;
-      const activeLayerId = activeLayerIdRef.current;
-      if (
-        !display ||
-        !below ||
-        !above ||
-        !snap ||
-        !preview ||
-        !sbuf ||
-        !activeLayerId
-      )
-        return;
-
-      const W = display.width;
-      const H = display.height;
-      const activeLayer = layersRef.current.find((l) => l.id === activeLayerId);
-      if (!activeLayer) return;
-
-      // Determine composite region — clip to canvas bounds, add 2px guard for rounding
-      const useDirty =
-        dirty != null &&
-        Number.isFinite(dirty.minX) &&
-        dirty.maxX >= dirty.minX;
-      const cx = useDirty ? Math.max(0, Math.floor(dirty!.minX) - 2) : 0;
-      const cy = useDirty ? Math.max(0, Math.floor(dirty!.minY) - 2) : 0;
-      const cx2 = useDirty ? Math.min(W, Math.ceil(dirty!.maxX) + 2) : W;
-      const cy2 = useDirty ? Math.min(H, Math.ceil(dirty!.maxY) + 2) : H;
-      const cw = cx2 - cx;
-      const ch = cy2 - cy;
-
-      // 1. Build active layer preview in composite region: snapshot + stroke buffer at strokeOpacity
-      const previewCtx = preview.getContext("2d", { willReadFrequently: true });
-      if (!previewCtx) return;
-      previewCtx.clearRect(cx, cy, cw, ch);
-      previewCtx.globalAlpha = 1;
-      previewCtx.globalCompositeOperation = "source-over";
-      previewCtx.drawImage(snap, cx, cy, cw, ch, cx, cy, cw, ch);
-      // Apply stroke-level opacity (the "diluted ink" cap) when compositing stroke buffer.
-      // If a selection is active, mask only the stroke buffer — not the snapshot —
-      // so existing layer content outside the selection is preserved in the preview.
-      if (
-        selectionMaskRef.current &&
-        selectionActiveRef.current &&
-        tool !== "eraser"
-      ) {
-        if (
-          _tempStrokeCanvas.width !== preview.width ||
-          _tempStrokeCanvas.height !== preview.height
-        ) {
-          _tempStrokeCanvas.width = preview.width;
-          _tempStrokeCanvas.height = preview.height;
-          _tempStrokeCtxCached = null;
-        }
-        if (!_tempStrokeCtxCached)
-          _tempStrokeCtxCached = _tempStrokeCanvas.getContext("2d", {
-            willReadFrequently: true,
-          });
-        const tempStroke = _tempStrokeCanvas;
-        const tempStrokeCtx = _tempStrokeCtxCached!;
-        tempStrokeCtx.clearRect(0, 0, tempStroke.width, tempStroke.height);
-        tempStrokeCtx.globalAlpha = 1;
-        tempStrokeCtx.drawImage(sbuf, cx, cy, cw, ch, cx, cy, cw, ch);
-        tempStrokeCtx.globalCompositeOperation = "destination-in";
-        tempStrokeCtx.drawImage(
-          selectionMaskRef.current,
-          cx,
-          cy,
-          cw,
-          ch,
-          cx,
-          cy,
-          cw,
-          ch,
-        );
-        previewCtx.globalAlpha = strokeCommitOpacityRef.current;
-        previewCtx.globalCompositeOperation = "source-over";
-        previewCtx.drawImage(tempStroke, 0, 0);
-        previewCtx.globalAlpha = 1;
-      } else {
-        previewCtx.globalAlpha = strokeCommitOpacityRef.current;
-        previewCtx.globalCompositeOperation =
-          tool === "eraser" ? "destination-out" : "source-over";
-        previewCtx.drawImage(sbuf, cx, cy, cw, ch, cx, cy, cw, ch);
-        previewCtx.globalAlpha = 1;
-        previewCtx.globalCompositeOperation = "source-over";
-      }
-      // Apply active layer mask to live stroke preview (non-destructive mask preview)
-      const activeMaskCanvas = layerMaskCanvasesRef.current.get(activeLayerId);
-      if (activeMaskCanvas) {
-        previewCtx.globalCompositeOperation = "destination-in";
-        previewCtx.drawImage(activeMaskCanvas, cx, cy, cw, ch, cx, cy, cw, ch);
-        previewCtx.globalCompositeOperation = "source-over";
-      }
-
-      // 2. Composite to display in region: below layers + active layer preview + above layers
-      const displayCtx = display.getContext("2d", { willReadFrequently: true });
-      if (!displayCtx) return;
-      displayCtx.clearRect(cx, cy, cw, ch);
-      displayCtx.globalAlpha = 1;
-      displayCtx.drawImage(below, cx, cy, cw, ch, cx, cy, cw, ch);
-
-      // If active layer is a clipping mask, clip preview to base layer
-      let previewSource: HTMLCanvasElement = preview;
-      if (activeLayer.isClippingMask) {
-        const ls2 = layersRef.current;
-        const aIdx2 = ls2.findIndex((l) => l.id === activeLayerId);
-        let baseLayerForClip: Layer | null = null;
-        for (let j = aIdx2 + 1; j < ls2.length; j++) {
-          if (ls2[j].id !== "layer-background" && !ls2[j].isClippingMask) {
-            baseLayerForClip = ls2[j];
-            break;
-          }
-        }
-        if (baseLayerForClip) {
-          const baseLcForClip = layerCanvasesRef.current.get(
-            baseLayerForClip.id,
-          );
-          if (baseLcForClip) {
-            if (_clipTmpCanvas.width !== W || _clipTmpCanvas.height !== H) {
-              _clipTmpCanvas.width = W;
-              _clipTmpCanvas.height = H;
-              _clipTmpCtxCached = null;
-            }
-            if (!_clipTmpCtxCached)
-              _clipTmpCtxCached = _clipTmpCanvas.getContext("2d", {
-                willReadFrequently: true,
-              });
-            const clipCtx = _clipTmpCtxCached!;
-            clipCtx.clearRect(0, 0, W, H);
-            clipCtx.drawImage(preview, 0, 0);
-            clipCtx.globalCompositeOperation = "destination-in";
-            clipCtx.drawImage(baseLcForClip, 0, 0);
-            clipCtx.globalCompositeOperation = "source-over";
-            previewSource = _clipTmpCanvas;
-          }
-        }
-      }
-
-      displayCtx.globalAlpha = activeLayer.opacity;
-      displayCtx.globalCompositeOperation = (activeLayer.blendMode ||
-        "source-over") as GlobalCompositeOperation;
-      displayCtx.drawImage(previewSource, cx, cy, cw, ch, cx, cy, cw, ch);
-      displayCtx.globalAlpha = 1;
-      displayCtx.globalCompositeOperation = "source-over";
-      displayCtx.drawImage(above, cx, cy, cw, ch, cx, cy, cw, ch);
-    },
-    [],
-  );
-
-  // Builds the persistent below/above/snapshot canvases at stroke start.
-  // Called once per stroke from handlePointerDown before the first stamp.
-  const buildStrokeCanvases = useCallback((activeLayerId: string) => {
-    const display = displayCanvasRef.current;
-    const below = belowActiveCanvasRef.current;
-    const above = aboveActiveCanvasRef.current;
-    const snap = snapshotCanvasRef.current;
-    const activeLayerCanvas = layerCanvasesRef.current.get(activeLayerId);
-    if (!display || !below || !above || !snap || !activeLayerCanvas) return;
-
-    const W = display.width;
-    const H = display.height;
-
-    // Clear WebGL stroke buffer for new stroke
-    if (webglBrushRef.current) {
-      webglBrushRef.current.clear();
-    } else {
-      const sbuf = strokeBufferRef.current;
-      if (sbuf)
-        sbuf
-          .getContext("2d", { willReadFrequently: true })
-          ?.clearRect(0, 0, sbuf.width, sbuf.height);
+  // Collapses multiple ruler-edit undo entries into a single entry when switching away from the ruler tool.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable
+  const collapseRulerHistory = useCallback(() => {
+    if (activeToolRef.current !== "ruler") return;
+    if (rulerEditHistoryDepthRef.current <= 1) return;
+    const _d = rulerEditHistoryDepthRef.current;
+    const _stack = undoStackRef.current;
+    const _first = _stack[_stack.length - _d];
+    const _last = _stack[_stack.length - 1];
+    if (
+      _first &&
+      _last &&
+      _first !== _last &&
+      (_first as { type: string }).type === "ruler-edit" &&
+      (_last as { type: string }).type === "ruler-edit"
+    ) {
+      (_first as unknown as { after: unknown }).after = (
+        _last as unknown as { after: unknown }
+      ).after;
     }
+    _stack.splice(-(_d - 1), _d - 1);
+    rulerEditHistoryDepthRef.current = 1;
+    setUndoCount(_stack.length);
+    setRedoCount(redoStackRef.current.length);
+  }, [
+    activeToolRef,
+    rulerEditHistoryDepthRef,
+    undoStackRef,
+    redoStackRef,
+    setUndoCount,
+    setRedoCount,
+  ]);
 
-    const ls = layersRef.current;
-    const activeIdx = ls.findIndex((l) => l.id === activeLayerId);
+  // stampDot, normalizePressure, flushStrokeBuffer → now from useStrokeEngine/useCompositing hooks
 
-    // --- Build belowActiveCanvas: background fill + layers below (with blend modes) ---
-    const belowCtx = below.getContext("2d", { willReadFrequently: true });
-    if (!belowCtx) return;
-    belowCtx.clearRect(0, 0, W, H);
-    belowCtx.globalAlpha = 1;
-    belowCtx.fillStyle = backgroundColorRef.current;
-    belowCtx.fillRect(0, 0, W, H);
-    for (let i = ls.length - 1; i > activeIdx; i--) {
-      const layer = ls[i];
-      if (layer.id === "layer-background") continue;
-      if (!layer.visible) continue;
-      const lc = layerCanvasesRef.current.get(layer.id);
-      if (!lc) continue;
-      const layerMaskCv = layerMaskCanvasesRef.current.get(layer.id);
-      belowCtx.globalAlpha = layer.opacity;
-      belowCtx.globalCompositeOperation = (layer.blendMode ||
-        "source-over") as GlobalCompositeOperation;
-      if (layer.isClippingMask && i < ls.length - 1) {
-        // Find the base layer this clips to
-        let baseLayer: Layer | null = null;
-        for (let j = i + 1; j < ls.length; j++) {
-          if (ls[j].id !== "layer-background" && !ls[j].isClippingMask) {
-            baseLayer = ls[j];
-            break;
-          }
-        }
-        if (baseLayer) {
-          const baseLc = layerCanvasesRef.current.get(baseLayer.id);
-          if (baseLc) {
-            const tmp = document.createElement("canvas");
-            tmp.width = W;
-            tmp.height = H;
-            const tmpCtx = tmp.getContext("2d", { willReadFrequently: true })!;
-            tmpCtx.drawImage(lc, 0, 0);
-            if (layerMaskCv) {
-              tmpCtx.globalCompositeOperation = "destination-in";
-              tmpCtx.drawImage(layerMaskCv, 0, 0);
-              tmpCtx.globalCompositeOperation = "source-over";
-            }
-            tmpCtx.globalCompositeOperation = "destination-in";
-            tmpCtx.drawImage(baseLc, 0, 0);
-            belowCtx.drawImage(tmp, 0, 0);
-            belowCtx.globalCompositeOperation = "source-over";
-            continue;
-          }
-        }
+  // compositeWithStrokePreview, buildStrokeCanvases → now from useCompositing hook
+  // Prewarm useEffect stays here since it orchestrates buildStrokeCanvases after layer/activeLayerId changes
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional – layers/activeLayerId trigger re-warm
+  useEffect(() => {
+    if (prewarmRafRef.current !== null)
+      cancelAnimationFrame(prewarmRafRef.current);
+    prewarmRafRef.current = requestAnimationFrame(() => {
+      prewarmRafRef.current = null;
+      if (!isDrawingRef.current) {
+        buildStrokeCanvases(activeLayerIdRef.current);
       }
-      if (layerMaskCv) {
-        const tmp = document.createElement("canvas");
-        tmp.width = W;
-        tmp.height = H;
-        const tmpCtx = tmp.getContext("2d", { willReadFrequently: true })!;
-        tmpCtx.drawImage(lc, 0, 0);
-        tmpCtx.globalCompositeOperation = "destination-in";
-        tmpCtx.drawImage(layerMaskCv, 0, 0);
-        belowCtx.drawImage(tmp, 0, 0);
-      } else {
-        belowCtx.drawImage(lc, 0, 0);
+    });
+    return () => {
+      if (prewarmRafRef.current !== null) {
+        cancelAnimationFrame(prewarmRafRef.current);
+        prewarmRafRef.current = null;
       }
-      belowCtx.globalCompositeOperation = "source-over";
-    }
-    belowCtx.globalAlpha = 1;
-    belowCtx.globalCompositeOperation = "source-over";
-
-    // --- Build aboveActiveCanvas: layers above active (lower index = drawn last) ---
-    const aboveCtx = above.getContext("2d", { willReadFrequently: true });
-    if (!aboveCtx) return;
-    aboveCtx.clearRect(0, 0, W, H);
-    for (let i = activeIdx - 1; i >= 0; i--) {
-      const layer = ls[i];
-      if (!layer.visible) continue;
-      const lc = layerCanvasesRef.current.get(layer.id);
-      if (!lc) continue;
-      aboveCtx.globalAlpha = layer.opacity;
-      aboveCtx.drawImage(lc, 0, 0);
-    }
-    aboveCtx.globalAlpha = 1;
-
-    // --- Build snapshotCanvas: copy of active layer pixels at stroke start ---
-    const snapCtx = snap.getContext("2d", { willReadFrequently: true });
-    if (!snapCtx) return;
-    snapCtx.clearRect(0, 0, W, H);
-    snapCtx.drawImage(activeLayerCanvas, 0, 0);
-  }, []);
-
-  // GPU-accelerated stamp using the WebGL brush context
-  const stampWebGL = useCallback(
-    (
-      sx: number,
-      sy: number,
-      stampSize: number,
-      stampOpacity: number,
-      settings: BrushSettings,
-      angle: number,
-      fillStyle: string,
-      capAlpha?: number,
-      dualFillStyle?: string,
-    ) => {
-      const glBrush = webglBrushRef.current;
-      if (!glBrush) return;
-      const m = /rgb\((\d+),\s*(\d+),\s*(\d+)\)/.exec(fillStyle);
-      const r = m ? Number.parseInt(m[1]) / 255 : 0;
-      const g = m ? Number.parseInt(m[2]) / 255 : 0;
-      const b = m ? Number.parseInt(m[3]) / 255 : 0;
-      let dualR: number | undefined;
-      let dualG: number | undefined;
-      let dualB: number | undefined;
-      if (dualFillStyle && dualFillStyle !== fillStyle) {
-        const md = /rgb\((\d+),\s*(\d+),\s*(\d+)\)/.exec(dualFillStyle);
-        if (md) {
-          dualR = Number.parseInt(md[1]) / 255;
-          dualG = Number.parseInt(md[2]) / 255;
-          dualB = Number.parseInt(md[3]) / 255;
-        }
-      }
-      glBrush.stamp(
-        sx,
-        sy,
-        stampSize,
-        stampOpacity,
-        r,
-        g,
-        b,
-        settings.tipImageData ?? null,
-        angle,
-        defaultTipCanvasRef.current,
-        settings.softness,
-        capAlpha,
-        settings.dualTipEnabled,
-        settings.dualTipImageData ?? null,
-        settings.dualTipBlendMode,
-        dualR,
-        dualG,
-        dualB,
-      );
-    },
-    [],
-  );
-
-  const renderBrushSegmentAlongPoints = useCallback(
-    (
-      ctx: CanvasRenderingContext2D,
-      points: Point[],
-      sizeFrom: number,
-      sizeTo: number,
-      opacityFrom: number,
-      opacityTo: number,
-      settings: BrushSettings,
-      _tool: Tool,
-      _applyOpacityPerStamp = false,
-      capAlpha?: number,
-    ) => {
-      if (points.length < 2) return;
-      const avgSize = (sizeFrom + sizeTo) / 2;
-      const _fillStyle = _tool !== "eraser" ? (ctx.fillStyle as string) : "";
-      let totalSegDist = 0;
-      for (let i = 1; i < points.length; i++) {
-        totalSegDist += ptDist(points[i - 1], points[i]);
-      }
-      let distFromSegStart = 0;
-      for (let i = 1; i < points.length; i++) {
-        const from = points[i - 1];
-        const to = points[i];
-        const dx = to.x - from.x;
-        const dy = to.y - from.y;
-        const segDist = Math.sqrt(dx * dx + dy * dy);
-        const strokeAngle = Math.atan2(dy, dx);
-        let accdist = distAccumRef.current + segDist;
-        let stampsPlaced = 0;
-        while (true) {
-          const globalT =
-            totalSegDist > 0
-              ? (distFromSegStart +
-                  (stampsPlaced + 1) *
-                    Math.max(1, (settings.spacing / 100) * avgSize) -
-                  distAccumRef.current) /
-                totalSegDist
-              : 0;
-          const clampedT = Math.min(1, Math.max(0, globalT));
-          const interpSize = sizeFrom + (sizeTo - sizeFrom) * clampedT;
-          const spacingPixels = Math.max(
-            1,
-            ((settings.spacing / 100) * interpSize) / (settings.count ?? 1),
-          );
-          if (accdist < spacingPixels) break;
-          const distFromPrev =
-            (stampsPlaced + 1) * spacingPixels - distAccumRef.current;
-          const segT = segDist > 0 ? distFromPrev / segDist : 0;
-          const sx = from.x + dx * segT;
-          const sy = from.y + dy * segT;
-          const _interpOpacity =
-            opacityFrom + (opacityTo - opacityFrom) * clampedT;
-          {
-            const _countA = settings.count ?? 1;
-            for (let _ci = 0; _ci < _countA; _ci++) {
-              const _scatter = settings.scatter ?? 0;
-              const _sizeJitter = settings.sizeJitter ?? 0;
-              const _colorJitter = settings.colorJitter ?? 0;
-              const _rotationJitter = settings.rotationJitter ?? 0;
-              const _flowJitter = settings.flowJitter ?? 0;
-              const _stampX = sx + (Math.random() - 0.5) * 2 * _scatter;
-              const _stampY = sy + (Math.random() - 0.5) * 2 * _scatter;
-              const _stampSize =
-                interpSize * (1 + (Math.random() - 0.5) * _sizeJitter);
-              const _rotJitterRad =
-                (_rotationJitter / 2) *
-                (Math.PI / 180) *
-                (Math.random() - 0.5) *
-                2;
-              const _flowJitterVal =
-                (_flowJitter / 100) *
-                _interpOpacity *
-                (Math.random() - 0.5) *
-                2;
-              const _stampOpacity = Math.max(
-                0,
-                Math.min(1, _interpOpacity + _flowJitterVal),
-              );
-              const _baseAngle =
-                settings.rotateMode === "follow"
-                  ? strokeAngle
-                  : (settings.rotation * Math.PI) / 180;
-              const _stampAngle = _baseAngle + _rotJitterRad;
-              // Dual tip color jitter (secondary tip only)
-              const _dualColorJitter = settings.dualTipColorJitter ?? 0;
-              if (_tool === "eraser") {
-                stampWebGL(
-                  _stampX,
-                  _stampY,
-                  _stampSize,
-                  _stampOpacity,
-                  settings,
-                  _stampAngle,
-                  "rgb(255,255,255)",
-                  capAlpha,
-                );
-              } else {
-                const _jFill =
-                  _colorJitter > 0
-                    ? applyColorJitter(_fillStyle, _colorJitter)
-                    : _fillStyle;
-                const _dualJFill =
-                  settings.dualTipEnabled && _dualColorJitter > 0
-                    ? applyColorJitter(_fillStyle, _dualColorJitter)
-                    : _jFill;
-                stampWebGL(
-                  _stampX,
-                  _stampY,
-                  _stampSize,
-                  _stampOpacity,
-                  settings,
-                  _stampAngle,
-                  _jFill,
-                  capAlpha,
-                  _dualJFill,
-                );
-              }
-            }
-          }
-          stampsPlaced++;
-          accdist -= spacingPixels;
-        }
-        distAccumRef.current = accdist;
-        distFromSegStart += segDist;
-      }
-    },
-    [stampWebGL],
-  );
-
-  // HeavyPaint-style smudge: samples paint at stroke start, drags it forward blending with canvas.
-  // Must call initSmudgeBuffer(lc, pos, size) at stroke start before first move.
-  const renderSmearAlongPoints = useCallback(
-    (
-      lc: HTMLCanvasElement,
-      points: Point[],
-      brushSizeVal: number,
-      softness = 0,
-      strength = 0.8,
-    ) => {
-      const ctx = lc.getContext("2d", { willReadFrequently: true });
-      if (!ctx || points.length < 2) return;
-      const size = brushSizeVal;
-      const radius = size / 2;
-      const cw = lc.width;
-      const ch = lc.height;
-
-      // Ensure smudge buffer is sized correctly for this brush
-      const bufSize = Math.max(4, Math.round(size));
-      if (
-        !_smudgeInitialized ||
-        _smudgeBufferCanvas.width !== bufSize ||
-        _smudgeBufferCanvas.height !== bufSize
-      ) {
-        _smudgeBufferCanvas.width = bufSize;
-        _smudgeBufferCanvas.height = bufSize;
-        // Sample initial color from first point
-        const ix = Math.max(
-          0,
-          Math.min(cw - bufSize, Math.round(points[0].x - radius)),
-        );
-        const iy = Math.max(
-          0,
-          Math.min(ch - bufSize, Math.round(points[0].y - radius)),
-        );
-        _smudgeBufferCtx.clearRect(0, 0, bufSize, bufSize);
-        _smudgeBufferCtx.drawImage(
-          lc,
-          ix,
-          iy,
-          bufSize,
-          bufSize,
-          0,
-          0,
-          bufSize,
-          bufSize,
-        );
-      }
-
-      for (let i = 1; i < points.length; i++) {
-        const to = points[i];
-        const destX = Math.round(to.x - radius);
-        const destY = Math.round(to.y - radius);
-        const clampedX = Math.max(0, destX);
-        const clampedY = Math.max(0, destY);
-        const clampedW = Math.min(bufSize, cw - clampedX);
-        const clampedH = Math.min(bufSize, ch - clampedY);
-        if (clampedW <= 0 || clampedH <= 0) continue;
-
-        try {
-          // Build a radial softness weight mask (0..1 per pixel)
-          const numPixels = clampedW * clampedH;
-          if (
-            !_smearSoftnessWeights ||
-            _smearSoftnessWeights.length < numPixels
-          ) {
-            _smearSoftnessWeights = new Float32Array(
-              Math.max(numPixels, SMEAR_BUF_SIZE),
-            );
-          }
-          const softnessWeights = _smearSoftnessWeights;
-          if (softness > 0) {
-            const cx2 = clampedW / 2;
-            const cy2 = clampedH / 2;
-            const r = Math.min(clampedW, clampedH) / 2;
-            const innerR = r * (1 - softness);
-            const rRange = r - innerR;
-            for (let py = 0; py < clampedH; py++) {
-              for (let px2 = 0; px2 < clampedW; px2++) {
-                const dist = Math.sqrt((px2 - cx2) ** 2 + (py - cy2) ** 2);
-                softnessWeights[py * clampedW + px2] =
-                  rRange > 0
-                    ? Math.min(1, Math.max(0, (r - dist) / rRange))
-                    : dist <= r
-                      ? 1
-                      : 0;
-              }
-            }
-          } else {
-            softnessWeights.fill(1);
-          }
-
-          // Scale buffer to clampedW x clampedH in _smearCanvas
-          if (
-            _smearCanvas.width !== clampedW ||
-            _smearCanvas.height !== clampedH
-          ) {
-            _smearCanvas.width = clampedW;
-            _smearCanvas.height = clampedH;
-          } else {
-            _smearCtx.clearRect(0, 0, clampedW, clampedH);
-          }
-          _smearCtx.globalAlpha = 1;
-          _smearCtx.globalCompositeOperation = "source-over";
-          _smearCtx.drawImage(
-            _smudgeBufferCanvas,
-            0,
-            0,
-            bufSize,
-            bufSize,
-            0,
-            0,
-            clampedW,
-            clampedH,
-          );
-          const bufPx = _smearCtx.getImageData(0, 0, clampedW, clampedH);
-          const bd = bufPx.data;
-
-          // Read canvas BEFORE modification
-          const origCanvasPx = ctx.getImageData(
-            clampedX,
-            clampedY,
-            clampedW,
-            clampedH,
-          );
-          const ocd = origCanvasPx.data;
-
-          // --- Step 1: Paint smudge buffer onto canvas: out = lerp(canvas, buffer, s) ---
-          if (!_smearPaintData || _smearPaintData.length < ocd.length) {
-            _smearPaintData = new Uint8ClampedArray(
-              Math.max(ocd.length, SMEAR_BUF_SIZE),
-            );
-          }
-          const paintData = _smearPaintData.subarray(0, ocd.length);
-          for (let i = 0; i < ocd.length; i += 4) {
-            const s = softnessWeights[i >> 2] * strength;
-            paintData[i] = ocd[i] * (1 - s) + bd[i] * s;
-            paintData[i + 1] = ocd[i + 1] * (1 - s) + bd[i + 1] * s;
-            paintData[i + 2] = ocd[i + 2] * (1 - s) + bd[i + 2] * s;
-            paintData[i + 3] = ocd[i + 3] * (1 - s) + bd[i + 3] * s;
-          }
-          ctx.putImageData(
-            new ImageData(
-              paintData as Uint8ClampedArray<ArrayBuffer>,
-              clampedW,
-              clampedH,
-            ),
-            clampedX,
-            clampedY,
-          );
-
-          // --- Step 2: Update smudge buffer: new_buffer = lerp(original_canvas, old_buffer, strength) ---
-          if (!_smearBufData || _smearBufData.length < ocd.length) {
-            _smearBufData = new Uint8ClampedArray(
-              Math.max(ocd.length, SMEAR_BUF_SIZE),
-            );
-          }
-          const newBufData = _smearBufData.subarray(0, ocd.length);
-          for (let i = 0; i < ocd.length; i += 4) {
-            const s = strength;
-            newBufData[i] = ocd[i] * (1 - s) + bd[i] * s;
-            newBufData[i + 1] = ocd[i + 1] * (1 - s) + bd[i + 1] * s;
-            newBufData[i + 2] = ocd[i + 2] * (1 - s) + bd[i + 2] * s;
-            newBufData[i + 3] = ocd[i + 3] * (1 - s) + bd[i + 3] * s;
-          }
-          _smearCtx.putImageData(
-            new ImageData(
-              newBufData as Uint8ClampedArray<ArrayBuffer>,
-              clampedW,
-              clampedH,
-            ),
-            0,
-            0,
-          );
-          _smudgeBufferCtx.clearRect(0, 0, bufSize, bufSize);
-          _smudgeBufferCtx.drawImage(
-            _smearCanvas,
-            0,
-            0,
-            clampedW,
-            clampedH,
-            0,
-            0,
-            bufSize,
-            bufSize,
-          );
-        } catch {
-          /* ignore OOB */
-        }
-      }
-    },
-    [],
-  );
-
-  // Initialize smudge buffer at stroke start — samples canvas at the first touch point
-  const initSmudgeBuffer = useCallback(
-    (lc: HTMLCanvasElement, startPos: Point, brushSize: number) => {
-      const size = Math.max(4, Math.round(brushSize));
-      _smudgeBufferCanvas.width = size;
-      _smudgeBufferCanvas.height = size;
-      const cw = lc.width;
-      const ch = lc.height;
-      const ix = Math.max(
-        0,
-        Math.min(cw - size, Math.round(startPos.x - size / 2)),
-      );
-      const iy = Math.max(
-        0,
-        Math.min(ch - size, Math.round(startPos.y - size / 2)),
-      );
-      _smudgeBufferCtx.clearRect(0, 0, size, size);
-      _smudgeBufferCtx.drawImage(lc, ix, iy, size, size, 0, 0, size, size);
-      _smudgeInitialized = true;
-    },
-    [],
-  );
-
+    };
+  }, [layers, activeLayerId]); // eslint-disable-line
+  // compositeWithStrokePreview, buildStrokeCanvases, stampWebGL, renderBrushSegmentAlongPoints,
+  // renderSmearAlongPoints → all moved to useCompositing/useStrokeEngine hooks.
   // Apply view transform directly to DOM during gesture — no React re-render
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable
   const applyTransformToDOM = useCallback((vt: ViewTransform) => {
     viewTransformRef.current = vt;
     const el = canvasWrapperRef.current;
@@ -3203,2027 +2589,147 @@ export function PaintingApp() {
     }
   }, []);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: applyTransformToDOMRef is a stable ref
   useEffect(() => {
     applyTransformToDOMRef.current = applyTransformToDOM;
   }, [applyTransformToDOM]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: uses refs/snapshotSelection intentionally
-  const handlePointerDown = useCallback(
-    (e: React.PointerEvent<HTMLCanvasElement>) => {
-      const display = displayCanvasRef.current;
-      const container = containerRef.current;
-      if (!display || !container) return;
-      e.preventDefault();
-      (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+  // Keep canvas wrapper DOM transform in sync with React state.
+  // This is critical: applyTransformToDOM mutates el.style.transform directly (bypassing React),
+  // but any React re-render from an unrelated state change (thumbnail update, etc.) will
+  // overwrite the DOM transform with the stale React state value.
+  // By running applyTransformToDOM here, we ensure every render that touches viewTransform
+  // or isFlipped also pushes the correct transform to the DOM immediately after paint.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: applyTransformToDOM is stable
+  useEffect(() => {
+    applyTransformToDOM(viewTransform);
+  }, [viewTransform, isFlipped, applyTransformToDOM]);
 
-      // Z+drag zoom with cursor pivot
-      if (zKeyDownRef.current) {
-        isZoomDraggingRef.current = true;
-        zoomDragStartXRef.current = e.clientX;
-        zoomDragOriginRef.current = viewTransformRef.current.zoom;
-        const cr = container.getBoundingClientRect();
-        zoomDragCursorStartRef.current = {
-          x: e.clientX - (cr.left + cr.width / 2),
-          y: e.clientY - (cr.top + cr.height / 2),
-        };
-        zoomDragPanOriginRef.current = {
-          x: viewTransformRef.current.panX,
-          y: viewTransformRef.current.panY,
-        };
-        return;
-      }
+  // Keep the selection overlay canvas pixel dimensions in sync with the main canvas.
+  // The ref callback only fires at mount, so after a crop resize the overlay would
+  // retain old pixel dimensions, causing a CSS-scale mismatch and coordinate desync.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: selectionOverlayCanvasRef is a stable ref
+  useEffect(() => {
+    const overlay = selectionOverlayCanvasRef.current;
+    if (
+      overlay &&
+      (overlay.width !== canvasWidth || overlay.height !== canvasHeight)
+    ) {
+      overlay.width = canvasWidth;
+      overlay.height = canvasHeight;
+    }
+  }, [canvasWidth, canvasHeight]);
 
-      if (
-        zoomModeRef.current ||
-        (zoomLockedRef.current && !spaceDownRef.current && !rKeyDownRef.current)
-      ) {
-        isZoomDraggingRef.current = true;
-        zoomDragStartXRef.current = e.clientX;
-        zoomDragOriginRef.current = viewTransformRef.current.zoom;
-        const cr2 = container.getBoundingClientRect();
-        zoomDragCursorStartRef.current = {
-          x: e.clientX - (cr2.left + cr2.width / 2),
-          y: e.clientY - (cr2.top + cr2.height / 2),
-        };
-        zoomDragPanOriginRef.current = {
-          x: viewTransformRef.current.panX,
-          y: viewTransformRef.current.panY,
-        };
-        return;
-      }
+  // Redraw ruler overlay when any ruler-relevant state changes
+  // biome-ignore lint/correctness/useExhaustiveDependencies: drawRulerOverlay is stable
+  useEffect(() => {
+    drawRulerOverlay();
+  }, [undoCount, redoCount, layers, activeRulerPresetType]);
 
-      if (
-        rKeyDownRef.current ||
-        (rotateLockedRef.current &&
-          !spaceDownRef.current &&
-          !zoomModeRef.current)
-      ) {
-        isRotatingRef.current = true;
-        rotStartRef.current = e.clientY;
-        rotStartXRef.current = e.clientX;
-        rotOriginRef.current = viewTransformRef.current.rotation;
-        const cr3 = container.getBoundingClientRect();
-        // Rotate around viewport center
-        rotDragCursorRef.current = { x: 0, y: 0 };
-        rotDragCanvasPointRef.current = getCanvasPosTransformed(
-          cr3.left + cr3.width / 2,
-          cr3.top + cr3.height / 2,
-          container,
-          display,
-          viewTransformRef.current,
-          isFlippedRef.current,
-        );
-        rotDragPanOriginRef.current = {
-          x: viewTransformRef.current.panX,
-          y: viewTransformRef.current.panY,
-        };
-        return;
-      }
+  // ---- Ruler overlay rendering ----
+  // Delegates to the four ruler sub-hooks which contain the drawing logic.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable
+  const drawRulerOverlay = useCallback(() => {
+    const rc = rulerCanvasRef.current;
+    if (!rc) return;
+    const ctx = rc.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, rc.width, rc.height);
 
-      if (e.button === 1 || spaceDownRef.current) {
-        isPanningRef.current = true;
-        panStartRef.current = { x: e.clientX, y: e.clientY };
-        panOriginRef.current = {
-          x: viewTransformRef.current.panX,
-          y: viewTransformRef.current.panY,
-        };
-        return;
-      }
+    const rulerLayer = layersRef.current.find((l) => l.isRuler);
+    if (!rulerLayer || !rulerLayer.visible) return;
 
-      const pos = getCanvasPosTransformed(
-        e.clientX,
-        e.clientY,
-        container,
-        display,
-        viewTransformRef.current,
-        isFlippedRef.current,
-      );
-      const tool = activeToolRef.current;
-      const layerId = activeLayerIdRef.current;
-      const lc = layerCanvasesRef.current.get(layerId);
+    const opacity = rulerLayer.opacity;
+    const presetType = rulerLayer.rulerPresetType ?? "perspective-1pt";
 
-      if (tool === "eyedropper") {
-        const ctx = display.getContext("2d", { willReadFrequently: true });
-        if (!ctx) return;
-        const pixel = ctx.getImageData(
-          Math.round(pos.x),
-          Math.round(pos.y),
-          1,
-          1,
-        ).data;
-        const [h, s, v] = rgbToHsv(pixel[0], pixel[1], pixel[2]);
-        const a = pixel[3] / 255;
-        setColor((prev) => ({ ...prev, h, s, v, a: a > 0 ? a : prev.a }));
-        return;
-      }
+    ctx.save();
+    ctx.globalAlpha = opacity;
 
-      // Handle lasso selection tools
-      if (tool === "lasso") {
-        const mode = lassoModeRef.current;
-        // Capture selection state BEFORE drawing for undo
-        selectionBeforeRef.current = snapshotSelection();
-        if (mode === "rect" || mode === "ellipse") {
-          isDrawingSelectionRef.current = true;
-          selectionDraftBoundsRef.current = {
-            sx: pos.x,
-            sy: pos.y,
-            ex: pos.x,
-            ey: pos.y,
-          };
-          // Only clear existing selection when no modifier (replace mode)
-          if (!e.shiftKey && !e.altKey) {
-            setSelectionActive(false);
-            selectionGeometryRef.current = null;
-            selectionMaskRef.current = null;
-          }
-        } else if (mode === "free") {
-          isDrawingSelectionRef.current = true;
-          selectionDraftPointsRef.current = [{ x: pos.x, y: pos.y }];
-          // Only clear existing selection when no modifier (replace mode)
-          if (!e.shiftKey && !e.altKey) {
-            setSelectionActive(false);
-            selectionGeometryRef.current = null;
-            selectionMaskRef.current = null;
-          }
-        } else if (mode === "poly") {
-          if (!isDrawingSelectionRef.current) {
-            // Start new polygon
-            isDrawingSelectionRef.current = true;
-            selectionPolyClosingRef.current = false;
-            selectionDraftPointsRef.current = [{ x: pos.x, y: pos.y }];
-            // Only clear when no modifier
-            if (!e.shiftKey && !e.altKey) {
-              setSelectionActive(false);
-              selectionGeometryRef.current = null;
-              selectionMaskRef.current = null;
-            }
-          } else {
-            // Check if clicking near the first point (close polygon)
-            const first = selectionDraftPointsRef.current[0];
-            const dx = pos.x - first.x;
-            const dy = pos.y - first.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist < 12 && selectionDraftPointsRef.current.length > 2) {
-              // Close the polygon
-              const polyPts = [...selectionDraftPointsRef.current];
-              if ((e.shiftKey || e.altKey) && selectionMaskRef.current) {
-                const tempPoly = document.createElement("canvas");
-                tempPoly.width = CANVAS_WIDTH;
-                tempPoly.height = CANVAS_HEIGHT;
-                const tPolyCtx = tempPoly.getContext("2d", {
-                  willReadFrequently: true,
-                })!;
-                tPolyCtx.fillStyle = "white";
-                tPolyCtx.beginPath();
-                tPolyCtx.moveTo(polyPts[0].x, polyPts[0].y);
-                for (let i = 1; i < polyPts.length; i++)
-                  tPolyCtx.lineTo(polyPts[i].x, polyPts[i].y);
-                tPolyCtx.closePath();
-                tPolyCtx.fill();
-                const mcP = selectionMaskRef.current;
-                const mCtxP = mcP.getContext("2d", {
-                  willReadFrequently: true,
-                })!;
-                if (e.shiftKey && !e.altKey) {
-                  mCtxP.globalCompositeOperation = "source-over";
-                } else if (e.altKey && !e.shiftKey) {
-                  mCtxP.globalCompositeOperation = "destination-out";
-                } else {
-                  mCtxP.globalCompositeOperation = "destination-in";
-                }
-                mCtxP.drawImage(tempPoly, 0, 0);
-                mCtxP.globalCompositeOperation = "source-over";
-                selectionGeometryRef.current = { type: "mask" as LassoMode };
-                if (e.shiftKey && !e.altKey) {
-                  selectionShapesRef.current = [
-                    ...selectionShapesRef.current,
-                    { type: "poly" as LassoMode, points: polyPts },
-                  ];
-                  selectionBoundaryPathRef.current.dirty = true;
-                } else {
-                  selectionShapesRef.current = [];
-                  selectionBoundaryPathRef.current.dirty = true;
-                }
-              } else {
-                selectionGeometryRef.current = {
-                  type: "poly",
-                  points: polyPts,
-                };
-                selectionShapesRef.current = [
-                  { type: "poly" as LassoMode, points: polyPts },
-                ];
-                selectionBoundaryPathRef.current.dirty = true;
-                rasterizeSelectionMask();
-              }
-              setSelectionActive(true);
-              isDrawingSelectionRef.current = false;
-              selectionDraftPointsRef.current = [];
-              selectionDraftCursorRef.current = null;
-              // Push selection undo
-              {
-                const afterSnap = snapshotSelection();
-                undoStackRef.current.push({
-                  type: "selection",
-                  before: selectionBeforeRef.current ?? afterSnap,
-                  after: afterSnap,
-                });
-                if (undoStackRef.current.length > 50)
-                  undoStackRef.current.shift();
-                redoStackRef.current = [];
-                setUndoCount(undoStackRef.current.length);
-                setRedoCount(0);
-              }
-            } else {
-              selectionDraftPointsRef.current.push({ x: pos.x, y: pos.y });
-            }
-          }
-        } else if (mode === "wand") {
-          // Magic wand flood-fill selection
-          selectionBeforeRef.current = snapshotSelection();
-          const layerCanvas = layerCanvasesRef.current.get(activeLayerId);
-          if (!layerCanvas) return;
-          const lCtx = layerCanvas.getContext("2d", {
-            willReadFrequently: true,
-          });
-          if (!lCtx) return;
-          const wx = Math.round(pos.x);
-          const wy = Math.round(pos.y);
-          if (wx < 0 || wx >= CANVAS_WIDTH || wy < 0 || wy >= CANVAS_HEIGHT)
-            return;
-          const imgData = lCtx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-          const srcData = imgData.data;
-          const maskCanvas = document.createElement("canvas");
-          maskCanvas.width = CANVAS_WIDTH;
-          maskCanvas.height = CANVAS_HEIGHT;
-          const mCtx = maskCanvas.getContext("2d", {
-            willReadFrequently: true,
-          })!;
-          const maskImgData = mCtx.createImageData(CANVAS_WIDTH, CANVAS_HEIGHT);
-          const md = maskImgData.data;
-          const wi = (wy * CANVAS_WIDTH + wx) * 4;
-          const tr = srcData[wi];
-          const tg = srcData[wi + 1];
-          const tb = srcData[wi + 2];
-          const _ta = srcData[wi + 3];
-          const tol = wandToleranceRef.current;
-          // RGB-only comparison (ignore alpha, _ta unused intentionally)
-          const colorMatch = (i: number) =>
-            Math.abs(srcData[i] - tr) <= tol &&
-            Math.abs(srcData[i + 1] - tg) <= tol &&
-            Math.abs(srcData[i + 2] - tb) <= tol;
-          if (wandContiguousRef.current) {
-            const visited = new Uint8Array(CANVAS_WIDTH * CANVAS_HEIGHT);
-            const stack = [wx + wy * CANVAS_WIDTH];
-            while (stack.length > 0) {
-              const p = stack.pop()!;
-              const cx2 = p % CANVAS_WIDTH;
-              const cy2 = Math.floor(p / CANVAS_WIDTH);
-              if (
-                cx2 < 0 ||
-                cx2 >= CANVAS_WIDTH ||
-                cy2 < 0 ||
-                cy2 >= CANVAS_HEIGHT
-              )
-                continue;
-              if (visited[p]) continue;
-              visited[p] = 1;
-              const pi = p * 4;
-              if (!colorMatch(pi)) continue;
-              md[pi] = 255;
-              md[pi + 1] = 255;
-              md[pi + 2] = 255;
-              md[pi + 3] = 255;
-              stack.push(p + 1, p - 1, p + CANVAS_WIDTH, p - CANVAS_WIDTH);
-            }
-          } else {
-            for (let i = 0; i < CANVAS_WIDTH * CANVAS_HEIGHT; i++) {
-              const pi = i * 4;
-              if (colorMatch(pi)) {
-                md[pi] = 255;
-                md[pi + 1] = 255;
-                md[pi + 2] = 255;
-                md[pi + 3] = 255;
-              }
-            }
-          }
-          // If shift, OR with existing mask
-          if (e.shiftKey && selectionMaskRef.current) {
-            const existCtx = selectionMaskRef.current.getContext("2d", {
-              willReadFrequently: true,
-            });
-            if (existCtx) {
-              const existData = existCtx.getImageData(
-                0,
-                0,
-                CANVAS_WIDTH,
-                CANVAS_HEIGHT,
-              ).data;
-              for (let i = 3; i < md.length; i += 4) {
-                if (existData[i] > 128) md[i] = 255;
-              }
-            }
-          }
-          mCtx.putImageData(maskImgData, 0, 0);
-          selectionMaskRef.current = maskCanvas;
-          // Compute bounding box for marching ants
-          let minX = CANVAS_WIDTH;
-          let minY = CANVAS_HEIGHT;
-          let maxX = 0;
-          let maxY = 0;
-          let hasWandPx = false;
-          for (let py2 = 0; py2 < CANVAS_HEIGHT; py2++) {
-            for (let px2 = 0; px2 < CANVAS_WIDTH; px2++) {
-              if (md[(py2 * CANVAS_WIDTH + px2) * 4 + 3] > 128) {
-                if (px2 < minX) minX = px2;
-                if (px2 > maxX) maxX = px2;
-                if (py2 < minY) minY = py2;
-                if (py2 > maxY) maxY = py2;
-                hasWandPx = true;
-              }
-            }
-          }
-          if (hasWandPx) {
-            selectionGeometryRef.current = {
-              type: "wand",
-              x: minX,
-              y: minY,
-              w: maxX - minX + 1,
-              h: maxY - minY + 1,
-            };
-          } else {
-            selectionGeometryRef.current = null;
-          }
-          setSelectionActive(hasWandPx);
-          // Push selection undo entry
-          {
-            const afterSnap = snapshotSelection();
-            undoStackRef.current.push({
-              type: "selection",
-              before: selectionBeforeRef.current ?? afterSnap,
-              after: afterSnap,
-            });
-            if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-            redoStackRef.current = [];
-            setUndoCount(undoStackRef.current.length);
-            setRedoCount(0);
-          }
-        }
-        return;
-      }
+    if (presetType === "line") {
+      lineRuler.drawLineRulerOverlay(ctx, rulerLayer);
+    } else if (presetType === "perspective-1pt") {
+      ruler1pt2pt.draw1ptRulerOverlay(ctx, rulerLayer);
+    } else if (presetType === "perspective-2pt") {
+      ruler1pt2pt.draw2ptRulerOverlay(ctx, rulerLayer);
+    } else if (presetType === "perspective-3pt") {
+      ruler3pt5pt.draw3ptRulerOverlay(ctx, rulerLayer, opacity);
+    } else if (presetType === "perspective-5pt") {
+      ruler3pt5pt.draw5ptRulerOverlay(ctx, rulerLayer, opacity);
+    } else if (presetType === "oval") {
+      ellipseGridRuler.drawOvalRulerOverlay(ctx, rulerLayer);
+    } else if (presetType === "grid") {
+      ellipseGridRuler.drawGridRulerOverlay(ctx, rulerLayer);
+    }
 
-      // Handle move/transform tools
-      if (tool === "move" || tool === "transform") {
-        if (
-          (tool === "transform" || tool === "move") &&
-          transformActiveRef.current
-        ) {
-          // Hit test handles
-          const hitHandle = hitTestTransformHandle(pos.x, pos.y);
-          if (hitHandle) {
-            transformHandleRef.current = hitHandle;
-            const xfDown = xfStateRef.current;
-            floatDragStartRef.current = {
-              px: pos.x,
-              py: pos.y,
-              fx: xfDown ? xfDown.x : 0,
-              fy: xfDown ? xfDown.y : 0,
-              origBounds: xfDown
-                ? { x: xfDown.x, y: xfDown.y, w: xfDown.w, h: xfDown.h }
-                : undefined,
-              initRotation: xfDown ? xfDown.rotation : 0,
-            };
-          } else {
-            // Click outside: commit
-            commitFloat({ keepSelection: true });
-          }
-          return;
-        }
-        if (isDraggingFloatRef.current && moveFloatCanvasRef.current) {
-          // Already have float, just start dragging
-          const xfMove2 = xfStateRef.current;
-          floatDragStartRef.current = {
-            px: pos.x,
-            py: pos.y,
-            fx: xfMove2 ? xfMove2.x : 0,
-            fy: xfMove2 ? xfMove2.y : 0,
-          };
-        } else {
-          // Extract float
-          selectionActionsRef.current.extractFloat(selectionActiveRef.current);
-          const xfAfterExtract = xfStateRef.current;
-          floatDragStartRef.current = {
-            px: pos.x,
-            py: pos.y,
-            fx: xfAfterExtract ? xfAfterExtract.x : 0,
-            fy: xfAfterExtract ? xfAfterExtract.y : 0,
-          };
-        }
-        return;
-      }
+    ctx.restore();
+  }, [lineRuler, ruler1pt2pt, ruler3pt5pt, ellipseGridRuler]);
 
-      // Background layer cannot be painted on
-      if (layerId === "layer-background") return;
+  // Debounced ruler overlay: coalesces multiple back-to-back calls (ruler drag, undo/redo,
+  // layer changes) into a single draw per animation frame — eliminates redundant full-canvas
+  // redraws when several ruler-editing operations fire in rapid succession.
+  const scheduleRulerOverlay = useCallback(() => {
+    if (rulerRafRef.current !== null) return;
+    rulerRafRef.current = requestAnimationFrame(() => {
+      rulerRafRef.current = null;
+      drawRulerOverlay();
+    });
+  }, [drawRulerOverlay]);
+  // Wire the stable ref so ruler sub-hooks (instantiated earlier) can call
+  // scheduleRulerOverlay without a forward-reference issue.
+  scheduleRulerOverlayRef.current = scheduleRulerOverlay;
 
-      if (!lc) return;
+  // handlePointerDown, handlePointerMove, and handlePointerUp are all implemented
+  // inside usePaintingCanvasEvents.ts. They are not defined here.
 
-      const layerCtx = lc.getContext("2d", { willReadFrequently: true });
-      if (layerCtx) {
-        strokeStartSnapshotRef.current = layerCtx.getImageData(
-          0,
-          0,
-          lc.width,
-          lc.height,
-        );
-      }
-
-      if (tool === "fill") {
-        const mode = fillModeRef.current;
-        const fSettings = fillSettingsRef.current;
-        const col = colorRef.current;
-
-        if (mode === "flood") {
-          const [r, g, b] = hsvToRgb(col.h, col.s, col.v);
-          const fa = Math.round(col.a * 255);
-          const tol = fSettings.tolerance;
-          const _floodBaseRgb = `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`;
-          const _floodJittered =
-            fSettings.colorJitter > 0
-              ? applyColorJitter(_floodBaseRgb, fSettings.colorJitter)
-              : null;
-          const [fr, fg, fb] = _floodJittered
-            ? (() => {
-                const m = /rgb\((\d+),\s*(\d+),\s*(\d+)\)/.exec(_floodJittered);
-                return m
-                  ? [Number(m[1]), Number(m[2]), Number(m[3])]
-                  : [r, g, b];
-              })()
-            : [r, g, b];
-          floodFillWithTolerance(lc, pos.x, pos.y, fr, fg, fb, fa, tol);
-          composite();
-          const after = lc
-            .getContext("2d", { willReadFrequently: true })
-            ?.getImageData(0, 0, lc.width, lc.height);
-          if (strokeStartSnapshotRef.current && after) {
-            undoStackRef.current.push({
-              type: "pixels",
-              layerId,
-              before: strokeStartSnapshotRef.current,
-              after,
-            });
-            if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-            redoStackRef.current = [];
-            setUndoCount(undoStackRef.current.length);
-            setRedoCount(0);
-          }
-          return;
-        }
-
-        if (mode === "gradient") {
-          gradientDragStartRef.current = { x: pos.x, y: pos.y };
-          gradientDragEndRef.current = { x: pos.x, y: pos.y };
-          isGradientDraggingRef.current = true;
-          return;
-        }
-
-        if (mode === "lasso") {
-          // Drag-based lasso fill: start new drag session
-          const layerCtxLF = lc.getContext("2d", { willReadFrequently: true });
-          if (layerCtxLF) {
-            strokeStartSnapshotRef.current = layerCtxLF.getImageData(
-              0,
-              0,
-              lc.width,
-              lc.height,
-            );
-          }
-          isLassoFillDrawingRef.current = true;
-          lassoFillOriginRef.current = { x: pos.x, y: pos.y };
-          lassoFillLastPtRef.current = { x: pos.x, y: pos.y };
-          lassoFillSmoothedPtRef.current = { x: pos.x, y: pos.y };
-          composite();
-          return;
-        }
-
-        return;
-      }
-
-      isDrawingRef.current = true;
-      stabBrushPosRef.current = null;
-      lastPosRef.current = pos;
-      distAccumRef.current = 0;
-      _smudgeInitialized = false; // Reset smudge buffer at each new stroke
-      if (tool === "smear" && lc) {
-        initSmudgeBuffer(lc, pos, getActiveSize());
-        smearDirtyRef.current = false;
-        if (smearRafRef.current) {
-          cancelAnimationFrame(smearRafRef.current);
-          smearRafRef.current = null;
-        }
-      }
-      if (webglBrushRef.current) {
-        webglBrushRef.current.clear();
-      } else {
-        const sbufInit = strokeBufferRef.current;
-        if (sbufInit)
-          sbufInit
-            .getContext("2d", { willReadFrequently: true })
-            ?.clearRect(0, 0, sbufInit.width, sbufInit.height);
-      }
-
-      // Build persistent stroke canvases once at stroke start for real-time opacity compositing
-      buildStrokeCanvases(layerId);
-
-      const ctx = lc.getContext("2d", { willReadFrequently: true });
-      if (ctx) {
-        const rawPressure = normalizePressure(e);
-        smoothedPressureRef.current = rawPressure;
-        const pressure = smoothedPressureRef.current;
-        const settings = brushSettingsRef.current;
-        const baseSize = getActiveSize();
-        const baseOpacity = brushOpacityRef.current;
-
-        const effectiveSize = settings.pressureSize
-          ? baseSize *
-            (settings.minSize / 100 + (1 - settings.minSize / 100) * pressure)
-          : baseSize;
-        const pressureFactor = settings.pressureOpacity
-          ? settings.minOpacity + (1 - settings.minOpacity) * pressure
-          : 1.0;
-        // Additive blending in strokeFbo — cap FBO always enforces opacity ceiling:
-        // effectiveOpacity = flow (per-stamp alpha; controls buildup rate)
-        // capAlpha = pressureFactor * baseOpacity if pressureOpacity on, else baseOpacity
-        // strokeCommitOpacity always 1.0 (cap FBO handles the ceiling)
-        const flow = settings.flow ?? 1.0;
-        const effectiveOpacity = settings.pressureFlow
-          ? flow *
-            ((settings.minFlow ?? 0) + (1 - (settings.minFlow ?? 0)) * pressure)
-          : flow;
-        webglBrushRef.current?.setCapMode(settings.pressureOpacity ?? false);
-        const capAlpha = settings.pressureOpacity
-          ? pressureFactor * baseOpacity
-          : baseOpacity;
-        strokeCommitOpacityRef.current = 1.0;
-
-        strokePointBufferRef.current = [
-          { ...pos, size: effectiveSize, opacity: effectiveOpacity },
-        ];
-        if (tool === "eraser") {
-          stampWebGL(
-            pos.x,
-            pos.y,
-            effectiveSize,
-            effectiveOpacity,
-            settings,
-            settings.rotateMode === "follow"
-              ? 0
-              : (settings.rotation * Math.PI) / 180,
-            "rgb(255,255,255)",
-            capAlpha,
-          );
-        } else {
-          const _initFillStyle = colorFillStyleRef.current;
-          stampWebGL(
-            pos.x,
-            pos.y,
-            effectiveSize,
-            effectiveOpacity,
-            settings,
-            settings.rotateMode === "follow"
-              ? 0
-              : (settings.rotation * Math.PI) / 180,
-            _initFillStyle,
-            capAlpha,
-          );
-        }
-        webglBrushRef.current?.flushDisplay(brushOpacityRef.current);
-        compositeWithStrokePreview(1.0, tool);
-      } else {
-        strokePointBufferRef.current = [
-          { ...pos, size: getActiveSize(), opacity: 1 },
-        ];
-      }
-    },
-    // biome-ignore lint/correctness/useExhaustiveDependencies: refs used intentionally
-    [
-      composite,
-      floodFill,
-      stampDot,
-      getActiveSize,
-      compositeWithStrokePreview,
-      buildStrokeCanvases,
-      stampWebGL,
-      initSmudgeBuffer,
-    ],
-  );
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: uses refs intentionally
-  const handlePointerMove = useCallback(
-    (e: React.PointerEvent<HTMLCanvasElement>) => {
-      if (isZoomDraggingRef.current) {
-        const deltaX = e.clientX - zoomDragStartXRef.current;
-        const newZoom = Math.min(
-          20,
-          Math.max(0.05, zoomDragOriginRef.current * Math.exp(deltaX * 0.005)),
-        );
-        const zoomRatio = newZoom / zoomDragOriginRef.current;
-        const cx = zoomDragCursorStartRef.current.x;
-        const cy = zoomDragCursorStartRef.current.y;
-        const newPanX = cx - (cx - zoomDragPanOriginRef.current.x) * zoomRatio;
-        const newPanY = cy - (cy - zoomDragPanOriginRef.current.y) * zoomRatio;
-        applyTransformToDOM({
-          ...viewTransformRef.current,
-          zoom: newZoom,
-          panX: newPanX,
-          panY: newPanY,
-        });
-        return;
-      }
-      if (isPanningRef.current) {
-        const dx = e.clientX - panStartRef.current.x;
-        const dy = e.clientY - panStartRef.current.y;
-        applyTransformToDOM({
-          ...viewTransformRef.current,
-          panX: panOriginRef.current.x + dx,
-          panY: panOriginRef.current.y + dy,
-        });
-        return;
-      }
-      if (isRotatingRef.current) {
-        const dy = e.clientY - rotStartRef.current;
-        const dx = e.clientX - rotStartXRef.current;
-        const delta = (dx - dy) * 0.35;
-        const newRotation = rotOriginRef.current + delta;
-        const rad = (newRotation * Math.PI) / 180;
-        const z = viewTransformRef.current.zoom;
-        const cp = rotDragCanvasPointRef.current;
-        const cpLocalX = cp.x - CANVAS_WIDTH / 2;
-        const cpLocalY = cp.y - CANVAS_HEIGHT / 2;
-        const rotX = (cpLocalX * Math.cos(rad) - cpLocalY * Math.sin(rad)) * z;
-        const rotY = (cpLocalX * Math.sin(rad) + cpLocalY * Math.cos(rad)) * z;
-        const cx = rotDragCursorRef.current.x;
-        const cy = rotDragCursorRef.current.y;
-        const newPanX = cx - rotX;
-        const newPanY = cy - rotY;
-        applyTransformToDOM({
-          ...viewTransformRef.current,
-          rotation: newRotation,
-          panX: newPanX,
-          panY: newPanY,
-        });
-        return;
-      }
-
-      // Handle gradient fill drag preview
-      if (isGradientDraggingRef.current && activeToolRef.current === "fill") {
-        const display2g = displayCanvasRef.current;
-        const container2g = containerRef.current;
-        if (display2g && container2g) {
-          const posG = getCanvasPosTransformed(
-            e.clientX,
-            e.clientY,
-            container2g,
-            display2g,
-            viewTransformRef.current,
-            isFlippedRef.current,
-          );
-          gradientDragEndRef.current = { x: posG.x, y: posG.y };
-          composite();
-        }
-        return;
-      }
-
-      // Handle lasso fill drawing (HeavyPaint sweep-fill model)
-      if (isLassoFillDrawingRef.current && activeToolRef.current === "fill") {
-        const display2lf = displayCanvasRef.current;
-        const container2lf = containerRef.current;
-        if (display2lf && container2lf) {
-          const posLF = getCanvasPosTransformed(
-            e.clientX,
-            e.clientY,
-            container2lf,
-            display2lf,
-            viewTransformRef.current,
-            isFlippedRef.current,
-          );
-          // Apply exponential smoothing to lasso fill cursor position
-          const prevSmoothed = lassoFillSmoothedPtRef.current ?? posLF;
-          const alpha = 0.35;
-          const smoothedLF = {
-            x: prevSmoothed.x * (1 - alpha) + posLF.x * alpha,
-            y: prevSmoothed.y * (1 - alpha) + posLF.y * alpha,
-          };
-          lassoFillSmoothedPtRef.current = smoothedLF;
-          const origin = lassoFillOriginRef.current;
-          const prev = lassoFillLastPtRef.current;
-          if (origin && prev) {
-            const dx = smoothedLF.x - prev.x;
-            const dy = smoothedLF.y - prev.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist >= 2) {
-              // Fill the triangle [origin, prev, current] with a fresh jitter color
-              const layerIdLF = activeLayerIdRef.current;
-              const lcLF = layerCanvasesRef.current.get(layerIdLF);
-              if (lcLF) {
-                const col = colorRef.current;
-                const fSet = fillSettingsRef.current;
-                const baseRgb = `rgb(${Math.round(hsvToRgb(col.h, col.s, col.v)[0])},${Math.round(hsvToRgb(col.h, col.s, col.v)[1])},${Math.round(hsvToRgb(col.h, col.s, col.v)[2])})`;
-                const jittered =
-                  fSet.colorJitter > 0
-                    ? applyColorJitter(baseRgb, fSet.colorJitter)
-                    : null;
-                const [jr, jg, jb] = jittered
-                  ? (() => {
-                      const m = /rgb\((\d+),\s*(\d+),\s*(\d+)\)/.exec(jittered);
-                      return m
-                        ? [Number(m[1]), Number(m[2]), Number(m[3])]
-                        : hsvToRgb(col.h, col.s, col.v);
-                    })()
-                  : hsvToRgb(col.h, col.s, col.v);
-                applyLassoFill(
-                  lcLF,
-                  [
-                    origin,
-                    { x: prev.x, y: prev.y },
-                    { x: smoothedLF.x, y: smoothedLF.y },
-                  ],
-                  Math.round(jr),
-                  Math.round(jg),
-                  Math.round(jb),
-                );
-                composite();
-              }
-              lassoFillLastPtRef.current = { x: smoothedLF.x, y: smoothedLF.y };
-            }
-          }
-        }
-        return;
-      }
-
-      // Handle lasso drawing
-      if (isDrawingSelectionRef.current && activeToolRef.current === "lasso") {
-        const display2 = displayCanvasRef.current;
-        const container2 = containerRef.current;
-        if (!display2 || !container2) return;
-        const pos2 = getCanvasPosTransformed(
-          e.clientX,
-          e.clientY,
-          container2,
-          display2,
-          viewTransformRef.current,
-          isFlippedRef.current,
-        );
-        const mode = lassoModeRef.current;
-        if (mode === "rect" || mode === "ellipse") {
-          const sb = selectionDraftBoundsRef.current;
-          if (sb) {
-            sb.ex = pos2.x;
-            sb.ey = pos2.y;
-            // RAF drawAnts loop draws the animated draft preview
-          }
-        } else if (mode === "free") {
-          selectionDraftPointsRef.current.push({ x: pos2.x, y: pos2.y });
-          // RAF drawAnts loop draws the animated draft preview
-        } else if (mode === "poly") {
-          // RAF drawAnts loop draws the animated draft preview; store cursor for poly
-          selectionDraftCursorRef.current = { x: pos2.x, y: pos2.y };
-        }
-        return;
-      }
-
-      // Handle move/transform dragging
-      if (
-        (activeToolRef.current === "move" ||
-          activeToolRef.current === "transform") &&
-        floatDragStartRef.current &&
-        moveFloatCanvasRef.current
-      ) {
-        const display3 = displayCanvasRef.current;
-        const container3 = containerRef.current;
-        if (!display3 || !container3) return;
-        const pos3 = getCanvasPosTransformed(
-          e.clientX,
-          e.clientY,
-          container3,
-          display3,
-          viewTransformRef.current,
-          isFlippedRef.current,
-        );
-        const drag = floatDragStartRef.current;
-        const dx = pos3.x - drag.px;
-        const dy = pos3.y - drag.py;
-
-        if (
-          (activeToolRef.current === "transform" ||
-            activeToolRef.current === "move") &&
-          transformHandleRef.current &&
-          transformHandleRef.current !== "move"
-        ) {
-          const handle = transformHandleRef.current;
-          const ob = moveFloatOriginBoundsRef.current;
-          if (!ob) return;
-          // Apply scale/rotate based on handle
-          if (handle === "rot") {
-            // Rotate: delta-based from drag start angle to cursor angle
-            const xfRot = xfStateRef.current;
-            if (!xfRot) return;
-            const cx = xfRot.x + xfRot.w / 2;
-            const cy = xfRot.y + xfRot.h / 2;
-            const startAngle = Math.atan2(drag.py - cy, drag.px - cx);
-            const curAngle = Math.atan2(pos3.y - cy, pos3.x - cx);
-            const initRot = drag.initRotation ?? 0;
-            const angle = curAngle - startAngle + initRot;
-            xfStateRef.current = { ...xfRot, rotation: angle };
-          } else {
-            // Scale handles: nw, ne, sw, se, n, s, w, e
-            const origBounds = drag.origBounds;
-            if (!origBounds) return;
-            const rawDx = pos3.x - drag.px;
-            const rawDy = pos3.y - drag.py;
-            // Un-rotate delta into box-local space so handles work correctly after rotation
-            const scaleRot = xfStateRef.current?.rotation ?? 0;
-            let dx2: number;
-            let dy2: number;
-            if (scaleRot !== 0) {
-              const cosR = Math.cos(-scaleRot);
-              const sinR = Math.sin(-scaleRot);
-              dx2 = rawDx * cosR - rawDy * sinR;
-              dy2 = rawDx * sinR + rawDy * cosR;
-            } else {
-              dx2 = rawDx;
-              dy2 = rawDy;
-            }
-            let newX = origBounds.x;
-            let newY = origBounds.y;
-            let newW = origBounds.w;
-            let newH = origBounds.h;
-
-            if (handle === "nw") {
-              newX = origBounds.x + dx2;
-              newY = origBounds.y + dy2;
-              newW = origBounds.w - dx2;
-              newH = origBounds.h - dy2;
-            } else if (handle === "ne") {
-              newY = origBounds.y + dy2;
-              newW = origBounds.w + dx2;
-              newH = origBounds.h - dy2;
-            } else if (handle === "sw") {
-              newX = origBounds.x + dx2;
-              newW = origBounds.w - dx2;
-              newH = origBounds.h + dy2;
-            } else if (handle === "se") {
-              newW = origBounds.w + dx2;
-              newH = origBounds.h + dy2;
-            } else if (handle === "n") {
-              newY = origBounds.y + dy2;
-              newH = origBounds.h - dy2;
-            } else if (handle === "s") {
-              newH = origBounds.h + dy2;
-            } else if (handle === "w") {
-              newX = origBounds.x + dx2;
-              newW = origBounds.w - dx2;
-            } else if (handle === "e") {
-              newW = origBounds.w + dx2;
-            }
-
-            // Proportional scaling with Shift — anchor to opposite corner
-            if (e.shiftKey && origBounds.w > 0 && origBounds.h > 0) {
-              const aspect = origBounds.w / origBounds.h;
-              if (
-                Math.abs(newW - origBounds.w) >= Math.abs(newH - origBounds.h)
-              ) {
-                newH = newW / aspect;
-                if (handle === "nw" || handle === "n")
-                  newY = origBounds.y + origBounds.h - newH;
-              } else {
-                newW = newH * aspect;
-                if (handle === "nw" || handle === "w")
-                  newX = origBounds.x + origBounds.w - newW;
-              }
-            }
-
-            // Clamp minimum size
-            const MIN = 10;
-            if (newW < MIN) {
-              if (handle === "nw" || handle === "w" || handle === "sw")
-                newX = origBounds.x + origBounds.w - MIN;
-              newW = MIN;
-            }
-            if (newH < MIN) {
-              if (handle === "nw" || handle === "n" || handle === "ne")
-                newY = origBounds.y + origBounds.h - MIN;
-              newH = MIN;
-            }
-
-            // Update unified state — composite() re-renders from origFloat automatically
-            const xfScale = xfStateRef.current;
-            xfStateRef.current = {
-              x: newX,
-              y: newY,
-              w: newW,
-              h: newH,
-              rotation: xfScale ? xfScale.rotation : 0,
-            };
-          }
-        } else {
-          // Move the float
-          const xfMv = xfStateRef.current;
-          xfStateRef.current = {
-            x: drag.fx + dx,
-            y: drag.fy + dy,
-            w: xfMv
-              ? xfMv.w
-              : (moveFloatOriginBoundsRef.current?.w ?? CANVAS_WIDTH),
-            h: xfMv
-              ? xfMv.h
-              : (moveFloatOriginBoundsRef.current?.h ?? CANVAS_HEIGHT),
-            rotation: xfMv ? xfMv.rotation : 0,
-          };
-        }
-        composite();
-        return;
-      }
-
-      if (!isDrawingRef.current) return;
-      const display = displayCanvasRef.current;
-      const container = containerRef.current;
-      if (!display || !container) return;
-
-      const pos = getCanvasPosTransformed(
-        e.clientX,
-        e.clientY,
-        container,
-        display,
-        viewTransformRef.current,
-        isFlippedRef.current,
-      );
-      const prev = lastPosRef.current;
-      if (!prev) {
-        lastPosRef.current = pos;
-        return;
-      }
-
-      const tool = activeToolRef.current;
-      const layerId = activeLayerIdRef.current;
-      const lc = layerCanvasesRef.current.get(layerId);
-      if (!lc) return;
-
-      const dx = pos.x - prev.x;
-      const dy = pos.y - prev.y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-
-      const settings = brushSettingsRef.current;
-      const smoothing = settings.strokeSmoothing;
-      const activeSize = getActiveSize();
-
-      if (tool === "smear") {
-        // Track raw stylus pos for glide-to-finish on pointer up
-        rawStylusPosRef.current = { ...pos, size: activeSize, opacity: 1 };
-        const rawSmearPressure =
-          e.nativeEvent.pointerType === "mouse"
-            ? 1.0
-            : e.nativeEvent.pressure > 0
-              ? e.nativeEvent.pressure
-              : 0.5;
-        smoothedPressureRef.current =
-          smoothedPressureRef.current * (1 - PRESSURE_SMOOTHING) +
-          rawSmearPressure * PRESSURE_SMOOTHING;
-        const smearPressure = smoothedPressureRef.current;
-        const baseStrength = settings.smearStrength ?? 0.8;
-        const effectiveSmearStrength = settings.pressureStrength
-          ? (settings.minStrength ?? 0) +
-            (1 - (settings.minStrength ?? 0)) * smearPressure
-          : baseStrength;
-        if (smoothing > 0) {
-          // Photoshop-style stabilizer: brush only moves when stylus exits the settling zone
-          const settlingRadius = (smoothing / 100) * 105;
-          const stab = stabBrushPosRef.current;
-          if (!stab) {
-            stabBrushPosRef.current = { ...pos, size: activeSize, opacity: 1 };
-          } else {
-            const sdx = pos.x - stab.x;
-            const sdy = pos.y - stab.y;
-            const sDist = Math.sqrt(sdx * sdx + sdy * sdy);
-            if (sDist > settlingRadius) {
-              const newStab = {
-                x: pos.x - (sdx / sDist) * settlingRadius,
-                y: pos.y - (sdy / sDist) * settlingRadius,
-                size: activeSize,
-                opacity: 1 as number,
-              };
-              renderSmearAlongPoints(
-                lc,
-                [stab, newStab],
-                activeSize,
-                settings.softness ?? 0,
-                effectiveSmearStrength,
-              );
-              stabBrushPosRef.current = newStab;
-              lastPosRef.current = newStab;
-            }
-          }
-          smearDirtyRef.current = true;
-          if (!smearRafRef.current) {
-            smearRafRef.current = requestAnimationFrame(() => {
-              smearRafRef.current = null;
-              if (smearDirtyRef.current) {
-                smearDirtyRef.current = false;
-                composite();
-              }
-            });
-          }
-        } else {
-          const ctx = lc.getContext("2d", { willReadFrequently: true });
-          if (ctx && dist > 0.5) {
-            const size = activeSize;
-            const radius = size / 2;
-            const srcX = Math.round(prev.x - radius);
-            const srcY = Math.round(prev.y - radius);
-            const sw = Math.round(size);
-            const sh = Math.round(size);
-            const cw = lc.width;
-            const ch = lc.height;
-            const clampedX = Math.max(0, srcX);
-            const clampedY = Math.max(0, srcY);
-            const clampedW = Math.min(sw, cw - clampedX);
-            const clampedH = Math.min(sh, ch - clampedY);
-            if (clampedW > 0 && clampedH > 0) {
-              try {
-                const imgData = ctx.getImageData(
-                  clampedX,
-                  clampedY,
-                  clampedW,
-                  clampedH,
-                );
-                const strength = Math.min(0.8, dist / (size * 0.5));
-                ctx.putImageData(
-                  imgData,
-                  clampedX + dx * strength,
-                  clampedY + dy * strength,
-                );
-              } catch {
-                /* ignore OOB */
-              }
-            }
-          }
-          smearDirtyRef.current = true;
-          if (!smearRafRef.current) {
-            smearRafRef.current = requestAnimationFrame(() => {
-              smearRafRef.current = null;
-              if (smearDirtyRef.current) {
-                smearDirtyRef.current = false;
-                composite();
-              }
-            });
-          }
-        }
-      } else if (tool === "brush" || tool === "eraser") {
-        const ctx = lc.getContext("2d", { willReadFrequently: true });
-        if (!ctx) return;
-
-        // Process coalesced events for maximum stroke fidelity (every intermediate stylus point)
-        const coalescedEvents = (
-          e.nativeEvent as PointerEvent
-        ).getCoalescedEvents?.() ?? [e.nativeEvent as PointerEvent];
-        let anyWork = false;
-        let stabMoved = false;
-        for (const ce of coalescedEvents) {
-          const cePos = getCanvasPosTransformed(
-            ce.clientX,
-            ce.clientY,
-            container,
-            display,
-            viewTransformRef.current,
-            isFlippedRef.current,
-          );
-          const cePrev = lastPosRef.current;
-          if (!cePrev) {
-            lastPosRef.current = cePos;
-            continue;
-          }
-          const ceDx = cePos.x - cePrev.x;
-          const ceDy = cePos.y - cePrev.y;
-          const ceDist = Math.sqrt(ceDx * ceDx + ceDy * ceDy);
-
-          const rawPressure =
-            ce.pointerType === "mouse"
-              ? 1.0
-              : ce.pressure > 0
-                ? ce.pressure
-                : 0.5;
-          smoothedPressureRef.current =
-            smoothedPressureRef.current * (1 - PRESSURE_SMOOTHING) +
-            rawPressure * PRESSURE_SMOOTHING;
-          const pressure = smoothedPressureRef.current;
-          const baseSize = activeSize;
-          const baseOpacity = brushOpacityRef.current;
-
-          const effectiveSize = settings.pressureSize
-            ? baseSize *
-              (settings.minSize / 100 + (1 - settings.minSize / 100) * pressure)
-            : baseSize;
-          const pressureFactor = settings.pressureOpacity
-            ? settings.minOpacity + (1 - settings.minOpacity) * pressure
-            : 1.0;
-          // Additive blending in strokeFbo — cap FBO always enforces opacity ceiling:
-          // effectiveOpacity = flow (per-stamp alpha; controls buildup rate)
-          // capAlpha = pressureFactor * baseOpacity if pressureOpacity on, else baseOpacity
-          // strokeCommitOpacity always 1.0 (cap FBO handles the ceiling)
-          const flow = settings.flow ?? 1.0;
-          const effectiveOpacity = settings.pressureFlow
-            ? flow *
-              ((settings.minFlow ?? 0) +
-                (1 - (settings.minFlow ?? 0)) * pressure)
-            : flow;
-          webglBrushRef.current?.setCapMode(settings.pressureOpacity ?? false);
-          const capAlpha = settings.pressureOpacity
-            ? pressureFactor * baseOpacity
-            : baseOpacity;
-          strokeCommitOpacityRef.current = 1.0;
-
-          const sbufCtxMove = strokeBufferRef.current?.getContext("2d", {
-            willReadFrequently: true,
-          });
-          // Compute fill style independently: sbufCtxMove is null when using WebGL canvas
-          const _moveFillStyle = colorFillStyleRef.current;
-          if (sbufCtxMove) {
-            if (tool === "eraser") {
-              sbufCtxMove.fillStyle = "rgba(0,0,0,1)";
-            } else {
-              sbufCtxMove.fillStyle = _moveFillStyle;
-            }
-            sbufCtxMove.globalCompositeOperation = "source-over";
-          }
-
-          // Track raw stylus pos for glide-to-finish on pointer up
-          rawStylusPosRef.current = {
-            ...cePos,
-            size: effectiveSize,
-            opacity: effectiveOpacity,
-          };
-          if (smoothing > 0) {
-            // Photoshop-style stabilizer: brush only moves when stylus exits the settling zone
-            const settlingRadius = (smoothing / 100) * 105;
-            const stab = stabBrushPosRef.current;
-            if (!stab) {
-              stabBrushPosRef.current = {
-                ...cePos,
-                size: effectiveSize,
-                opacity: effectiveOpacity,
-              };
-            } else {
-              const sdx = cePos.x - stab.x;
-              const sdy = cePos.y - stab.y;
-              const sDist = Math.sqrt(sdx * sdx + sdy * sdy);
-              if (sDist > settlingRadius) {
-                const newStab: StrokePoint = {
-                  x: cePos.x - (sdx / sDist) * settlingRadius,
-                  y: cePos.y - (sdy / sDist) * settlingRadius,
-                  size: effectiveSize,
-                  opacity: effectiveOpacity,
-                };
-                const _segCtx =
-                  sbufCtxMove ??
-                  ({
-                    fillStyle: _moveFillStyle,
-                  } as unknown as CanvasRenderingContext2D);
-                renderBrushSegmentAlongPoints(
-                  _segCtx,
-                  [stab, newStab],
-                  stab.size,
-                  newStab.size,
-                  stab.opacity,
-                  newStab.opacity,
-                  settings,
-                  tool,
-                  true,
-                  capAlpha,
-                );
-                stabMoved = true;
-                stabBrushPosRef.current = newStab;
-                lastPosRef.current = newStab;
-              }
-            }
-          } else {
-            const spacingPixels = Math.max(
-              1,
-              ((settings.spacing / 100) * effectiveSize) /
-                (settings.count ?? 1),
-            );
-            const strokeAngle = Math.atan2(ceDy, ceDx);
-            let accdist = distAccumRef.current + ceDist;
-            let stampsPlaced = 0;
-            const _moveDirtyNS = {
-              minX: Number.POSITIVE_INFINITY,
-              minY: Number.POSITIVE_INFINITY,
-              maxX: Number.NEGATIVE_INFINITY,
-              maxY: Number.NEGATIVE_INFINITY,
-            };
-            while (accdist >= spacingPixels) {
-              const distFromPrev =
-                (stampsPlaced + 1) * spacingPixels - distAccumRef.current;
-              const t = ceDist > 0 ? distFromPrev / ceDist : 0;
-              const sx = cePrev.x + ceDx * t;
-              const sy = cePrev.y + ceDy * t;
-              {
-                const _countB = settings.count ?? 1;
-                for (let _ciB = 0; _ciB < _countB; _ciB++) {
-                  const _scatter = settings.scatter ?? 0;
-                  const _sizeJitter = settings.sizeJitter ?? 0;
-                  const _colorJitter3 = settings.colorJitter ?? 0;
-                  const _rotationJitter3 = settings.rotationJitter ?? 0;
-                  const _flowJitter3 = settings.flowJitter ?? 0;
-                  const _stampX = sx + (Math.random() - 0.5) * 2 * _scatter;
-                  const _stampY = sy + (Math.random() - 0.5) * 2 * _scatter;
-                  const _stampSize =
-                    effectiveSize * (1 + (Math.random() - 0.5) * _sizeJitter);
-                  const _rotJitterRad3 =
-                    (_rotationJitter3 / 2) *
-                    (Math.PI / 180) *
-                    (Math.random() - 0.5) *
-                    2;
-                  const _flowJitterVal3 =
-                    (_flowJitter3 / 100) *
-                    effectiveOpacity *
-                    (Math.random() - 0.5) *
-                    2;
-                  const _stampOpacity3 = Math.max(
-                    0,
-                    Math.min(1, effectiveOpacity + _flowJitterVal3),
-                  );
-                  const _baseAngle3 =
-                    settings.rotateMode === "follow"
-                      ? strokeAngle
-                      : (settings.rotation * Math.PI) / 180;
-                  const _stampAngle3 = _baseAngle3 + _rotJitterRad3;
-                  // Dual brush extra noise
-                  // Dual tip color jitter (secondary tip only)
-                  const _dualColorJitter3 = settings.dualTipColorJitter ?? 0;
-                  if (tool === "eraser") {
-                    stampWebGL(
-                      _stampX,
-                      _stampY,
-                      _stampSize,
-                      _stampOpacity3,
-                      settings,
-                      _stampAngle3,
-                      "rgb(255,255,255)",
-                      capAlpha,
-                    );
-                    // Track dirty rect for eraser stamps
-                    const _erNS = _stampSize / 2;
-                    if (_stampX - _erNS < _moveDirtyNS.minX)
-                      _moveDirtyNS.minX = _stampX - _erNS;
-                    if (_stampY - _erNS < _moveDirtyNS.minY)
-                      _moveDirtyNS.minY = _stampY - _erNS;
-                    if (_stampX + _erNS > _moveDirtyNS.maxX)
-                      _moveDirtyNS.maxX = _stampX + _erNS;
-                    if (_stampY + _erNS > _moveDirtyNS.maxY)
-                      _moveDirtyNS.maxY = _stampY + _erNS;
-                  } else {
-                    const _jFill3 =
-                      _colorJitter3 > 0
-                        ? applyColorJitter(_moveFillStyle, _colorJitter3)
-                        : _moveFillStyle;
-                    const _dualJFill3 =
-                      settings.dualTipEnabled && _dualColorJitter3 > 0
-                        ? applyColorJitter(_moveFillStyle, _dualColorJitter3)
-                        : _jFill3;
-                    stampWebGL(
-                      _stampX,
-                      _stampY,
-                      _stampSize,
-                      _stampOpacity3,
-                      settings,
-                      _stampAngle3,
-                      _jFill3,
-                      capAlpha,
-                      _dualJFill3,
-                    );
-                  }
-                }
-              }
-              stampsPlaced++;
-              accdist -= spacingPixels;
-            }
-            distAccumRef.current = accdist;
-            if (stampsPlaced > 0) anyWork = true;
-          }
-          lastPosRef.current = cePos;
-        } // end coalesced events loop
-        if (anyWork || stabMoved) {
-          webglBrushRef.current?.flushDisplay(brushOpacityRef.current);
-          compositeWithStrokePreview(1.0, tool);
-        }
-      }
-
-      lastPosRef.current = pos;
-      if (!isDrawingRef.current) composite();
-    },
-    // biome-ignore lint/correctness/useExhaustiveDependencies: refs used intentionally
-    [
-      composite,
-      stampDot,
-      stampWebGL,
-      renderBrushSegmentAlongPoints,
-      renderSmearAlongPoints,
-      getActiveSize,
-      compositeWithStrokePreview,
-      applyTransformToDOM,
-    ],
-  );
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: uses refs/snapshotSelection intentionally
-  const handlePointerUp = useCallback(
-    (e?: React.PointerEvent<HTMLCanvasElement>) => {
-      if (isZoomDraggingRef.current) {
-        isZoomDraggingRef.current = false;
-        setViewTransform({ ...viewTransformRef.current });
-        return;
-      }
-      if (isPanningRef.current) {
-        isPanningRef.current = false;
-        setViewTransform({ ...viewTransformRef.current });
-        return;
-      }
-      if (isRotatingRef.current) {
-        isRotatingRef.current = false;
-        setViewTransform({ ...viewTransformRef.current });
-        return;
-      }
-
-      // Handle gradient fill pointer up
-      if (isGradientDraggingRef.current && activeToolRef.current === "fill") {
-        isGradientDraggingRef.current = false;
-        const layerIdG = activeLayerIdRef.current;
-        if (layerIdG === "layer-background") return;
-        const lcG = layerCanvasesRef.current.get(layerIdG);
-        if (!lcG) return;
-        const ctxG = lcG.getContext("2d", { willReadFrequently: true });
-        if (!ctxG) return;
-        const start = gradientDragStartRef.current;
-        const end = gradientDragEndRef.current;
-        if (!start || !end) return;
-        const before = ctxG.getImageData(0, 0, lcG.width, lcG.height);
-        const col = colorRef.current;
-        const [gr, gg, gb] = hsvToRgb(col.h, col.s, col.v);
-        const fSettings = fillSettingsRef.current;
-        const colorStr = `rgb(${gr},${gg},${gb})`;
-        const _gradJittered =
-          fSettings.colorJitter > 0
-            ? applyColorJitter(colorStr, fSettings.colorJitter)
-            : null;
-        const _gradColorStr = _gradJittered ?? colorStr;
-        const _gradRgbMatch = _gradJittered
-          ? /rgb\((\d+),\s*(\d+),\s*(\d+)\)/.exec(_gradJittered)
-          : null;
-        const [_gJr, _gJg, _gJb] = _gradRgbMatch
-          ? [
-              Number(_gradRgbMatch[1]),
-              Number(_gradRgbMatch[2]),
-              Number(_gradRgbMatch[3]),
-            ]
-          : [gr, gg, gb];
-        const transparentStr = `rgba(${_gJr},${_gJg},${_gJb},0)`;
-        ctxG.save();
-        // Clip to selection if active
-        if (selectionMaskRef.current && selectionActiveRef.current) {
-          const selCtx = selectionMaskRef.current.getContext("2d", {
-            willReadFrequently: true,
-          });
-          if (selCtx) {
-            ctxG.globalCompositeOperation = "source-over";
-            // Apply selection clipping via temporary canvas
-            const tempC = document.createElement("canvas");
-            tempC.width = lcG.width;
-            tempC.height = lcG.height;
-            const tempCtx = tempC.getContext("2d", {
-              willReadFrequently: true,
-            })!;
-            let grad: CanvasGradient;
-            if (fSettings.gradientMode === "radial") {
-              const dx = end.x - start.x;
-              const dy = end.y - start.y;
-              const radius = Math.sqrt(dx * dx + dy * dy);
-              grad = tempCtx.createRadialGradient(
-                start.x,
-                start.y,
-                0,
-                start.x,
-                start.y,
-                Math.max(radius, 1),
-              );
-            } else {
-              grad = tempCtx.createLinearGradient(
-                start.x,
-                start.y,
-                end.x,
-                end.y,
-              );
-            }
-            grad.addColorStop(0, _gradColorStr);
-            grad.addColorStop(1, transparentStr);
-            tempCtx.fillStyle = grad;
-            tempCtx.fillRect(0, 0, lcG.width, lcG.height);
-            tempCtx.globalCompositeOperation = "destination-in";
-            tempCtx.drawImage(selectionMaskRef.current, 0, 0);
-            ctxG.drawImage(tempC, 0, 0);
-          }
-        } else {
-          let grad: CanvasGradient;
-          if (fSettings.gradientMode === "radial") {
-            const dx = end.x - start.x;
-            const dy = end.y - start.y;
-            const radius = Math.sqrt(dx * dx + dy * dy);
-            grad = ctxG.createRadialGradient(
-              start.x,
-              start.y,
-              0,
-              start.x,
-              start.y,
-              Math.max(radius, 1),
-            );
-          } else {
-            grad = ctxG.createLinearGradient(start.x, start.y, end.x, end.y);
-          }
-          grad.addColorStop(0, _gradColorStr);
-          grad.addColorStop(1, transparentStr);
-          ctxG.fillStyle = grad;
-          ctxG.fillRect(0, 0, lcG.width, lcG.height);
-        }
-        ctxG.restore();
-        composite();
-        const after = ctxG.getImageData(0, 0, lcG.width, lcG.height);
-        undoStackRef.current.push({
-          type: "pixels",
-          layerId: layerIdG,
-          before,
-          after,
-        });
-        if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-        redoStackRef.current = [];
-        setUndoCount(undoStackRef.current.length);
-        setRedoCount(0);
-        gradientDragStartRef.current = null;
-        gradientDragEndRef.current = null;
-        return;
-      }
-
-      // Handle lasso fill pointer up: commit undo entry
-      if (isLassoFillDrawingRef.current && activeToolRef.current === "fill") {
-        const layerIdLF = activeLayerIdRef.current;
-        const lcLF = layerCanvasesRef.current.get(layerIdLF);
-        if (lcLF) {
-          const after = lcLF
-            .getContext("2d", { willReadFrequently: true })
-            ?.getImageData(0, 0, lcLF.width, lcLF.height);
-          const before = strokeStartSnapshotRef.current;
-          if (before && after) {
-            undoStackRef.current.push({
-              type: "pixels",
-              layerId: layerIdLF,
-              before,
-              after,
-            });
-            if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-            redoStackRef.current = [];
-            setUndoCount(undoStackRef.current.length);
-            setRedoCount(0);
-          }
-        }
-        isLassoFillDrawingRef.current = false;
-        lassoFillOriginRef.current = null;
-        lassoFillLastPtRef.current = null;
-        strokeStartSnapshotRef.current = null;
-        composite();
-        return;
-      }
-
-      // Handle lasso tool pointer up
-      if (isDrawingSelectionRef.current && activeToolRef.current === "lasso") {
-        const mode = lassoModeRef.current;
-        if (mode === "rect" || mode === "ellipse") {
-          const sb = selectionDraftBoundsRef.current;
-          if (
-            sb &&
-            (Math.abs(sb.ex - sb.sx) > 4 || Math.abs(sb.ey - sb.sy) > 4)
-          ) {
-            const newGeom = {
-              type: mode,
-              x: sb.sx,
-              y: sb.sy,
-              w: sb.ex - sb.sx,
-              h: sb.ey - sb.sy,
-            };
-            // Apply modifier compositing if needed
-            if ((e?.shiftKey || e?.altKey) && selectionMaskRef.current) {
-              // Composite new shape onto existing mask
-              const tempC = document.createElement("canvas");
-              tempC.width = CANVAS_WIDTH;
-              tempC.height = CANVAS_HEIGHT;
-              const tCtx = tempC.getContext("2d", {
-                willReadFrequently: true,
-              })!;
-              tCtx.fillStyle = "white";
-              if (mode === "rect") {
-                const x = newGeom.w < 0 ? newGeom.x + newGeom.w : newGeom.x;
-                const y = newGeom.h < 0 ? newGeom.y + newGeom.h : newGeom.y;
-                tCtx.fillRect(x, y, Math.abs(newGeom.w), Math.abs(newGeom.h));
-              } else {
-                const cx2 = newGeom.x + newGeom.w / 2;
-                const cy2 = newGeom.y + newGeom.h / 2;
-                tCtx.beginPath();
-                tCtx.ellipse(
-                  cx2,
-                  cy2,
-                  Math.abs(newGeom.w / 2),
-                  Math.abs(newGeom.h / 2),
-                  0,
-                  0,
-                  Math.PI * 2,
-                );
-                tCtx.fill();
-              }
-              const mc2 = selectionMaskRef.current;
-              const mCtx2 = mc2.getContext("2d", { willReadFrequently: true })!;
-              if (e?.shiftKey && !e?.altKey) {
-                // Add: draw new shape on top
-                mCtx2.globalCompositeOperation = "source-over";
-                mCtx2.drawImage(tempC, 0, 0);
-              } else if (e?.altKey && !e?.shiftKey) {
-                // Subtract: erase new shape from existing
-                mCtx2.globalCompositeOperation = "destination-out";
-                mCtx2.drawImage(tempC, 0, 0);
-              } else if (e?.shiftKey && e?.altKey) {
-                // Intersect: keep only overlap
-                mCtx2.globalCompositeOperation = "destination-in";
-                mCtx2.drawImage(tempC, 0, 0);
-              }
-              mCtx2.globalCompositeOperation = "source-over";
-              selectionGeometryRef.current = { type: "mask" as LassoMode };
-              // Always clear shapes after compositing — store as merged mask
-              selectionShapesRef.current = [];
-              selectionBoundaryPathRef.current.dirty = true;
-              setSelectionActive(true);
-            } else {
-              selectionGeometryRef.current = newGeom;
-              selectionShapesRef.current = [newGeom];
-              selectionBoundaryPathRef.current.dirty = true;
-              rasterizeSelectionMask();
-              setSelectionActive(true);
-            }
-          } else if (!e?.shiftKey && !e?.altKey) {
-            clearSelection();
-          }
-          selectionDraftBoundsRef.current = null;
-          isDrawingSelectionRef.current = false;
-          // Push selection undo
-          {
-            const afterSnap = snapshotSelection();
-            undoStackRef.current.push({
-              type: "selection",
-              before: selectionBeforeRef.current ?? afterSnap,
-              after: afterSnap,
-            });
-            if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-            redoStackRef.current = [];
-            setUndoCount(undoStackRef.current.length);
-            setRedoCount(0);
-          }
-        } else if (mode === "free") {
-          const pts = selectionDraftPointsRef.current;
-          if (pts.length > 4) {
-            if ((e?.shiftKey || e?.altKey) && selectionMaskRef.current) {
-              // Composite new free lasso onto existing mask
-              const tempC2 = document.createElement("canvas");
-              tempC2.width = CANVAS_WIDTH;
-              tempC2.height = CANVAS_HEIGHT;
-              const tCtx2 = tempC2.getContext("2d", {
-                willReadFrequently: true,
-              })!;
-              tCtx2.fillStyle = "white";
-              tCtx2.beginPath();
-              tCtx2.moveTo(pts[0].x, pts[0].y);
-              for (let i = 1; i < pts.length; i++)
-                tCtx2.lineTo(pts[i].x, pts[i].y);
-              tCtx2.closePath();
-              tCtx2.fill();
-              const mc3 = selectionMaskRef.current;
-              const mCtx3 = mc3.getContext("2d", { willReadFrequently: true })!;
-              if (e?.shiftKey && !e?.altKey) {
-                mCtx3.globalCompositeOperation = "source-over";
-                mCtx3.drawImage(tempC2, 0, 0);
-              } else if (e?.altKey && !e?.shiftKey) {
-                mCtx3.globalCompositeOperation = "destination-out";
-                mCtx3.drawImage(tempC2, 0, 0);
-              } else if (e?.shiftKey && e?.altKey) {
-                mCtx3.globalCompositeOperation = "destination-in";
-                mCtx3.drawImage(tempC2, 0, 0);
-              }
-              mCtx3.globalCompositeOperation = "source-over";
-              selectionGeometryRef.current = { type: "mask" as LassoMode };
-              selectionShapesRef.current = [];
-              selectionBoundaryPathRef.current.dirty = true;
-              setSelectionActive(true);
-            } else {
-              selectionGeometryRef.current = { type: "free", points: [...pts] };
-              selectionShapesRef.current = [
-                { type: "free" as LassoMode, points: [...pts] },
-              ];
-              selectionBoundaryPathRef.current.dirty = true;
-              selectionActionsRef.current.rasterizeSelectionMask();
-              setSelectionActive(true);
-            }
-          } else if (!e?.shiftKey && !e?.altKey) {
-            selectionActionsRef.current.clearSelection();
-          }
-          selectionDraftPointsRef.current = [];
-          selectionDraftCursorRef.current = null;
-          isDrawingSelectionRef.current = false;
-          // Push selection undo
-          {
-            const afterSnap = snapshotSelection();
-            undoStackRef.current.push({
-              type: "selection",
-              before: selectionBeforeRef.current ?? afterSnap,
-              after: afterSnap,
-            });
-            if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-            redoStackRef.current = [];
-            setUndoCount(undoStackRef.current.length);
-            setRedoCount(0);
-          }
-        }
-        // poly lasso: pointer up doesn't close - clicking does
-        return;
-      }
-
-      // Handle move pointer up (commit when pointer released for non-transform drags)
-      if (
-        activeToolRef.current === "move" &&
-        floatDragStartRef.current &&
-        !transformActiveRef.current
-      ) {
-        floatDragStartRef.current = null;
-        selectionActionsRef.current.commitFloat({ keepSelection: true });
-        return;
-      }
-      // Move/Transform: just stop dragging handle but keep float alive
-      if (
-        (activeToolRef.current === "transform" ||
-          activeToolRef.current === "move") &&
-        floatDragStartRef.current &&
-        transformActiveRef.current
-      ) {
-        floatDragStartRef.current = null;
-        transformHandleRef.current = null;
-        return;
-      }
-
-      if (!isDrawingRef.current) return;
-
-      // Flush any pending smear rAF before committing stroke
-      if (smearRafRef.current) {
-        cancelAnimationFrame(smearRafRef.current);
-        smearRafRef.current = null;
-      }
-      if (smearDirtyRef.current) {
-        smearDirtyRef.current = false;
-        composite();
-      }
-      isDrawingRef.current = false;
-
-      const settings = brushSettingsRef.current;
-      const tool = activeToolRef.current;
-      const layerId = activeLayerIdRef.current;
-      const lc = layerCanvasesRef.current.get(layerId);
-      // strokePointBufferRef no longer used for smoothing
-
-      const _baseOpacity = brushOpacityRef.current;
-      const _upPressure = smoothedPressureRef.current;
-      const _upPressureFactor = settings.pressureOpacity
-        ? settings.minOpacity + (1 - settings.minOpacity) * _upPressure
-        : 1.0;
-      const _upCapAlpha = settings.pressureOpacity
-        ? _upPressureFactor * _baseOpacity
-        : _baseOpacity;
-      const _upCommitOpacity = 1.0;
-
-      // Stabilizer glide-to-finish: draw from stabBrushPos to rawStylusPos
-      if (lc && settings.strokeSmoothing > 0) {
-        const stab = stabBrushPosRef.current;
-        const raw = rawStylusPosRef.current;
-        if (stab && raw) {
-          const gdx = raw.x - stab.x;
-          const gdy = raw.y - stab.y;
-          const gDist = Math.sqrt(gdx * gdx + gdy * gdy);
-          if (gDist > 0.5) {
-            if (tool === "smear") {
-              const baseStrengthUp = settings.smearStrength ?? 0.8;
-              const effectiveSmearStrengthUp = settings.pressureStrength
-                ? (settings.minStrength ?? 0) +
-                  (1 - (settings.minStrength ?? 0)) *
-                    smoothedPressureRef.current
-                : baseStrengthUp;
-              renderSmearAlongPoints(
-                lc,
-                [stab, raw],
-                getActiveSize(),
-                settings.softness ?? 0,
-                effectiveSmearStrengthUp,
-              );
-              composite();
-            } else if (tool === "brush" || tool === "eraser") {
-              const sbufCtxUp = strokeBufferRef.current?.getContext("2d", {
-                willReadFrequently: true,
-              });
-              const _upFillStyle =
-                tool === "eraser" ? "rgba(0,0,0,1)" : colorFillStyleRef.current;
-              if (sbufCtxUp) {
-                sbufCtxUp.fillStyle = _upFillStyle;
-                sbufCtxUp.globalCompositeOperation = "source-over";
-              }
-              const _upCtx =
-                sbufCtxUp ??
-                ({
-                  fillStyle: _upFillStyle,
-                } as unknown as CanvasRenderingContext2D);
-              renderBrushSegmentAlongPoints(
-                _upCtx,
-                [stab, raw],
-                stab.size,
-                raw.size,
-                stab.opacity,
-                raw.opacity,
-                settings,
-                tool,
-                true,
-                _upCapAlpha,
-              );
-              strokeCommitOpacityRef.current = _upCommitOpacity;
-              flushStrokeBuffer(lc, _upCommitOpacity, tool);
-              composite();
-            }
-          } else {
-            if (lc && (tool === "brush" || tool === "eraser")) {
-              strokeCommitOpacityRef.current = _upCommitOpacity;
-              flushStrokeBuffer(lc, _upCommitOpacity, tool);
-            }
-            composite();
-          }
-        } else {
-          if (lc && (tool === "brush" || tool === "eraser")) {
-            strokeCommitOpacityRef.current = _upCommitOpacity;
-            flushStrokeBuffer(lc, _upCommitOpacity, tool);
-          }
-          composite();
-        }
-      } else {
-        // No smoothing: flush stroke buffer directly
-        if (lc && (tool === "brush" || tool === "eraser")) {
-          strokeCommitOpacityRef.current = _upCommitOpacity;
-          flushStrokeBuffer(lc, _upCommitOpacity, tool);
-        }
-        composite();
-      }
-
-      smoothedPressureRef.current = 0.5;
-      strokePointBufferRef.current = [];
-      stabBrushPosRef.current = null;
-      rawStylusPosRef.current = null;
-
-      const before = strokeStartSnapshotRef.current;
-      if (lc && before) {
-        const ctx = lc.getContext("2d", { willReadFrequently: true });
-        if (ctx) {
-          const after = ctx.getImageData(0, 0, lc.width, lc.height);
-          undoStackRef.current.push({ type: "pixels", layerId, before, after });
-          if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-          redoStackRef.current = [];
-          setUndoCount(undoStackRef.current.length);
-          setRedoCount(0);
-        }
-      }
-      strokeStartSnapshotRef.current = null;
-      lastPosRef.current = null;
-
-      // Update layer thumbnail and navigator thumbnail after stroke commit
-      if (lc) {
-        const thumbCanvas = document.createElement("canvas");
-        thumbCanvas.width = 36;
-        thumbCanvas.height = 36;
-        const thumbCtx = thumbCanvas.getContext("2d", {
-          willReadFrequently: true,
-        });
-        if (thumbCtx) {
-          thumbCtx.drawImage(lc, 0, 0, 36, 36);
-          const dataUrl = thumbCanvas.toDataURL("image/png");
-          setLayerThumbnails((prev) => ({ ...prev, [layerId]: dataUrl }));
-        }
-      }
-      // Update navigator thumbnail from display canvas
-      if (displayCanvasRef.current) {
-        const navCanvas = document.createElement("canvas");
-        navCanvas.width = 160;
-        navCanvas.height = Math.round(160 * (CANVAS_HEIGHT / CANVAS_WIDTH));
-        const navCtx = navCanvas.getContext("2d", { willReadFrequently: true });
-        if (navCtx) {
-          navCtx.drawImage(
-            displayCanvasRef.current,
-            0,
-            0,
-            navCanvas.width,
-            navCanvas.height,
-          );
-          setNavigatorThumbnail(navCanvas.toDataURL("image/png"));
-        }
-      }
-
-      const col = colorRef.current;
-      if (activeToolRef.current === "brush") {
-        const [r, g, b] = hsvToRgb(col.h, col.s, col.v);
-        const hex = rgbToHex(r, g, b);
-        setRecentColors((prev) =>
-          [hex, ...prev.filter((c) => c !== hex)].slice(0, 8),
-        );
-      }
-      // biome-ignore lint/correctness/useExhaustiveDependencies: refs used intentionally
-    },
-    [
-      renderBrushSegmentAlongPoints,
-      renderSmearAlongPoints,
-      getActiveSize,
-      flushStrokeBuffer,
-      composite,
-    ],
-  );
-
+  // biome-ignore lint/correctness/useExhaustiveDependencies: selectionActiveRef and selectionMaskRef are stable refs
   const handleClear = useCallback(() => {
     const layerId = activeLayerIdRef.current;
     const lc = layerCanvasesRef.current.get(layerId);
     if (!lc) return;
-    const ctx = lc.getContext("2d", { willReadFrequently: true });
+    const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
     if (!ctx) return;
     const before = ctx.getImageData(0, 0, lc.width, lc.height);
-    ctx.clearRect(0, 0, lc.width, lc.height);
+    if (selectionActiveRef.current && selectionMaskRef.current) {
+      // Only erase pixels inside the selection
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.drawImage(selectionMaskRef.current, 0, 0);
+      ctx.globalCompositeOperation = "source-over";
+    } else {
+      ctx.clearRect(0, 0, lc.width, lc.height);
+    }
     const after = ctx.getImageData(0, 0, lc.width, lc.height);
-    undoStackRef.current.push({ type: "pixels", layerId, before, after });
-    redoStackRef.current = [];
-    setUndoCount(undoStackRef.current.length);
-    setRedoCount(0);
-    composite();
-  }, [composite]);
+    pushHistory({ type: "pixels", layerId, before, after });
+    markCanvasDirty(layerId);
+    scheduleComposite();
+  }, [scheduleComposite, pushHistory]);
 
-  const handleExportBrushes = () => {
-    const data = JSON.stringify(
-      {
-        version: 1,
-        presets: {
-          brush: presets.brush,
-          smear: presets.smear,
-          eraser: presets.eraser,
-        },
-      },
-      null,
-      2,
-    );
-    const blob = new Blob([data], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "brushes.hbrush";
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+  // handleExportBrushes, handleImportBrushes, processImportAppend, resolveConflict
+  // are now provided by usePresetSystem above.
 
-  const handleImportBrushes = (file: File) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const json = JSON.parse(e.target?.result as string);
-        if (!json.version || !json.presets) throw new Error("Invalid format");
-        const parsed = json.presets as typeof DEFAULT_PRESETS;
-        setImportParsed(parsed);
-        setShowMergeDialog(true);
-      } catch {
-        toast.error("Invalid .hbrush file");
-      }
-    };
-    reader.readAsText(file);
-  };
-
-  const processImportAppend = (
-    parsed: typeof DEFAULT_PRESETS,
-    currentPresets: typeof presets,
-  ) => {
-    const merged: typeof DEFAULT_PRESETS = {
-      brush: [...currentPresets.brush],
-      smear: [...currentPresets.smear],
-      eraser: [...currentPresets.eraser],
-    };
-    const conflicts: Array<{
-      toolType: "brush" | "smear" | "eraser";
-      preset: Preset;
-    }> = [];
-    for (const toolType of ["brush", "smear", "eraser"] as const) {
-      for (const incoming of parsed[toolType] || []) {
-        const exists = merged[toolType].some((p) => p.name === incoming.name);
-        if (exists) {
-          conflicts.push({ toolType, preset: incoming });
-        } else {
-          merged[toolType] = [
-            ...merged[toolType],
-            { ...incoming, id: `${toolType}-${Date.now()}-${Math.random()}` },
-          ];
-        }
-      }
-    }
-    if (conflicts.length > 0) {
-      setPendingMerged(merged);
-      setConflictQueue(conflicts.slice(1));
-      setCurrentConflict(conflicts[0]);
-    } else {
-      setPresets(merged);
-      toast.success("Brushes imported successfully!");
-    }
-  };
-
-  const resolveConflict = (action: "overwrite" | "rename" | "skip") => {
-    if (!currentConflict || !pendingMerged) return;
-    const { toolType, preset } = currentConflict;
-    let nextMerged = {
-      ...pendingMerged,
-      [toolType]: [...pendingMerged[toolType]],
-    };
-
-    if (action === "overwrite") {
-      nextMerged[toolType] = nextMerged[toolType].map((p) =>
-        p.name === preset.name ? { ...preset, id: p.id } : p,
-      );
-    } else if (action === "rename") {
-      let suffix = 2;
-      let newName = `${preset.name} ${suffix}`;
-      while (nextMerged[toolType].some((p) => p.name === newName)) {
-        suffix++;
-        newName = `${preset.name} ${suffix}`;
-      }
-      nextMerged[toolType] = [
-        ...nextMerged[toolType],
-        {
-          ...preset,
-          name: newName,
-          id: `${toolType}-${Date.now()}-${Math.random()}`,
-        },
-      ];
-    }
-    // skip: do nothing
-
-    setPendingMerged(nextMerged);
-
-    if (conflictQueue.length > 0) {
-      setCurrentConflict(conflictQueue[0]);
-      setConflictQueue(conflictQueue.slice(1));
-    } else {
-      setPresets(nextMerged);
-      setCurrentConflict(null);
-      setPendingMerged(null);
-      toast.success("Brushes imported successfully!");
-    }
-  };
-
+  // biome-ignore lint/correctness/useExhaustiveDependencies: displayCanvasRef is a stable ref
   const handleExport = useCallback(() => {
     const display = displayCanvasRef.current;
     if (!display) return;
     const exportCanvas = document.createElement("canvas");
     exportCanvas.width = display.width;
     exportCanvas.height = display.height;
-    const ctx = exportCanvas.getContext("2d", { willReadFrequently: true });
+    const ctx = exportCanvas.getContext("2d", { willReadFrequently: !isIPad });
     if (!ctx) return;
-    ctx.fillStyle = backgroundColorRef.current;
-    ctx.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
     ctx.drawImage(display, 0, 0);
     const link = document.createElement("a");
     link.href = exportCanvas.toDataURL("image/png");
     link.download = `painting-${Date.now()}.png`;
+    link.style.display = "none";
+    document.body.appendChild(link);
     link.click();
+    document.body.removeChild(link);
     toast.success("Exported as PNG!");
   }, []);
 
   const handleSave = useCallback(async () => {
-    const display = displayCanvasRef.current;
-    if (!display) return;
-    const exportCanvas = document.createElement("canvas");
-    exportCanvas.width = display.width;
-    exportCanvas.height = display.height;
-    const ctx = exportCanvas.getContext("2d", { willReadFrequently: true });
-    if (!ctx) return;
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
-    ctx.drawImage(display, 0, 0);
-    exportCanvas.toBlob((blob) => {
-      if (!blob) return;
-      toast.success("Painting saved!");
-    }, "image/png");
-  }, []);
+    // Save button always does silent local save (Ctrl+S behavior)
+    await handleSilentSave();
+  }, [handleSilentSave]);
 
   const handleRecentColorClick = useCallback((hex: string) => {
     const rgb = hexToRgb(hex);
@@ -5233,1044 +2739,659 @@ export function PaintingApp() {
     setColor((prev) => ({ ...prev, h, s, v }));
   }, []);
 
-  // ---- Selection helpers ----
+  // ---- Move/Transform helpers ----
+  // These are now in useTransformSystem. Wire them into selectionActionsRef for backward compat.
 
-  const rasterizeSelectionMask = useCallback(() => {
-    const geom = selectionGeometryRef.current;
-    if (!geom) return;
-    if (!selectionMaskRef.current) {
-      const mc = document.createElement("canvas");
-      mc.width = CANVAS_WIDTH;
-      mc.height = CANVAS_HEIGHT;
-      selectionMaskRef.current = mc;
-    }
-    const mc = selectionMaskRef.current;
-    mc.width = CANVAS_WIDTH;
-    mc.height = CANVAS_HEIGHT;
-    const mctx = mc.getContext("2d", { willReadFrequently: true })!;
-    mctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-    mctx.fillStyle = "white";
-    if (geom.type === "rect" && geom.w !== undefined && geom.h !== undefined) {
-      const x = geom.w! < 0 ? geom.x! + geom.w! : geom.x!;
-      const y = geom.h! < 0 ? geom.y! + geom.h! : geom.y!;
-      const w = Math.abs(geom.w!);
-      const h = Math.abs(geom.h!);
-      mctx.fillRect(x, y, w, h);
-    } else if (
-      geom.type === "ellipse" &&
-      geom.w !== undefined &&
-      geom.h !== undefined
-    ) {
-      const cx = geom.x! + geom.w! / 2;
-      const cy = geom.y! + geom.h! / 2;
-      const rx = Math.abs(geom.w! / 2);
-      const ry = Math.abs(geom.h! / 2);
-      mctx.beginPath();
-      mctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-      mctx.fill();
-    } else if (
-      (geom.type === "free" || geom.type === "poly") &&
-      geom.points &&
-      geom.points.length > 2
-    ) {
-      mctx.beginPath();
-      mctx.moveTo(geom.points[0].x, geom.points[0].y);
-      for (let i = 1; i < geom.points.length; i++) {
-        mctx.lineTo(geom.points[i].x, geom.points[i].y);
-      }
-      mctx.closePath();
-      mctx.fill();
-    }
-  }, []);
-
-  // Sync to actions ref
   // biome-ignore lint/correctness/useExhaustiveDependencies: stable ref
   useEffect(() => {
-    selectionActionsRef.current.rasterizeSelectionMask = rasterizeSelectionMask;
-  }, [rasterizeSelectionMask]);
+    selectionActionsRef.current.extractFloat =
+      transformActionsRef.current.extractFloat;
+  }, []);
 
-  const handleCtrlClickLayer = useCallback(
-    (id: string) => {
-      const lc = layerCanvasesRef.current.get(id);
-      if (!lc) return;
-      const ctx = lc.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return;
-      const imgData = ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-      const data = imgData.data;
-      const maskCanvas = document.createElement("canvas");
-      maskCanvas.width = CANVAS_WIDTH;
-      maskCanvas.height = CANVAS_HEIGHT;
-      const mCtx = maskCanvas.getContext("2d", { willReadFrequently: true })!;
-      const maskImgData = mCtx.createImageData(CANVAS_WIDTH, CANVAS_HEIGHT);
-      const md = maskImgData.data;
-      let minX = CANVAS_WIDTH;
-      let minY = CANVAS_HEIGHT;
-      let maxX = 0;
-      let maxY = 0;
-      let hasPixels = false;
-      for (let py = 0; py < CANVAS_HEIGHT; py++) {
-        for (let px = 0; px < CANVAS_WIDTH; px++) {
-          const i = (py * CANVAS_WIDTH + px) * 4;
-          if (data[i + 3] > 0) {
-            md[i] = 255;
-            md[i + 1] = 255;
-            md[i + 2] = 255;
-            md[i + 3] = 255;
-            if (px < minX) minX = px;
-            if (px > maxX) maxX = px;
-            if (py < minY) minY = py;
-            if (py > maxY) maxY = py;
-            hasPixels = true;
-          }
-        }
+  // biome-ignore lint/correctness/useExhaustiveDependencies: stable ref
+  useEffect(() => {
+    selectionActionsRef.current.commitFloat =
+      transformActionsRef.current.commitFloat;
+  }, []);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: stable ref
+  useEffect(() => {
+    selectionActionsRef.current.revertTransform =
+      transformActionsRef.current.revertTransform;
+  }, []);
+
+  // ── Selection grow/shrink ─────────────────────────────────────────────────
+  const handleGrowShrink = (direction: 1 | -1) => {
+    if (!selectionMaskRef.current) return;
+    selectionBeforeRef.current = snapshotSelection();
+    const mc = selectionMaskRef.current;
+    const mctx = mc.getContext("2d", { willReadFrequently: !isIPad });
+    if (!mctx) return;
+
+    // Use computeMaskBounds for the initial size measurement
+    const preBounds = computeMaskBounds(mc);
+    if (!preBounds) return;
+
+    const pixels =
+      Math.max(1, Math.round(Math.max(preBounds.w, preBounds.h) * 0.05)) *
+      direction;
+
+    const mdata = mctx.getImageData(
+      0,
+      0,
+      canvasWidthRef.current,
+      canvasHeightRef.current,
+    ).data;
+    const currentMask = new Uint8Array(
+      canvasWidthRef.current * canvasHeightRef.current,
+    );
+    for (let i = 0; i < canvasWidthRef.current * canvasHeightRef.current; i++) {
+      currentMask[i] = mdata[i * 4 + 3] > 64 ? 1 : 0;
+    }
+    const newMask = growShrinkMask(
+      currentMask,
+      canvasWidthRef.current,
+      canvasHeightRef.current,
+      pixels,
+    );
+    const newImgData = mctx.createImageData(
+      canvasWidthRef.current,
+      canvasHeightRef.current,
+    );
+    const nd = newImgData.data;
+    for (let i = 0; i < newMask.length; i++) {
+      if (newMask[i]) {
+        nd[i * 4] = 255;
+        nd[i * 4 + 1] = 255;
+        nd[i * 4 + 2] = 255;
+        nd[i * 4 + 3] = 255;
       }
-      if (!hasPixels) return;
-      mCtx.putImageData(maskImgData, 0, 0);
-      selectionMaskRef.current = maskCanvas;
-      selectionGeometryRef.current = {
-        type: "wand",
-        x: minX,
-        y: minY,
-        w: maxX - minX + 1,
-        h: maxY - minY + 1,
-      };
-      setActiveTool("lasso");
-      setSelectionActive(true);
-    },
-    // biome-ignore lint/correctness/useExhaustiveDependencies: stable ref
-    [],
-  );
+    }
+    mctx.putImageData(newImgData, 0, 0);
 
-  const clearSelection = useCallback(() => {
-    selectionGeometryRef.current = null;
+    // Normalize to mask type with no stale shape data — extractFloat and the ant
+    // renderer will both read the actual pixel mask for bounds and outline.
+    selectionGeometryRef.current = { type: "mask" as LassoMode };
     selectionShapesRef.current = [];
     selectionBoundaryPathRef.current.dirty = true;
-    selectionMaskRef.current = null;
-    isDrawingSelectionRef.current = false;
-    selectionDraftPointsRef.current = [];
-    selectionDraftCursorRef.current = null;
-    selectionDraftBoundsRef.current = null;
-    setSelectionActive(false);
-    // Clear overlay
-    const overlay = selectionOverlayCanvasRef.current;
-    if (overlay) {
-      const ctx = overlay.getContext("2d", { willReadFrequently: true });
-      if (ctx) ctx.clearRect(0, 0, overlay.width, overlay.height);
-    }
-  }, []);
+    // Synchronously rebuild chains so the ant loop reflects the grown/shrunk selection.
+    if (selectionMaskRef.current)
+      rebuildChainsNowRef.current(selectionMaskRef.current);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: stable ref
-  useEffect(() => {
-    selectionActionsRef.current.clearSelection = clearSelection;
-  }, [clearSelection]);
+    const afterSnap = snapshotSelection();
+    pushHistory({
+      type: "selection",
+      before: selectionBeforeRef.current ?? afterSnap,
+      after: afterSnap,
+    });
+    selectionBeforeRef.current = null;
 
-  // biome-ignore lint/correctness/noUnusedVariables: used via selectionActionsRef
-  const deleteSelection = useCallback(() => {
-    if (!selectionActiveRef.current || !selectionMaskRef.current) return;
-    const layerId = activeLayerIdRef.current;
-    if (layerId === "layer-background") return;
-    const lc = layerCanvasesRef.current.get(layerId);
-    if (!lc) return;
-    const ctx = lc.getContext("2d", { willReadFrequently: true });
-    if (!ctx) return;
-    const before = ctx.getImageData(0, 0, lc.width, lc.height);
-    ctx.save();
-    ctx.globalCompositeOperation = "destination-out";
-    ctx.drawImage(selectionMaskRef.current, 0, 0);
-    ctx.restore();
-    const after = ctx.getImageData(0, 0, lc.width, lc.height);
-    undoStackRef.current.push({ type: "pixels", layerId, before, after });
-    if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-    redoStackRef.current = [];
-    setUndoCount(undoStackRef.current.length);
-    setRedoCount(0);
-    composite();
-  }, [composite]);
-
-  const cutOrCopyToLayer = useCallback(
-    (cut: boolean) => {
-      if (!selectionActiveRef.current || !selectionMaskRef.current) return;
-      const layerId = activeLayerIdRef.current;
-      if (layerId === "layer-background") return;
-      const lc = layerCanvasesRef.current.get(layerId);
-      if (!lc) return;
-      const srcCtx = lc.getContext("2d", { willReadFrequently: true });
-      if (!srcCtx) return;
-      // Create new layer canvas with just the selected pixels
-      const newLayerData = newLayer();
-      const nl = document.createElement("canvas");
-      nl.width = CANVAS_WIDTH;
-      nl.height = CANVAS_HEIGHT;
-      const nlCtx = nl.getContext("2d", { willReadFrequently: true })!;
-      nlCtx.drawImage(lc, 0, 0);
-      nlCtx.globalCompositeOperation = "destination-in";
-      nlCtx.drawImage(selectionMaskRef.current, 0, 0);
-      nlCtx.globalCompositeOperation = "source-over";
-      layerCanvasesRef.current.set(newLayerData.id, nl);
-      if (cut) {
-        const before = srcCtx.getImageData(0, 0, lc.width, lc.height);
-        srcCtx.save();
-        srcCtx.globalCompositeOperation = "destination-out";
-        srcCtx.drawImage(selectionMaskRef.current, 0, 0);
-        srcCtx.restore();
-        const after = srcCtx.getImageData(0, 0, lc.width, lc.height);
-        undoStackRef.current.push({ type: "pixels", layerId, before, after });
-        if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-        redoStackRef.current = [];
-        setUndoCount(undoStackRef.current.length);
-        setRedoCount(0);
-      }
-      // Insert new layer above active
-      setLayers((prev) => {
-        const idx = prev.findIndex((l) => l.id === layerId);
-        const next = [...prev];
-        next.splice(Math.max(0, idx), 0, newLayerData);
-        return next;
-      });
-      setActiveLayerId(newLayerData.id);
-      composite();
-      toast.success(cut ? "Cut to new layer" : "Copied to new layer");
-    },
-    [composite],
-  );
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: stable ref
-  useEffect(() => {
-    selectionActionsRef.current.cutOrCopyToLayer = cutOrCopyToLayer;
-  }, [cutOrCopyToLayer]);
-
-  // ---- Move/Transform helpers ----
-
-  const extractFloat = useCallback(
-    (fromSelection: boolean) => {
-      const layerId = activeLayerIdRef.current;
-      if (layerId === "layer-background") return;
-      const lc = layerCanvasesRef.current.get(layerId);
-      if (!lc) return;
-      const ctx = lc.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return;
-
-      let bounds = { x: 0, y: 0, w: CANVAS_WIDTH, h: CANVAS_HEIGHT };
-
-      // Capture snapshot BEFORE any clearing (for transform revert)
-      const layerSnapshot = ctx.getImageData(0, 0, lc.width, lc.height);
-
-      // Create float canvas
-      const fc = document.createElement("canvas");
-      fc.width = CANVAS_WIDTH;
-      fc.height = CANVAS_HEIGHT;
-      const fCtx = fc.getContext("2d", { willReadFrequently: true })!;
-
-      if (
-        fromSelection &&
-        selectionActiveRef.current &&
-        selectionMaskRef.current
-      ) {
-        // Extract selection bounds
-        const geom = selectionGeometryRef.current;
-        if (geom) {
-          if (geom.type === "rect" || geom.type === "ellipse") {
-            const x = geom.w! < 0 ? geom.x! + geom.w! : geom.x!;
-            const y = geom.h! < 0 ? geom.y! + geom.h! : geom.y!;
-            bounds = { x, y, w: Math.abs(geom.w!), h: Math.abs(geom.h!) };
-          } else if (geom.type === "mask") {
-            // Compute tight bounds from all shapes
-            const shapes = selectionShapesRef.current;
-            if (shapes.length > 0) {
-              let minX = CANVAS_WIDTH;
-              let minY = CANVAS_HEIGHT;
-              let maxX = 0;
-              let maxY = 0;
-              for (const shape of shapes) {
-                if (
-                  (shape.type === "rect" || shape.type === "ellipse") &&
-                  shape.w !== undefined
-                ) {
-                  const sx = shape.w < 0 ? shape.x! + shape.w : shape.x!;
-                  const sy = shape.h! < 0 ? shape.y! + shape.h! : shape.y!;
-                  const ex = sx + Math.abs(shape.w);
-                  const ey = sy + Math.abs(shape.h!);
-                  minX = Math.min(minX, sx);
-                  minY = Math.min(minY, sy);
-                  maxX = Math.max(maxX, ex);
-                  maxY = Math.max(maxY, ey);
-                } else if (shape.points && shape.points.length > 0) {
-                  for (const p of shape.points) {
-                    minX = Math.min(minX, p.x);
-                    minY = Math.min(minY, p.y);
-                    maxX = Math.max(maxX, p.x);
-                    maxY = Math.max(maxY, p.y);
-                  }
-                }
-              }
-              if (maxX > minX && maxY > minY) {
-                bounds = { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
-              }
-            } else if (selectionMaskRef.current) {
-              // Scan mask for bounds
-              const mc = selectionMaskRef.current;
-              const mctx = mc.getContext("2d", { willReadFrequently: true })!;
-              const mdata = mctx.getImageData(
-                0,
-                0,
-                CANVAS_WIDTH,
-                CANVAS_HEIGHT,
-              ).data;
-              let minX = CANVAS_WIDTH;
-              let minY = CANVAS_HEIGHT;
-              let maxX = 0;
-              let maxY = 0;
-              let hasPx = false;
-              for (let ry = 0; ry < CANVAS_HEIGHT; ry++) {
-                for (let rx = 0; rx < CANVAS_WIDTH; rx++) {
-                  if (mdata[(ry * CANVAS_WIDTH + rx) * 4 + 3] > 64) {
-                    if (rx < minX) minX = rx;
-                    if (rx > maxX) maxX = rx;
-                    if (ry < minY) minY = ry;
-                    if (ry > maxY) maxY = ry;
-                    hasPx = true;
-                  }
-                }
-              }
-              if (hasPx)
-                bounds = { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
-            }
-          } else if (geom.points && geom.points.length > 0) {
-            const xs = geom.points.map((p) => p.x);
-            const ys = geom.points.map((p) => p.y);
-            const minX = Math.min(...xs);
-            const maxX = Math.max(...xs);
-            const minY = Math.min(...ys);
-            const maxY = Math.max(...ys);
-            bounds = { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
-          }
-        }
-        fCtx.drawImage(lc, 0, 0);
-        fCtx.globalCompositeOperation = "destination-in";
-        fCtx.drawImage(selectionMaskRef.current, 0, 0);
-        fCtx.globalCompositeOperation = "source-over";
-        // Clear from source layer
-        const beforeClear = ctx.getImageData(0, 0, lc.width, lc.height);
-        ctx.save();
-        ctx.globalCompositeOperation = "destination-out";
-        ctx.drawImage(selectionMaskRef.current, 0, 0);
-        ctx.restore();
-        // Store before-clear snapshot for consolidated transform undo (committed in commitFloat)
-        transformPreCommitSnapshotRef.current = beforeClear;
-      } else {
-        fCtx.drawImage(lc, 0, 0);
-        // Clear entire layer — store before snapshot for consolidated transform undo
-        const beforeClear = ctx.getImageData(0, 0, lc.width, lc.height);
-        ctx.clearRect(0, 0, lc.width, lc.height);
-        transformPreCommitSnapshotRef.current = beforeClear;
-      }
-
-      moveFloatCanvasRef.current = fc;
-      moveFloatOriginBoundsRef.current = bounds;
-      isDraggingFloatRef.current = true;
-      // Set unified transform state for both move and transform tools
-      xfStateRef.current = {
-        x: bounds.x,
-        y: bounds.y,
-        w: bounds.w,
-        h: bounds.h,
-        rotation: 0,
-      };
-      // Both move and transform get full transform capabilities
-      transformActiveRef.current = true;
-      // lastToolBeforeTransformRef is set when user presses V/T key
-      // Store snapshot for revert — captured BEFORE clearing above
-      transformPreSnapshotRef.current = layerSnapshot;
-      // Save a copy of the original float (selected pixels only) for scale/rotate source
-      const origCopy = document.createElement("canvas");
-      origCopy.width = fc.width;
-      origCopy.height = fc.height;
-      origCopy
-        .getContext("2d", { willReadFrequently: true })!
-        .drawImage(fc, 0, 0);
-      transformOrigFloatCanvasRef.current = origCopy;
-      composite();
-    },
-    [composite],
-  );
-
-  const commitFloat = useCallback(
-    (opts?: { keepSelection?: boolean }) => {
-      const fc = moveFloatCanvasRef.current;
-      if (!fc) return;
-      const layerId = activeLayerIdRef.current;
-      if (layerId === "layer-background") return;
-      const lc = layerCanvasesRef.current.get(layerId);
-      if (!lc) return;
-      const ctx = lc.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return;
-      // Use the pre-clear snapshot from extractFloat for a single consolidated undo entry
-      const before =
-        transformPreCommitSnapshotRef.current ??
-        ctx.getImageData(0, 0, lc.width, lc.height);
-      const xfCommit = xfStateRef.current;
-      const obCommit = moveFloatOriginBoundsRef.current;
-      const origFloatCommit = transformOrigFloatCanvasRef.current || fc;
-      if (xfCommit && obCommit) {
-        const cx = xfCommit.x + xfCommit.w / 2;
-        const cy = xfCommit.y + xfCommit.h / 2;
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.rotate(xfCommit.rotation);
-        ctx.drawImage(
-          origFloatCommit,
-          obCommit.x,
-          obCommit.y,
-          obCommit.w,
-          obCommit.h,
-          -xfCommit.w / 2,
-          -xfCommit.h / 2,
-          xfCommit.w,
-          xfCommit.h,
-        );
-        ctx.restore();
-      } else if (xfCommit) {
-        ctx.drawImage(fc, xfCommit.x, xfCommit.y);
-      } else {
-        ctx.drawImage(fc, 0, 0);
-      }
-      const after = ctx.getImageData(0, 0, lc.width, lc.height);
-      undoStackRef.current.push({ type: "pixels", layerId, before, after });
-      if (undoStackRef.current.length > 50) undoStackRef.current.shift();
-      redoStackRef.current = [];
-
-      // Update selection geometry to match the committed transform
-      const geom = selectionGeometryRef.current;
-      if (geom && xfCommit && obCommit) {
-        const rot = xfCommit.rotation;
-        const newCx = xfCommit.x + xfCommit.w / 2;
-        const newCy = xfCommit.y + xfCommit.h / 2;
-        const cosR = Math.cos(rot);
-        const sinR = Math.sin(rot);
-        // Helper: rotate a point around the new center
-        const rotPt = (px: number, py: number) => {
-          const dx = px - newCx;
-          const dy = py - newCy;
-          return {
-            x: newCx + dx * cosR - dy * sinR,
-            y: newCy + dx * sinR + dy * cosR,
-          };
+    // If a transform is currently active, update the bounding box to match the new mask
+    if (transformActiveRef.current) {
+      const newBounds = computeMaskBounds(mc);
+      if (newBounds) {
+        moveFloatOriginBoundsRef.current = newBounds;
+        xfStateRef.current = {
+          ...newBounds,
+          rotation: xfStateRef.current?.rotation ?? 0,
         };
-        if (geom.type === "rect" || geom.type === "ellipse") {
-          if (Math.abs(rot) > 0.001) {
-            // Convert to polygon so ants can show the rotated shape accurately
-            const hw = xfCommit.w / 2;
-            const hh = xfCommit.h / 2;
-            const corners = [
-              rotPt(newCx - hw, newCy - hh),
-              rotPt(newCx + hw, newCy - hh),
-              rotPt(newCx + hw, newCy + hh),
-              rotPt(newCx - hw, newCy + hh),
-            ];
-            (
-              geom as {
-                type: string;
-                points?: { x: number; y: number }[];
-                x?: number;
-                y?: number;
-                w?: number;
-                h?: number;
-              }
-            ).type = "poly";
-            geom.points = corners;
-            geom.x = undefined;
-            geom.y = undefined;
-            geom.w = undefined;
-            geom.h = undefined;
-          } else {
-            geom.x = xfCommit.x;
-            geom.y = xfCommit.y;
-            geom.w = xfCommit.w;
-            geom.h = xfCommit.h;
-          }
-        } else if (geom.points && geom.points.length > 0) {
-          // Apply full transform: scale around original center, translate, rotate around new center
-          const origCx = obCommit.x + obCommit.w / 2;
-          const origCy = obCommit.y + obCommit.h / 2;
-          const scaleX = obCommit.w > 0 ? xfCommit.w / obCommit.w : 1;
-          const scaleY = obCommit.h > 0 ? xfCommit.h / obCommit.h : 1;
-          const transDx = newCx - origCx;
-          const transDy = newCy - origCy;
-          geom.points = geom.points.map((p) => {
-            // Scale around original center
-            const sx = origCx + (p.x - origCx) * scaleX;
-            const sy = origCy + (p.y - origCy) * scaleY;
-            // Translate
-            const tx = sx + transDx;
-            const ty = sy + transDy;
-            // Rotate around new center
-            return rotPt(tx, ty);
-          });
-        }
-        // Re-bake selection mask so painting is restricted to correct region
-        selectionActionsRef.current.rasterizeSelectionMask();
-      }
-
-      moveFloatCanvasRef.current = null;
-      xfStateRef.current = null;
-      moveFloatOriginBoundsRef.current = null;
-      isDraggingFloatRef.current = false;
-      transformActiveRef.current = false;
-      transformPreSnapshotRef.current = null;
-      transformPreCommitSnapshotRef.current = null;
-      transformOrigFloatCanvasRef.current = null;
-      floatDragStartRef.current = null;
-      // Clear selection unless keepSelection is requested
-      if (!opts?.keepSelection) {
-        selectionGeometryRef.current = null;
-        selectionMaskRef.current = null;
-        selectionActiveRef.current = false;
-        setSelectionActive(false);
-      } else if (selectionActiveRef.current) {
-        // Selection was kept — mark boundary dirty so ants redraw at new position
-        selectionBoundaryPathRef.current.dirty = true;
-        setSelectionActive(true);
-      }
-      // Restore tool that was active before transform
-      if (lastToolBeforeTransformRef.current) {
-        const restoredTool = lastToolBeforeTransformRef.current;
-        setActiveTool(restoredTool);
-        if (
-          restoredTool === "brush" ||
-          restoredTool === "smear" ||
-          restoredTool === "eraser"
-        ) {
-          setActiveSubpanel(restoredTool);
-        } else if (restoredTool === "lasso") {
-          setActiveSubpanel("lasso");
-        } else if (restoredTool === "fill") {
-          setActiveSubpanel("fill");
-        } else if (restoredTool === "adjustments") {
-          setActiveSubpanel("adjustments");
-        }
-        lastToolBeforeTransformRef.current = null;
-      }
-      composite();
-      setUndoCount(undoStackRef.current.length);
-      setRedoCount(0);
-    },
-    [composite],
-  );
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: stable ref
-  useEffect(() => {
-    selectionActionsRef.current.extractFloat = extractFloat;
-  }, [extractFloat]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: stable ref
-  useEffect(() => {
-    selectionActionsRef.current.commitFloat = commitFloat;
-  }, [commitFloat]);
-
-  const revertTransform = useCallback(() => {
-    const snap = transformPreSnapshotRef.current;
-    const layerId = activeLayerIdRef.current;
-    if (snap && layerId !== "layer-background") {
-      const lc = layerCanvasesRef.current.get(layerId);
-      if (lc) {
-        const ctx = lc.getContext("2d", { willReadFrequently: true });
-        if (ctx) ctx.putImageData(snap, 0, 0);
       }
     }
-    moveFloatCanvasRef.current = null;
-    xfStateRef.current = null;
-    moveFloatOriginBoundsRef.current = null;
-    isDraggingFloatRef.current = false;
-    transformActiveRef.current = false;
-    transformPreSnapshotRef.current = null;
-    transformOrigFloatCanvasRef.current = null;
-    floatDragStartRef.current = null;
-    // Restore tool that was active before transform
-    if (lastToolBeforeTransformRef.current) {
-      const restoredTool = lastToolBeforeTransformRef.current;
-      setActiveTool(restoredTool);
-      if (
-        restoredTool === "brush" ||
-        restoredTool === "smear" ||
-        restoredTool === "eraser"
-      ) {
-        setActiveSubpanel(restoredTool);
-      } else if (restoredTool === "lasso") {
-        setActiveSubpanel("lasso");
-      } else if (restoredTool === "fill") {
-        setActiveSubpanel("fill");
-      } else if (restoredTool === "adjustments") {
-        setActiveSubpanel("adjustments");
-      }
-      lastToolBeforeTransformRef.current = null;
-    }
-    composite();
-  }, [composite]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: stable ref
-  useEffect(() => {
-    selectionActionsRef.current.revertTransform = revertTransform;
-  }, [revertTransform]);
-
-  // Get the 9 transform handle positions (8 + rotation) based on float position and original bounds
-  const getTransformHandles = useCallback(() => {
-    const xfH = xfStateRef.current;
-    if (!xfH) return null;
-    const { x, y, w, h } = xfH;
-    const hw = w / 2;
-    const hh = h / 2;
-    return {
-      nw: { x, y },
-      n: { x: x + hw, y },
-      ne: { x: x + w, y },
-      w: { x, y: y + hh },
-      e: { x: x + w, y: y + hh },
-      sw: { x, y: y + h },
-      s: { x: x + hw, y: y + h },
-      se: { x: x + w, y: y + h },
-      rot: { x: x + hw, y: y - 24 },
-      bounds: { x, y, w, h },
-    };
-  }, []);
-
-  const hitTestTransformHandle = useCallback(
-    (px: number, py: number): string | null => {
-      const handles = getTransformHandles();
-      if (!handles) return null;
-      const xfHit = xfStateRef.current;
-      const rot = xfHit ? xfHit.rotation : 0;
-      let testX = px;
-      let testY = py;
-      if (rot !== 0) {
-        // Inverse-rotate px, py around the visual center of the bounding box
-        const { x, y, w, h } = handles.bounds;
-        const cx = x + w / 2;
-        const cy = y + h / 2;
-        const cos = Math.cos(-rot);
-        const sin = Math.sin(-rot);
-        const dx = px - cx;
-        const dy = py - cy;
-        testX = cx + dx * cos - dy * sin;
-        testY = cy + dx * sin + dy * cos;
-      }
-      const R = 8;
-      for (const [key, pt] of Object.entries(handles)) {
-        if (key === "bounds") continue;
-        const dx = testX - (pt as { x: number; y: number }).x;
-        const dy = testY - (pt as { x: number; y: number }).y;
-        if (Math.sqrt(dx * dx + dy * dy) <= R) return key;
-      }
-      // Check if inside bounds = drag entire float
-      const { x, y, w, h } = handles.bounds;
-      // For the bounds check, also use the un-rotated test point
-      if (testX >= x && testX <= x + w && testY >= y && testY <= y + h)
-        return "move";
-      // Outside-bbox: check if within 30px of any edge = rotation
-      const ROT_ZONE = 30;
-      if (
-        testX >= x - ROT_ZONE &&
-        testX <= x + w + ROT_ZONE &&
-        testY >= y - ROT_ZONE &&
-        testY <= y + h + ROT_ZONE
-      ) {
-        return "rot";
-      }
-      return null;
-    },
-    [getTransformHandles],
-  );
-
-  // Brush-tip cursor: renders the tip shape as the canvas cursor for brush/eraser/smear tools
-  const updateBrushCursor = useCallback(() => {
-    const isBrushTool =
-      activeTool === "brush" ||
-      activeTool === "eraser" ||
-      activeTool === "smear";
-    if (!containerRef.current) return;
-    if (!isBrushTool) {
-      containerRef.current.style.cursor = "";
-      return;
-    }
-    const rawSize =
-      activeTool === "eraser"
-        ? brushSizesRef.current.eraser
-        : brushSizesRef.current.brush;
-    const vt = viewTransformRef.current;
-    const screenSize = rawSize * vt.zoom;
-    // Browsers cap CSS cursor images at 128px; fall back to crosshair for very large brushes
-    const MAX_CURSOR = 120;
-    if (screenSize > MAX_CURSOR) {
-      containerRef.current.style.cursor = "crosshair";
-      return;
-    }
-    const padded = Math.max(6, Math.ceil(screenSize) + 8);
-    const offscreen = document.createElement("canvas");
-    offscreen.width = padded;
-    offscreen.height = padded;
-    const ctx = offscreen.getContext("2d", { willReadFrequently: true });
-    if (!ctx) return;
-    const cxPos = padded / 2;
-    const cyPos = padded / 2;
-    const r = Math.max(1, screenSize / 2);
-    ctx.clearRect(0, 0, padded, padded);
-
-    const drawCrosshair = () => {
-      if (!cursorCrosshair) return;
-      ctx.strokeStyle = "rgba(0,0,0,0.5)";
-      ctx.lineWidth = 0.7;
-      ctx.beginPath();
-      ctx.moveTo(cxPos - r - 1, cyPos);
-      ctx.lineTo(cxPos + r + 1, cyPos);
-      ctx.moveTo(cxPos, cyPos - r - 1);
-      ctx.lineTo(cxPos, cyPos + r + 1);
-      ctx.stroke();
-      ctx.strokeStyle = "rgba(255,255,255,0.6)";
-      ctx.lineWidth = 0.5;
-      ctx.beginPath();
-      ctx.moveTo(cxPos - r - 1, cyPos);
-      ctx.lineTo(cxPos + r + 1, cyPos);
-      ctx.moveTo(cxPos, cyPos - r - 1);
-      ctx.lineTo(cxPos, cyPos + r + 1);
-      ctx.stroke();
-    };
-
-    if (cursorType === "brush-outline" && brushSettings.tipImageData) {
-      // Render brush tip as an outline cursor
-      const img = new Image();
-      img.onload = () => {
-        ctx.clearRect(0, 0, padded, padded);
-
-        // Step 1: draw tip onto temp canvas, build alpha mask (black=opaque, white=transparent)
-        const tmpCanvas = document.createElement("canvas");
-        tmpCanvas.width = padded;
-        tmpCanvas.height = padded;
-        const tmpCtx = tmpCanvas.getContext("2d", {
-          willReadFrequently: true,
-        })!;
-        tmpCtx.drawImage(img, cxPos - r, cyPos - r, r * 2, r * 2);
-        const rawData = tmpCtx.getImageData(0, 0, padded, padded);
-
-        // Build black alpha mask
-        const maskData = tmpCtx.createImageData(padded, padded);
-        for (let i = 0; i < rawData.data.length; i += 4) {
-          const brightness =
-            (rawData.data[i] + rawData.data[i + 1] + rawData.data[i + 2]) / 3;
-          const a =
-            rawData.data[i + 3] > 0
-              ? Math.round((1 - brightness / 255) * 255)
-              : 0;
-          maskData.data[i] = 0;
-          maskData.data[i + 1] = 0;
-          maskData.data[i + 2] = 0;
-          maskData.data[i + 3] = a;
-        }
-        tmpCtx.putImageData(maskData, 0, 0);
-        const maskDataUrl = tmpCanvas.toDataURL();
-
-        // Step 2: outer black ring = expanded tip minus exact tip
-        const outerCanvas = document.createElement("canvas");
-        outerCanvas.width = padded;
-        outerCanvas.height = padded;
-        const outerCtx = outerCanvas.getContext("2d", {
-          willReadFrequently: true,
-        })!;
-        outerCtx.drawImage(
-          tmpCanvas,
-          cxPos - r - 1.5,
-          cyPos - r - 1.5,
-          (r + 1.5) * 2,
-          (r + 1.5) * 2,
-        );
-        const maskImg = new Image();
-        maskImg.onload = () => {
-          outerCtx.globalCompositeOperation = "destination-out";
-          outerCtx.drawImage(maskImg, cxPos - r, cyPos - r, r * 2, r * 2);
-          outerCtx.globalCompositeOperation = "source-over";
-
-          // Step 3: white inner ring
-          const innerCanvas = document.createElement("canvas");
-          innerCanvas.width = padded;
-          innerCanvas.height = padded;
-          const innerCtx = innerCanvas.getContext("2d", {
-            willReadFrequently: true,
-          })!;
-          const whiteMask = innerCtx.createImageData(padded, padded);
-          for (let i = 0; i < rawData.data.length; i += 4) {
-            const brightness =
-              (rawData.data[i] + rawData.data[i + 1] + rawData.data[i + 2]) / 3;
-            const a =
-              rawData.data[i + 3] > 0
-                ? Math.round((1 - brightness / 255) * 200)
-                : 0;
-            whiteMask.data[i] = 255;
-            whiteMask.data[i + 1] = 255;
-            whiteMask.data[i + 2] = 255;
-            whiteMask.data[i + 3] = a;
-          }
-          innerCtx.putImageData(whiteMask, 0, 0);
-          innerCtx.globalCompositeOperation = "destination-out";
-          innerCtx.drawImage(
-            maskImg,
-            cxPos - r + 1,
-            cyPos - r + 1,
-            (r - 1) * 2,
-            (r - 1) * 2,
-          );
-          innerCtx.globalCompositeOperation = "source-over";
-
-          // Composite both rings
-          ctx.drawImage(outerCanvas, 0, 0);
-          ctx.drawImage(innerCanvas, 0, 0);
-
-          drawCrosshair();
-          const dataUrl = offscreen.toDataURL();
-          if (containerRef.current) {
-            containerRef.current.style.cursor = `url(${dataUrl}) ${cxPos} ${cyPos}, crosshair`;
-          }
-        };
-        maskImg.src = maskDataUrl;
-      };
-      img.src = brushSettings.tipImageData;
-      return;
-    }
-
-    // Default: circle cursor
-    const radius = Math.max(1, r - 1);
-    ctx.strokeStyle = "rgba(0,0,0,0.6)";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(cxPos, cyPos, radius, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.strokeStyle = "rgba(255,255,255,0.8)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(cxPos, cyPos, radius, 0, Math.PI * 2);
-    ctx.stroke();
-    drawCrosshair();
-    const dataUrl = offscreen.toDataURL();
-    if (containerRef.current) {
-      containerRef.current.style.cursor = `url(${dataUrl}) ${cxPos} ${cyPos}, crosshair`;
-    }
-  }, [activeTool, cursorType, cursorCrosshair, brushSettings.tipImageData]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: updateBrushCursor uses refs
-  useEffect(() => {
-    updateBrushCursor();
-  }, [
-    activeTool,
-    brushSizes,
-    brushSettings.tipImageData,
-    brushSettings.softness,
-    cursorType,
-    cursorCrosshair,
-    updateBrushCursor,
-  ]);
-
-  const getCursorStyle = () => {
-    if (isPanningRef.current) return "grabbing";
-    if (zoomLocked || zoomModeRef.current) return "zoom-in";
-    if (rotateLocked || rKeyDownRef.current) return "crosshair";
-    if (spaceDownRef.current) return "grab";
-    if (activeTool === "fill") return "cell";
-    if (activeTool === "move" || activeTool === "transform")
-      return transformActiveRef.current
-        ? "default"
-        : isDraggingFloatRef.current
-          ? "grabbing"
-          : "grab";
-    if (activeTool === "lasso") return "crosshair";
-    return "crosshair";
+    scheduleComposite();
   };
 
-  const handleAddLayer = useCallback(() => {
-    // Commit any active transform before adding a new layer to avoid
-    // a blink caused by the active layer ID switching while the layer
-    // has a hole cut out and the float canvas is still pending.
-    if (transformActiveRef.current || isDraggingFloatRef.current) {
-      selectionActionsRef.current.commitFloat({ keepSelection: true });
-    }
-    const layer = newLayer();
-    setLayers((prev) => [layer, ...prev]);
-    setActiveLayerId(layer.id);
-    undoStackRef.current.push({ type: "layer-add", layer, index: 0 });
-    redoStackRef.current = [];
-    setUndoCount(undoStackRef.current.length);
-  }, []);
+  // ── Cursor system hook ────────────────────────────────────────────────────
+  const {
+    cursorType,
+    cursorCenter,
+    setCursorType,
+    setCursorCenter,
+    softwareCursorRef,
+    updateBrushCursorRef,
+    updateEyedropperCursorRef,
+    cursorBuildingRef,
+    drawBrushTipOverlay,
+    getCursorStyle,
+    sampleEyedropperColor,
+  } = useCursorSystem({
+    activeTool,
+    color,
+    brushSettings,
+    liquifySize,
+    zoomLocked,
+    rotateLocked,
+    panLocked,
+    containerRef,
+    pointerScreenPosRef,
+    isBrushSizeAdjustingRef,
+    isPanningRef,
+    spaceDownRef,
+    panLockedRef,
+    zKeyDownRef,
+    zoomLockedRef,
+    rKeyDownRef,
+    rotateLockedRef,
+    lassoModeRef,
+    liquifySizeRef,
+    brushSizesRef,
+    viewTransformRef,
+    eyedropperHoverColorRef,
+    layerCanvasesRef,
+    layerTreeRef,
+    selectedLayerIdsRef,
+    activeLayerIdRef,
+    eyedropperSampleSourceRef,
+    eyedropperSampleSizeRef,
+    displayCanvasRef,
+  });
 
-  const handleDeleteLayer = useCallback(
-    (id: string) => {
-      if (id === "layer-background") return;
-      const layerToDelete = layers.find((l) => l.id === id);
-      const indexToDelete = layers.findIndex((l) => l.id === id);
-      const lcToDelete = layerCanvasesRef.current.get(id);
-      if (layerToDelete && indexToDelete !== -1 && lcToDelete) {
-        const lcCtx = lcToDelete.getContext("2d", { willReadFrequently: true });
-        const pixelsToDelete = lcCtx
-          ? lcCtx.getImageData(0, 0, lcToDelete.width, lcToDelete.height)
-          : new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT);
-        undoStackRef.current.push({
-          type: "layer-delete",
-          layer: layerToDelete,
-          pixels: pixelsToDelete,
-          index: indexToDelete,
-        });
-        redoStackRef.current = [];
-        setUndoCount(undoStackRef.current.length);
-      }
-      setLayers((prev) => {
-        const nonBgLayers = prev.filter((l) => l.id !== "layer-background");
-        if (nonBgLayers.length <= 1) return prev;
-        return prev.filter((l) => l.id !== id);
-      });
-      setActiveLayerId((prev) => {
-        if (prev === id) {
-          const remaining = layers.filter((l) => l.id !== id);
-          return remaining[0]?.id ?? "";
-        }
-        return prev;
-      });
-      layerCanvasesRef.current.delete(id);
-      composite();
-    },
-    [layers, composite],
-  );
-
-  const handleToggleVisible = useCallback((id: string) => {
-    setLayers((prev) =>
-      prev.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)),
-    );
-  }, []);
-
-  const handleSetOpacity = useCallback((id: string, opacity: number) => {
-    setLayers((prev) => prev.map((l) => (l.id === id ? { ...l, opacity } : l)));
-  }, []);
-
-  const handleMergeLayers = useCallback(() => {
-    setLayers((prev) => {
-      const layers = prev;
-      const activeId = activeLayerIdRef.current;
-      const idx = layers.findIndex((l) => l.id === activeId);
-      if (idx <= 0) return prev; // can't merge bottom-most or bg
-      const belowLayer = layers[idx + 1];
-      if (!belowLayer || belowLayer.id === "layer-background") return prev;
-      // Draw active layer onto layer below
-      const activeLc = layerCanvasesRef.current.get(activeId);
-      const belowLc = layerCanvasesRef.current.get(belowLayer.id);
-      if (activeLc && belowLc) {
-        const bCtx = belowLc.getContext("2d", { willReadFrequently: true });
-        if (bCtx) {
-          bCtx.globalAlpha = layers[idx].opacity;
-          bCtx.globalCompositeOperation = (layers[idx].blendMode ||
-            "source-over") as GlobalCompositeOperation;
-          bCtx.drawImage(activeLc, 0, 0);
-          bCtx.globalAlpha = 1;
-          bCtx.globalCompositeOperation = "source-over";
-        }
-      }
-      // Remove active layer, make below layer active
-      const next = prev.filter((l) => l.id !== activeId);
-      setActiveLayerId(belowLayer.id);
-      return next;
-    });
-    setTimeout(() => {
-      composite();
-    }, 0);
-  }, [composite]);
-
-  const handleMergeLayersRef = useRef(handleMergeLayers);
+  // Stable ref for compositeWithStrokePreview (used from RAF callbacks)
+  const compositeWithStrokePreviewRef = useRef<
+    (
+      opacity: number,
+      tool: Tool,
+      dirty?: { minX: number; minY: number; maxX: number; maxY: number },
+    ) => void
+  >(() => {});
   useEffect(() => {
-    handleMergeLayersRef.current = handleMergeLayers;
-  }, [handleMergeLayers]);
+    compositeWithStrokePreviewRef.current = (
+      opacity: number,
+      tool: Tool,
+      dirty?: { minX: number; minY: number; maxX: number; maxY: number },
+    ) => compositeWithStrokePreview(opacity, tool, dirty);
+  }, [compositeWithStrokePreview]);
 
-  const handleToggleClippingMask = useCallback(() => {
-    const activeId = activeLayerIdRef.current;
-    setLayers((prev) =>
-      prev.map((l) =>
-        l.id === activeId ? { ...l, isClippingMask: !l.isClippingMask } : l,
-      ),
-    );
-    setTimeout(() => {
-      composite();
-    }, 0);
-  }, [composite]);
+  // ---- Layer system hook ----
+  const {
+    handleAddLayer,
+    handleDeleteLayer,
+    handleToggleVisible,
+    handleRenameLayer,
+    handleToggleAlphaLock,
+    handleSetOpacity,
+    handleMergeLayers,
+    handleMergeLayersRef,
+    handleToggleClippingMask,
+    handleToggleClippingMaskRef,
+    handleReorderLayers,
+    handleSetLayerBlendMode,
+    handleCreateGroup,
+    handleDeleteGroup,
+    // Group UI handlers — wired to LayersPanel tree UI in upcoming task
+    handleToggleGroupCollapse: _handleToggleGroupCollapse,
+    handleRenameGroup: _handleRenameGroup,
+    handleSetGroupOpacity: _handleSetGroupOpacity,
+    handleToggleGroupVisible: _handleToggleGroupVisible,
+    handleReorderTree: _handleReorderTree,
+    layerTree,
+    setLayerTree: _setLayerTree,
+    selectedLayerIds,
+    setSelectedLayerIds,
+    handleToggleLayerSelection: _handleToggleLayerSelection,
+  } = useLayerSystem({
+    layers,
+    setLayers,
+    setActiveLayerId,
+    composite,
+    setUndoCount,
+    newLayerFn: newLayer,
+    canvasWidth: canvasWidth,
+    canvasHeight: canvasHeight,
+    activeLayerIdRef,
+    layerCanvasesRef,
+    undoStackRef,
+    redoStackRef,
+    transformActiveRef,
+    isDraggingFloatRef,
+    selectionActionsRef,
+    setLayerThumbnails,
+    markLayerBitmapDirty,
+    // Pass the ref so handleToggleLayerSelection can keep it in sync synchronously.
+    // This ensures extractFloat always reads the correct selection even when called
+    // in the same event-loop tick as a layer-selection click.
+    selectedLayerIdsRef,
+  });
 
-  const handleToggleClippingMaskRef = useRef(handleToggleClippingMask);
+  // Stable refs that mirror layerTree and selectedLayerIds state for context consumers
+  // (Refs declared earlier near useTransformSystem — only sync effects here)
   useEffect(() => {
-    handleToggleClippingMaskRef.current = handleToggleClippingMask;
-  }, [handleToggleClippingMask]);
+    layerTreeRef.current = layerTree;
+  }, [layerTree]);
+  // selectedLayerIdsRef is now also updated synchronously inside handleToggleLayerSelection,
+  // but we keep this effect as a fallback for any other setSelectedLayerIds call sites
+  // (layer add, group create, undo/redo, etc.) that don't go through the toggle handler.
+  useEffect(() => {
+    selectedLayerIdsRef.current = selectedLayerIds;
+  }, [selectedLayerIds]);
+  // Keep setLayerTreeRef in sync so useHistory can call it for group undo/redo
+  useEffect(() => {
+    setLayerTreeRef.current = _setLayerTree;
+  }, [_setLayerTree]);
 
-  const handleAddMask = useCallback((id: string) => {
-    const lc = layerCanvasesRef.current.get(id);
-    if (!lc) return;
-    const maskCanvas = document.createElement("canvas");
-    maskCanvas.width = lc.width;
-    maskCanvas.height = lc.height;
-    const mCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
-    if (mCtx) {
-      mCtx.fillStyle = "white";
-      mCtx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
-    }
-    layerMaskCanvasesRef.current.set(id, maskCanvas);
-    setLayers((prev) =>
-      prev.map((l) => (l.id === id ? { ...l, hasMask: true } : l)),
-    );
-  }, []);
+  // ── usePaintingCanvasEvents: wires all keyboard/wheel/touch/pointer events ─
+  // canvasEventCallbacksRef is updated every render so event handlers always
+  // call the latest callbacks without stale-closure issues.
 
-  const handleToggleMaskActive = useCallback((id: string) => {
-    setLayers((prev) =>
-      prev.map((l) => (l.id === id ? { ...l, maskActive: !l.maskActive } : l)),
-    );
-  }, []);
+  const { handleToolChange } = useToolSwitchSystem({
+    cancelInProgressSelectionRef,
+    activeToolRef,
+    isRotatingRef,
+    rotateLockedRef,
+    updateBrushCursorRef,
+    transformActiveRef,
+    selectionActionsRef,
+    lastToolBeforeTransformRef,
+    selectionBoundaryPathRef,
+    prevToolRef,
+    layersRef,
+    lastPaintToolRef2,
+    lastPaintLayerIdRef,
+    activeLayerIdRef,
+    activeTool,
+    activeLayerId,
+    setActiveTool,
+    setZoomLocked,
+    setRotateLocked,
+    setPanLocked,
+    setActiveSubpanel,
+    setActiveLayerId,
+    handleAdjustmentsToggle,
+    collapseRulerHistory,
+  });
 
-  const handleReorderLayers = useCallback(
-    (ids: string[]) => {
-      setLayers((prev) => {
-        const map = new Map(prev.map((l) => [l.id, l]));
-        return ids.map((id) => map.get(id)!).filter(Boolean);
+  const canvasEventCallbacksRef = useRef<PaintingCanvasEventsCallbacks>(
+    {} as PaintingCanvasEventsCallbacks,
+  );
+  canvasEventCallbacksRef.current = {
+    handleUndo,
+    handleRedo,
+    pasteFloat: (img: HTMLImageElement) => {
+      const layerId = activeLayerIdRef.current;
+      const lc = layerCanvasesRef.current.get(layerId);
+      if (!lc) return;
+      const layerCtx = lc.getContext("2d", {
+        willReadFrequently: !_isIPadRef.current,
       });
-      setTimeout(() => {
-        composite();
-      }, 0);
+      if (!layerCtx) return;
+      // Snapshot BEFORE any changes — the layer content is preserved intact
+      const snapshot = layerCtx.getImageData(0, 0, lc.width, lc.height);
+      const cw = canvasWidthRef.current;
+      const ch = canvasHeightRef.current;
+      const imgW = img.naturalWidth;
+      const imgH = img.naturalHeight;
+      const drawX = Math.round((cw - imgW) / 2);
+      const drawY = Math.round((ch - imgH) / 2);
+      // Float canvas contains only the pasted image — layer is NOT cleared
+      const fc = document.createElement("canvas");
+      fc.width = cw;
+      fc.height = ch;
+      const fcCtx = fc.getContext("2d", {
+        willReadFrequently: !_isIPadRef.current,
+      })!;
+      fcCtx.drawImage(img, drawX, drawY, imgW, imgH);
+      // origCopy for scale/rotate reset
+      const origCopy = document.createElement("canvas");
+      origCopy.width = cw;
+      origCopy.height = ch;
+      origCopy
+        .getContext("2d", { willReadFrequently: !_isIPadRef.current })!
+        .drawImage(fc, 0, 0);
+      // Wire up all transform refs
+      transformPreSnapshotRef.current = snapshot;
+      // Pre-commit snapshot is the current layer state (paste composites on top)
+      transformPreCommitSnapshotRef.current = snapshot;
+      moveFloatCanvasRef.current = fc;
+      moveFloatOriginBoundsRef.current = {
+        x: drawX,
+        y: drawY,
+        w: imgW,
+        h: imgH,
+      };
+      transformOrigFloatCanvasRef.current = origCopy;
+      xfStateRef.current = {
+        x: drawX,
+        y: drawY,
+        w: imgW,
+        h: imgH,
+        rotation: 0,
+      };
+      lastToolBeforeTransformRef.current = activeTool as Tool;
+      transformActiveRef.current = true;
+      isDraggingFloatRef.current = true;
+      setIsTransformActive(true);
+      setIsDraggingFloatState(true);
+      setActiveTool("move");
+      setActiveSubpanel(null);
+      composite();
     },
-    [composite],
-  );
+    handleSaveFile,
+    handleSilentSave,
+    handleAddLayer,
+    handleDeleteLayer,
+    handleToggleVisible,
+    handleToggleAlphaLock,
+    handleMergeLayersRef,
+    handleToggleClippingMaskRef,
+    handleCreateGroup,
+    handleClear,
+    handleGrowShrink,
+    collapseRulerHistory,
+    scheduleRulerOverlay,
+    composite,
+    drawBrushTipOverlay,
+    setActiveTool,
+    setActiveSubpanel,
+    setActiveLayerId,
+    setLayers,
+    setViewTransform,
+    setIsFlipped,
+    setBrushSizes,
+    setBrushSettings,
+    setBrushBlendMode,
+    setColor,
+    setLiquifySize,
+    setLiquifyStrength,
+    setZoomLocked,
+    setRotateLocked,
+    setPanLocked,
+    setSelectionActive,
+    setRecentColors,
+    setCropRectVersion,
+    handleToolChange,
+    // Compositing / stroke helpers
+    scheduleComposite,
+    compositeWithStrokePreview,
+    buildStrokeCanvases,
+    flushStrokeBuffer,
+    strokeCommitDirty: _strokeCommitDirty,
+    getActiveSize,
+    applyTransformToDOM,
+    // History / selection
+    pushHistory,
+    snapshotSelection,
+    clearSelection,
+    rasterizeSelectionMask,
+    // Stroke engine
+    stampWebGL,
+    stampDot,
+    renderBrushSegmentAlongPoints,
+    renderSmearAlongPoints,
+    initSmudgeBuffer,
+    getSnapPosition,
+    // Fill system
+    handleFillPointerDown,
+    handleFillPointerMove,
+    handleFillPointerUp,
+    // Cursor
+    sampleEyedropperColor,
+    updateEyedropperCursorRef,
+    // Ruler handlers bundle
+    rulerHandlers: {
+      handleLineRulerPointerDown: lineRuler.handleLineRulerPointerDown,
+      handleLineRulerPointerMove: lineRuler.handleLineRulerPointerMove,
+      handleLineRulerPointerUp: lineRuler.handleLineRulerPointerUp,
+      isLineRulerDragging: lineRuler.isLineRulerDragging,
+      handle1ptRulerPointerDown: ruler1pt2pt.handle1ptRulerPointerDown,
+      handle2ptRulerPointerDown: ruler1pt2pt.handle2ptRulerPointerDown,
+      handle1pt2ptRulerPointerMove: ruler1pt2pt.handle1pt2ptRulerPointerMove,
+      handle1pt2ptRulerPointerUp: ruler1pt2pt.handle1pt2ptRulerPointerUp,
+      is1pt2ptRulerDragging: ruler1pt2pt.is1pt2ptRulerDragging,
+      handle3ptRulerPointerDown: ruler3pt5pt.handle3ptRulerPointerDown,
+      handle5ptRulerPointerDown: ruler3pt5pt.handle5ptRulerPointerDown,
+      handle3ptExclusivePointerMove: ruler3pt5pt.handle3ptExclusivePointerMove,
+      handle5ptRulerPointerMove: ruler3pt5pt.handle5ptRulerPointerMove,
+      handle3pt5ptRulerPointerUp: ruler3pt5pt.handle3pt5ptRulerPointerUp,
+      is3ptExclusiveDragging: ruler3pt5pt.is3ptExclusiveDragging,
+      is5ptDragging: ruler3pt5pt.is5ptDragging,
+      handleOvalRulerPointerDown: ellipseGridRuler.handleOvalRulerPointerDown,
+      handleGridRulerPointerDown: ellipseGridRuler.handleGridRulerPointerDown,
+      handleOvalRulerPointerMove: ellipseGridRuler.handleOvalRulerPointerMove,
+      handleGridRulerPointerMove: ellipseGridRuler.handleGridRulerPointerMove,
+      handleEllipseGridRulerPointerUp:
+        ellipseGridRuler.handleEllipseGridRulerPointerUp,
+      isOvalDragging: ellipseGridRuler.isOvalDragging,
+      isGridDragging: ellipseGridRuler.isGridDragging,
+    },
+  };
 
-  const handleSetLayerBlendMode = useCallback(
-    (id: string, blendMode: string) => {
-      const currentLayer = layers.find((l) => l.id === id);
-      if (currentLayer) {
-        const currentBlendMode = currentLayer.blendMode || "source-over";
-        undoStackRef.current.push({
-          type: "blend-mode",
-          layerId: id,
-          before: currentBlendMode,
-          after: blendMode,
-        });
-        redoStackRef.current = [];
-        setUndoCount(undoStackRef.current.length);
-      }
-      setLayers((prev) =>
-        prev.map((l) => (l.id === id ? { ...l, blendMode } : l)),
-      );
-      setTimeout(() => {
-        composite();
-      }, 0);
-    },
-    [layers, composite],
-  );
+  usePaintingCanvasEvents({
+    callbacksRef: canvasEventCallbacksRef,
+    displayCanvasRef,
+    containerRef,
+    softwareCursorRef,
+    viewTransformRef,
+    isFlippedRef,
+    spaceDownRef,
+    zoomModeRef,
+    rKeyDownRef,
+    zKeyDownRef,
+    isPanningRef,
+    panStartRef,
+    panOriginRef,
+    isRotatingRef,
+    rotOriginRef,
+    rotAngleOriginRef,
+    rotCenterRef,
+    isZoomDraggingRef,
+    zoomDragStartXRef,
+    zoomDragOriginRef,
+    zoomDragCursorStartRef,
+    zoomDragPanOriginRef,
+    rotDragCursorRef,
+    rotDragCanvasPointRef,
+    rotDragPanOriginRef,
+    applyTransformToDOMRef,
+    wheelCommitTimerRef,
+    zoomLockedRef,
+    rotateLockedRef,
+    panLockedRef,
+    altEyedropperActiveRef,
+    altSpaceModeRef,
+    prevToolRef,
+    shiftHeldRef,
+    isBrushSizeAdjustingRef,
+    brushSizeAdjustStartXRef,
+    brushSizeAdjustOriginRef,
+    brushSizeOverlayRef,
+    brushSizeOverlayStartPosRef,
+    penDownCountRef,
+    currentPointerTypeRef,
+    pointerScreenPosRef,
+    eyedropperIsPressedRef,
+    updateBrushCursorRef,
+    activeToolRef,
+    hotkeysRef,
+    isDrawingRef,
+    isCommittingRef,
+    transformActiveRef,
+    isDraggingFloatRef,
+    selectionActiveRef,
+    isDrawingSelectionRef,
+    selectionPolyClosingRef,
+    cancelInProgressSelectionRef,
+    commitInProgressLassoRef,
+    rebuildChainsNowRef,
+    selectionMaskRef,
+    selectionGeometryRef,
+    selectionBoundaryPathRef,
+    selectionShapesRef,
+    selectionActionsRef,
+    moveFloatOriginBoundsRef,
+    xfStateRef,
+    transformHandleRef,
+    transformPreSnapshotRef,
+    transformPreCommitSnapshotRef,
+    transformOrigFloatCanvasRef,
+    lastToolBeforeTransformRef,
+    isCropActiveRef,
+    cropRectRef,
+    cropPrevViewRef,
+    cropPrevToolRef,
+    layerCanvasesRef,
+    activeLayerIdRef,
+    layersRef,
+    canvasWidthRef,
+    canvasHeightRef,
+    lastPosRef,
+    strokeStartSnapshotRef,
+    strokeSnapLayerRef,
+    tailRafIdRef,
+    fileLoadInputRef,
+    liquifySizeRef,
+    liquifyStrengthRef,
+    lastPaintLayerIdRef,
+    lastPaintToolRef2,
+    opacityFirstDigitRef,
+    opacityTimerRef,
+    isIPadRef: _isIPadRef,
+    toolSizesRef,
+    toolOpacitiesRef,
+    brushSizesRef,
+    lastSingle5ptFamilyRef: ruler3pt5pt.lastSingle5ptFamilyRef,
+    lastSingle2ptFamilyRef: ruler1pt2pt.lastSingle2ptFamilyRef,
+    lastSingle3ptFamilyRef: ruler3pt5pt.lastSingle3ptFamilyRef,
+    undoStackRef,
+    redoStackRef,
+    presetsRef,
+    activeRulerPresetTypeRef,
+    fillModeRef,
+    fillSettingsRef,
+    // Lasso / selection drawing refs
+    lassoModeRef,
+    lassoIsDraggingRef,
+    lassoHasPolyPointsRef,
+    lassoStrokeStartRef,
+    lassoLastTapTimeRef,
+    lassoLastTapPosRef,
+    lassoFreeLastPtRef,
+    selectionDraftBoundsRef,
+    selectionDraftPointsRef,
+    selectionDraftCursorRef,
+    selectionBeforeRef,
+    marchingAntsRafRef,
+    drawAntsRef,
+    wandToleranceRef,
+    wandContiguousRef,
+    wandGrowShrinkRef,
+    // Transform / float refs
+    moveFloatCanvasRef,
+    floatDragStartRef,
+    transformActionsRef,
+    // Fill refs
+    isGradientDraggingRef,
+    isLassoFillDrawingRef,
+    // Crop ref
+    cropDragRef,
+    // Stroke engine refs
+    strokeSnapshotPendingRef,
+    strokeDirtyRectRef,
+    strokeStampsPlacedRef,
+    strokeSnapOriginRef,
+    strokeSnapDirRef,
+    strokeHvAxisRef,
+    strokeHvPivotRef,
+    gridSnapLineRef,
+    strokeWarmRawDistRef,
+    smoothedPressureRef,
+    prevPrimaryPressureRef,
+    rawStylusPosRef,
+    stabBrushPosRef,
+    smoothBufferRef,
+    elasticPosRef,
+    elasticVelRef,
+    elasticRawPrevRef,
+    lastCompositeOpacityRef,
+    strokeCommitOpacityRef,
+    flushDisplayCapRef,
+    strokePreviewRafRef,
+    strokePreviewPendingWorkRef,
+    universalPressureCurveRef,
+    brushSettingsRef,
+    brushOpacityRef,
+    colorRef,
+    colorFillStyleRef,
+    webglBrushRef,
+    strokeBufferRef,
+    tailDoCommitRef,
+    smearRafRef,
+    smearDirtyRef,
+    distAccumRef,
+    // Layer tree
+    layerTreeRef,
+    selectedLayerIdsRef,
+    // Liquify refs
+    liquifyBeforeSnapshotRef,
+    liquifyMultiBeforeSnapshotsRef,
+    liquifyHoldIntervalRef,
+    liquifyScopeRef,
+    // Thumbnail debounce
+    thumbDebounceRef,
+    thumbDebounceLcRef,
+    thumbDebounceLayerIdRef,
+    // Compositing
+    compositeWithStrokePreviewRef,
+    // Eyedropper
+    eyedropperHoverColorRef,
+    // Cursor building guard
+    cursorBuildingRef,
+    // Ruler edit history depth
+    rulerEditHistoryDepthRef,
+    // Brush blend mode (for toggleClearBlendMode hotkey)
+    brushBlendModeRef,
+    prevBrushBlendModeRef,
+  });
 
   const handleZoomLockToggle = useCallback(() => {
     setZoomLocked((prev) => {
-      if (!prev) setRotateLocked(false);
+      if (!prev) {
+        setRotateLocked(false);
+        setPanLocked(false);
+      }
       return !prev;
     });
   }, []);
 
   const handleRotateLockToggle = useCallback(() => {
     setRotateLocked((prev) => {
-      if (!prev) setZoomLocked(false);
+      if (!prev) {
+        setZoomLocked(false);
+        setPanLocked(false);
+      }
       return !prev;
     });
+  }, []);
+
+  const handlePanLockToggle = useCallback(() => {
+    setPanLocked((prev) => {
+      if (!prev) {
+        setZoomLocked(false);
+        setRotateLocked(false);
+      }
+      return !prev;
+    });
+  }, []);
+
+  const handleFlipToggle = useCallback(() => {
+    setIsFlipped((f) => !f);
+  }, []);
+
+  const handleAdminOpen = useCallback(() => {
+    setSettingsOpen(true);
+  }, []);
+
+  const handleToolReselect = useCallback((tool: Tool) => {
+    // Always keep subpanel open — no toggling
+    if (tool === "brush" || tool === "smudge" || tool === "eraser") {
+      setActiveSubpanel(tool as "brush" | "smudge" | "eraser");
+    } else if (tool === "lasso") {
+      setActiveSubpanel("lasso");
+    } else if (tool === "fill") {
+      setActiveSubpanel("fill");
+    } else if (tool === "ruler") {
+      setActiveSubpanel("ruler");
+    } else if (tool === "eyedropper") {
+      setActiveSubpanel("eyedropper" as never);
+    }
   }, []);
 
   const { panX, panY, zoom, rotation } = viewTransform;
@@ -6281,803 +3402,825 @@ export function PaintingApp() {
   const currentBrushSize =
     activeTool === "eraser" ? brushSizes.eraser : brushSizes.brush;
 
-  return (
-    <div
-      className="flex bg-background overflow-hidden select-none"
-      style={{
-        height: "100dvh",
-        width: "100dvw",
-        paddingLeft: "env(safe-area-inset-left)",
-        paddingRight: "env(safe-area-inset-right)",
-        paddingTop: "env(safe-area-inset-top)",
-      }}
-    >
-      {/* Left toolbar */}
-      <Toolbar
-        activeTool={activeTool}
-        activeSubpanel={activeSubpanel}
-        activeLassoMode={lassoMode}
-        onToolChange={(tool) => {
-          // Commit transform if switching away
-          if (transformActiveRef.current && tool !== "move") {
-            selectionActionsRef.current.commitFloat({ keepSelection: true });
-          }
-          if (tool === "adjustments") {
-            // Don't change activeTool — just show adjustments panel
-            preAdjustmentSubpanelRef.current = activeSubpanelRef.current as
-              | string
-              | null;
-            setActiveSubpanel((prev) =>
-              prev === "adjustments"
-                ? (preAdjustmentSubpanelRef.current as Tool | null)
-                : "adjustments",
-            );
-            return;
-          }
-          setActiveTool(tool);
-          if (tool === "brush" || tool === "smear" || tool === "eraser") {
-            setActiveSubpanel(tool as "brush" | "smear" | "eraser");
-          } else if (tool === "lasso") {
-            setActiveSubpanel("lasso");
-          } else if (tool === "fill") {
-            setActiveSubpanel("fill");
-          } else {
-            setActiveSubpanel(null);
-          }
-        }}
-        onToolReselect={(tool) => {
-          if (tool === "brush" || tool === "smear" || tool === "eraser") {
-            setActiveSubpanel((prev) => (prev === tool ? null : tool));
-          } else if (tool === "lasso") {
-            // Toggle lasso presets panel
-            setActiveSubpanel((prev) => (prev === "lasso" ? null : "lasso"));
-          }
-        }}
-        zoomLocked={zoomLocked}
-        rotateLocked={rotateLocked}
-        isFlipped={isFlipped}
-        onZoomLockToggle={handleZoomLockToggle}
-        onRotateLockToggle={handleRotateLockToggle}
-        onFlipToggle={() => setIsFlipped((f) => !f)}
-        onAdminOpen={() => setSettingsOpen(true)}
-      />
+  // ---- CanvasArea callbacks ----
+  // handleCropHandlePointerDown is now from useCropSystem above.
 
-      {/* Left sidebar: Color Panel + Tool Presets — always visible, collapsible */}
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
+  const handleCanvasDoubleClick = useCallback(
+    (_evDbl: React.MouseEvent<HTMLCanvasElement>) => {
+      if (
+        activeToolRef.current === "lasso" &&
+        isDrawingSelectionRef.current &&
+        lassoModeRef.current !== "rect" &&
+        lassoModeRef.current !== "ellipse" &&
+        lassoModeRef.current !== "wand"
+      ) {
+        const pts = selectionDraftPointsRef.current;
+        if (pts.length > 2) {
+          selectionGeometryRef.current = {
+            type: "free",
+            points: [...pts],
+          };
+          selectionShapesRef.current = [
+            { type: "free" as LassoMode, points: [...pts] },
+          ];
+          selectionBoundaryPathRef.current.dirty = true;
+          rasterizeSelectionMask();
+          setSelectionActive(true);
+          const afterSnap = snapshotSelection();
+          pushHistory({
+            type: "selection",
+            before: selectionBeforeRef.current ?? afterSnap,
+            after: afterSnap,
+          });
+          selectionBeforeRef.current = null;
+        } else {
+          clearSelection();
+        }
+        selectionDraftPointsRef.current = [];
+        selectionDraftCursorRef.current = null;
+        isDrawingSelectionRef.current = false;
+        lassoHasPolyPointsRef.current = false;
+        lassoIsDraggingRef.current = false;
+        lassoStrokeStartRef.current = null;
+      }
+    },
+    [],
+  );
+
+  // Preset callbacks (handleSelectPreset, handleUpdatePreset, handleAddPreset,
+  // handleDeletePreset, handleActivatePreset, handleReorderPresets,
+  // handleSaveCurrentToPreset) are now provided by usePresetSystem above.
+
+  const handleSelectLassoMode = useCallback((mode: LassoMode) => {
+    setLassoMode(mode);
+  }, []);
+
+  const handleSelectFillMode = useCallback(
+    (mode: FillMode) => {
+      setFillMode(mode);
+    },
+    [setFillMode],
+  );
+
+  const handleFillSettingsChange = useCallback(
+    (settings: FillSettings) => {
+      setFillSettings(settings);
+    },
+    [setFillSettings],
+  );
+
+  // handleCanvasBrushSizeChange, handleCanvasBrushOpacityChange, handleCanvasBrushFlowChange
+  // are now provided by usePresetSystem above.
+
+  // Ruler UI handlers are now provided by useRulerUIHandlers below.
+  const {
+    handleRulerPresetTypeChangeForCanvas,
+    handleRulerColorChangeForCanvas,
+    handleVp1ColorChangeForCanvas,
+    handleVp2ColorChangeForCanvas,
+    handleVp3ColorChangeForCanvas,
+    handleRulerWarmupDistChangeForCanvas,
+    handleLineSnapModeChangeForCanvas,
+    handleLockFocalLengthChangeForCanvas,
+    handleOvalSnapModeChangeForCanvas,
+    handleFivePtEnableCenterChangeForCanvas,
+    handleFivePtEnableLRChangeForCanvas,
+    handleFivePtEnableUDChangeForCanvas,
+    handleGridResetForCanvas,
+    handleGridModeChangeForCanvas,
+    handleGridVertSegmentsChangeForCanvas,
+    handleGridHorizSegmentsChangeForCanvas,
+    handleFivePtCenterColorChangeForCanvas,
+    handleFivePtLRColorChangeForCanvas,
+    handleFivePtUDColorChangeForCanvas,
+    handleSelectionOverlayCanvasRef,
+    handleRulerCanvasRef,
+  } = useRulerUIHandlers({
+    setLayers,
+    layersRef,
+    setActiveRulerPresetType,
+    activeRulerPresetTypeRef,
+    canvasWidthRef,
+    canvasHeightRef,
+    selectionOverlayCanvasRef,
+    rulerCanvasRef,
+    scheduleRulerOverlay,
+  });
+
+  return (
+    <PaintingContextProvider
+      canvasWidth={canvasWidth}
+      canvasHeight={canvasHeight}
+      canvasWidthRef={canvasWidthRef}
+      canvasHeightRef={canvasHeightRef}
+      layerCanvasesRef={layerCanvasesRef}
+      activeLayerIdRef={activeLayerIdRef}
+      layersRef={layersRef}
+      pendingLayerPixelsRef={pendingLayerPixelsRef}
+      undoStackRef={undoStackRef}
+      redoStackRef={redoStackRef}
+      selectionActiveRef={selectionActiveRef}
+      selectionMaskRef={selectionMaskRef}
+      selectionGeometryRef={selectionGeometryRef}
+      selectionBoundaryPathRef={selectionBoundaryPathRef}
+      selectionShapesRef={selectionShapesRef}
+      selectionActionsRef={selectionActionsRef}
+      selectionOverlayCanvasRef={selectionOverlayCanvasRef}
+      transformActiveRef={transformActiveRef}
+      isDraggingFloatRef={isDraggingFloatRef}
+      moveFloatCanvasRef={moveFloatCanvasRef}
+      xfStateRef={xfStateRef}
+      compositeRef={compositeRef}
+      updateNavigatorCanvasRef={updateNavigatorCanvasRef}
+      rebuildChainsNowRef={rebuildChainsNowRef}
+      setLayerThumbnails={setLayerThumbnails}
+      setActiveTool={setActiveTool}
+      setActiveLayerId={setActiveLayerId}
+      setLayers={setLayers}
+      setUndoCount={setUndoCount}
+      setRedoCount={setRedoCount}
+      markLayerBitmapDirty={markLayerBitmapDirty}
+      invalidateAllLayerBitmaps={invalidateAllLayerBitmaps}
+      layerTreeRef={layerTreeRef}
+      selectedLayerIdsRef={selectedLayerIdsRef}
+      setSelectedLayerIds={setSelectedLayerIds}
+    >
       <div
-        className="flex border-r border-border bg-card overflow-hidden relative"
+        className="flex flex-col bg-background overflow-hidden select-none"
         style={{
-          width: leftSidebarCollapsed ? 16 : leftSidebarWidth,
-          minWidth: leftSidebarCollapsed ? 16 : 160,
-          maxWidth: leftSidebarCollapsed ? 16 : 380,
-          transition: "width 0.15s ease, min-width 0.15s ease",
-          flexShrink: 0,
+          height: "100dvh",
+          width: "100dvw",
+          paddingLeft: "env(safe-area-inset-left)",
+          paddingRight: "env(safe-area-inset-right)",
+          paddingTop: "env(safe-area-inset-top)",
         }}
       >
-        {/* Left sidebar resize handle (right edge) */}
-        {!leftSidebarCollapsed && (
+        {/* WebGL1 fallback warning banner */}
+        <WebGL1WarningBanner
+          visible={webGLFallbackWarning}
+          onDismiss={() => setWebGLFallbackWarning(false)}
+        />
+        <div className="flex flex-1 overflow-hidden">
+          <ToolbarArea
+            activeTool={activeTool}
+            activeSubpanel={activeSubpanel}
+            activeLassoMode={lassoMode}
+            onToolChange={handleToolChange}
+            onToolReselect={handleToolReselect}
+            zoomLocked={zoomLocked}
+            rotateLocked={rotateLocked}
+            panLocked={panLocked}
+            isFlipped={isFlipped}
+            onZoomLockToggle={handleZoomLockToggle}
+            onRotateLockToggle={handleRotateLockToggle}
+            onPanLockToggle={handlePanLockToggle}
+            onFlipToggle={handleFlipToggle}
+            onAdminOpen={handleAdminOpen}
+            onSaveFile={handleSaveFile}
+            onOpenFile={() => fileLoadInputRef.current?.click()}
+            hasUnsavedChanges={hasUnsavedChanges}
+            isMobile={isMobile}
+            leftHanded={leftHanded}
+            fileLoadInputRef={fileLoadInputRef}
+            onFileLoad={handleLoadFile}
+          />
+          {/* Left sidebar: Color Panel + Tool Presets — desktop only; mobile uses floating panels */}
+          {!isMobile && (
+            <LeftSidebarArea
+              leftSidebarCollapsed={leftSidebarCollapsed}
+              setLeftSidebarCollapsed={setLeftSidebarCollapsed}
+              leftSidebarWidth={leftSidebarWidth}
+              setLeftSidebarWidth={setLeftSidebarWidth}
+              activeTool={activeTool}
+              color={color}
+              setColor={setColor}
+              recentColors={recentColors}
+              onRecentColorClick={handleRecentColorClick}
+              activeSubpanel={activeSubpanel}
+              setActiveSubpanel={setActiveSubpanel}
+              presets={presets}
+              activePresetIds={activePresetIds}
+              brushSettings={brushSettings}
+              currentBrushSize={currentBrushSize}
+              onSelectPreset={handleSelectPreset}
+              onUpdatePreset={handleUpdatePreset}
+              onAddPreset={handleAddPreset}
+              onDeletePreset={handleDeletePreset}
+              onActivatePreset={handleActivatePreset}
+              onReorderPresets={handleReorderPresets}
+              onSaveCurrentToPreset={handleSaveCurrentToPreset}
+              lassoMode={lassoMode}
+              onSelectLassoMode={handleSelectLassoMode}
+              wandTolerance={wandTolerance}
+              wandContiguous={wandContiguous}
+              wandGrowShrink={wandGrowShrink}
+              onWandToleranceChange={setWandTolerance}
+              onWandContiguousChange={setWandContiguous}
+              onWandGrowShrinkChange={setWandGrowShrink}
+              activeLayerId={activeLayerId}
+              layers={layers}
+              layerCanvasesRef={layerCanvasesRef}
+              selectionMaskRef={selectionMaskRef}
+              selectionActive={selectionActive}
+              onAdjustmentsPushUndo={onAdjustmentsPushUndo}
+              onAdjustmentsPreview={onAdjustmentsPreview}
+              onAdjustmentsComposite={onAdjustmentsComposite}
+              onAdjustmentsThumbnailUpdate={onAdjustmentsThumbnailUpdate}
+              onAdjustmentsMarkLayerDirty={onAdjustmentsMarkLayerDirty}
+              fillMode={fillMode}
+              fillSettings={fillSettings}
+              onSelectFillMode={handleSelectFillMode}
+              onFillSettingsChange={handleFillSettingsChange}
+              activeRulerPresetType={activeRulerPresetType}
+              onRulerPresetTypeChange={handleRulerPresetTypeChangeForCanvas}
+              onRulerColorChange={handleRulerColorChangeForCanvas}
+              onVp1ColorChange={handleVp1ColorChangeForCanvas}
+              onVp2ColorChange={handleVp2ColorChangeForCanvas}
+              onVp3ColorChange={handleVp3ColorChangeForCanvas}
+              onRulerWarmupDistChange={handleRulerWarmupDistChangeForCanvas}
+              onLineSnapModeChange={handleLineSnapModeChangeForCanvas}
+              onLockFocalLengthChange={handleLockFocalLengthChangeForCanvas}
+              onOvalSnapModeChange={handleOvalSnapModeChangeForCanvas}
+              onGridModeChange={handleGridModeChangeForCanvas}
+              onGridVertSegmentsChange={handleGridVertSegmentsChangeForCanvas}
+              onGridHorizSegmentsChange={handleGridHorizSegmentsChangeForCanvas}
+              onFivePtCenterColorChange={handleFivePtCenterColorChangeForCanvas}
+              onFivePtLRColorChange={handleFivePtLRColorChangeForCanvas}
+              onFivePtUDColorChange={handleFivePtUDColorChangeForCanvas}
+              onFivePtEnableCenterChange={
+                handleFivePtEnableCenterChangeForCanvas
+              }
+              onFivePtEnableLRChange={handleFivePtEnableLRChangeForCanvas}
+              onFivePtEnableUDChange={handleFivePtEnableUDChangeForCanvas}
+              onGridReset={handleGridResetForCanvas}
+              eyedropperSampleSource={eyedropperSampleSource}
+              setEyedropperSampleSource={setEyedropperSampleSource}
+              eyedropperSampleSize={eyedropperSampleSize}
+              setEyedropperSampleSize={setEyedropperSampleSize}
+            />
+          )}{" "}
+          {/* end mobile/desktop conditional for left sidebar */}
+          {/* Hidden layer canvases */}
           <div
             style={{
               position: "absolute",
-              right: 0,
-              top: 0,
-              bottom: 0,
-              width: 4,
-              cursor: "col-resize",
-              zIndex: 10,
+              left: -9999,
+              top: -9999,
+              pointerEvents: "none",
             }}
-            onPointerDown={(e) => {
-              e.preventDefault();
-              const startX = e.clientX;
-              const startW = leftSidebarWidth;
-              const onMove = (me: PointerEvent) => {
-                const delta = me.clientX - startX;
-                setLeftSidebarWidth(
-                  Math.min(380, Math.max(160, startW + delta)),
-                );
-              };
-              const onUp = () => {
-                window.removeEventListener("pointermove", onMove);
-                window.removeEventListener("pointerup", onUp);
-              };
-              window.addEventListener("pointermove", onMove);
-              window.addEventListener("pointerup", onUp);
-            }}
-          />
-        )}
-        {!leftSidebarCollapsed && (
-          <div className="flex flex-col flex-1 overflow-hidden">
-            {/* Color Picker Panel */}
-            <div onPointerDown={(e) => e.stopPropagation()}>
-              <ColorPickerPanel
-                color={color}
-                onColorChange={setColor}
-                recentColors={recentColors}
-                onRecentColorClick={handleRecentColorClick}
+          >
+            {layers.map((layer) => (
+              <canvas
+                key={layer.id}
+                ref={(el) => {
+                  if (el) layerCanvasesRef.current.set(layer.id, el);
+                  else layerCanvasesRef.current.delete(layer.id);
+                }}
               />
-            </div>
+            ))}
+          </div>
+          {/* Canvas + top bar */}
+          <div className="flex flex-col flex-1 min-w-0">
+            <BottomBar
+              brushSize={currentBrushSize}
+              brushOpacity={color.a}
+              brushFlow={brushSettings.flow ?? 1}
+              brushBlendMode={brushBlendMode}
+              activeTool={activeTool}
+              onBrushSizeChange={(v) => {
+                const key = activeTool === "eraser" ? "eraser" : "brush";
+                setBrushSizes((prev) => ({ ...prev, [key]: v }));
+                toolSizesRef.current = {
+                  ...toolSizesRef.current,
+                  [activeTool]: v,
+                };
+              }}
+              onBrushOpacityChange={(v) => {
+                setColor((prev) => ({ ...prev, a: v }));
+                toolOpacitiesRef.current = {
+                  ...toolOpacitiesRef.current,
+                  [activeTool]: v,
+                };
+              }}
+              onBrushFlowChange={(v) => {
+                setBrushSettings((prev) => ({ ...prev, flow: v }));
+                toolFlowsRef.current = {
+                  ...toolFlowsRef.current,
+                  [activeTool]: v,
+                };
+              }}
+              onBrushBlendModeChange={setBrushBlendMode}
+              smudgeStrength={brushSettings.smearStrength ?? 0.8}
+              onSmudgeStrengthChange={(v) =>
+                setBrushSettings((prev) => ({ ...prev, smearStrength: v }))
+              }
+              canUndo={
+                undoCount > 0 && !isTransformActive && !isDrawingRef.current
+              }
+              canRedo={
+                redoCount > 0 && !isTransformActive && !isDrawingRef.current
+              }
+              onUndo={() => {
+                if (isDrawingRef.current || isCommittingRef.current) return;
+                if (transformActiveRef.current) {
+                  toast.warning(
+                    "Commit or cancel the transform before undoing",
+                  );
+                  return;
+                }
+                handleUndo();
+              }}
+              onRedo={() => {
+                if (isDrawingRef.current || isCommittingRef.current) return;
+                if (transformActiveRef.current) {
+                  toast.warning(
+                    "Commit or cancel the transform before redoing",
+                  );
+                  return;
+                }
+                handleRedo();
+              }}
+              onClear={handleClear}
+              onExport={handleExport}
+              onSave={handleSave}
+              eyedropperSampleSource={eyedropperSampleSource}
+              eyedropperSampleSize={eyedropperSampleSize}
+              onEyedropperSampleSourceChange={setEyedropperSampleSource}
+              onEyedropperSampleSizeChange={setEyedropperSampleSize}
+              isCropActive={isCropActive}
+              onCropConfirm={commitCrop}
+              onCropCancel={handleCropCancel}
+              hasSelection={selectionActive}
+              isTransformActive={isTransformActive}
+              onGrowSelection={() => handleGrowShrink(1)}
+              onShrinkSelection={() => handleGrowShrink(-1)}
+              onClearSelection={() =>
+                selectionActionsRef.current.deleteSelection()
+              }
+              onCopyToNewLayer={() =>
+                selectionActionsRef.current.cutOrCopyToLayer(false)
+              }
+              onCutToNewLayer={() =>
+                selectionActionsRef.current.cutOrCopyToLayer(true)
+              }
+              onDeselect={() => {
+                selectionActionsRef.current.commitFloat();
+                selectionActionsRef.current.clearSelection();
+              }}
+              onTransformCommit={() =>
+                selectionActionsRef.current.commitFloat({ keepSelection: true })
+              }
+              onTransformCancel={() =>
+                selectionActionsRef.current.revertTransform()
+              }
+              onTransformReset={() =>
+                selectionActionsRef.current.revertTransform()
+              }
+              activeRuler={layers.find((l) => l.isRuler) ?? null}
+              onResetCurrentRuler={handleResetCurrentRuler}
+              onClearAllRulers={handleClearAllRulers}
+              onUpdateRulerLayer={(updates) => {
+                setLayers((prev) =>
+                  prev.map((l) => (l.isRuler ? { ...l, ...updates } : l)),
+                );
+                layersRef.current = layersRef.current.map((l) =>
+                  l.isRuler ? { ...l, ...updates } : l,
+                );
+              }}
+              onSetLastSingle5ptFamily={(v) => {
+                ruler3pt5pt.lastSingle5ptFamilyRef.current = v;
+              }}
+              onSetLastSingle2ptFamily={(v) => {
+                ruler1pt2pt.lastSingle2ptFamilyRef.current = v;
+              }}
+              onSetLastSingle3ptFamily={(v) => {
+                ruler3pt5pt.lastSingle3ptFamilyRef.current = v;
+              }}
+              liquifySize={liquifySize}
+              liquifyStrength={liquifyStrength}
+              liquifyScope={liquifyScope}
+              onLiquifySizeChange={setLiquifySize}
+              onLiquifyStrengthChange={setLiquifyStrength}
+              onLiquifyScopeChange={setLiquifyScope}
+              isMobile={isMobile}
+            />
+            <CanvasArea
+              containerRef={containerRef}
+              displayCanvasRef={displayCanvasRef}
+              selectionOverlayCanvasRef={selectionOverlayCanvasRef}
+              rulerCanvasRef={rulerCanvasRef}
+              canvasWrapperRef={canvasWrapperRef}
+              canvasWidthRef={canvasWidthRef}
+              canvasHeightRef={canvasHeightRef}
+              cropRectRef={cropRectRef}
+              toolSizesRef={toolSizesRef}
+              toolOpacitiesRef={toolOpacitiesRef}
+              toolFlowsRef={toolFlowsRef}
+              canvasWidth={canvasWidth}
+              canvasHeight={canvasHeight}
+              viewTransform={viewTransform}
+              isFlipped={isFlipped}
+              isDefaultTransform={isDefaultTransform}
+              zoom={zoom}
+              rotation={rotation}
+              activeTool={activeTool}
+              activeSubpanel={
+                activeSubpanel as
+                  | "brush"
+                  | "smudge"
+                  | "eraser"
+                  | "lasso"
+                  | "fill"
+                  | "ruler"
+                  | "eyedropper"
+                  | "rotate"
+                  | null
+              }
+              currentBrushSize={currentBrushSize}
+              color={color}
+              brushSettings={brushSettings}
+              lassoMode={lassoMode}
+              fillMode={fillMode}
+              fillSettings={fillSettings}
+              activeRulerPresetType={activeRulerPresetType}
+              presets={presets}
+              activePresetIds={activePresetIds}
+              layers={layers}
+              scheduleRulerOverlay={scheduleRulerOverlay}
+              isCropActive={isCropActive}
+              cropRectVersion={cropRectVersion}
+              isMobile={isMobile}
+              leftHanded={leftHanded}
+              showMobileColorPanel={showMobileColorPanel}
+              showMobilePresetsPanel={showMobilePresetsPanel}
+              recentColors={recentColors}
+              wandTolerance={wandTolerance}
+              wandContiguous={wandContiguous}
+              wandGrowShrink={wandGrowShrink}
+              cursor={getCursorStyle()}
+              onSetShowMobileColorPanel={setShowMobileColorPanel}
+              onSetShowMobilePresetsPanel={setShowMobilePresetsPanel}
+              onSetRightSidebarCollapsed={setRightSidebarCollapsed}
+              onRecentColorClick={handleRecentColorClick}
+              onColorChange={setColor}
+              onBrushSizeChange={handleCanvasBrushSizeChange}
+              onBrushOpacityChange={handleCanvasBrushOpacityChange}
+              onBrushFlowChange={handleCanvasBrushFlowChange}
+              onSelectPreset={handleSelectPreset}
+              onUpdatePreset={handleUpdatePreset}
+              onAddPreset={handleAddPreset}
+              onDeletePreset={handleDeletePreset}
+              onActivatePreset={handleActivatePreset}
+              onReorderPresets={handleReorderPresets}
+              onSaveCurrentToPreset={handleSaveCurrentToPreset}
+              onSelectLassoMode={handleSelectLassoMode}
+              onCloseMobilePresetsPanel={() => setShowMobilePresetsPanel(false)}
+              onWandToleranceChange={setWandTolerance}
+              onWandContiguousChange={setWandContiguous}
+              onWandGrowShrinkChange={setWandGrowShrink}
+              onSelectFillMode={handleSelectFillMode}
+              onFillSettingsChange={handleFillSettingsChange}
+              onRulerPresetTypeChange={handleRulerPresetTypeChangeForCanvas}
+              onRulerColorChange={handleRulerColorChangeForCanvas}
+              onVp1ColorChange={handleVp1ColorChangeForCanvas}
+              onVp2ColorChange={handleVp2ColorChangeForCanvas}
+              onVp3ColorChange={handleVp3ColorChangeForCanvas}
+              onRulerWarmupDistChange={handleRulerWarmupDistChangeForCanvas}
+              onLineSnapModeChange={handleLineSnapModeChangeForCanvas}
+              onLockFocalLengthChange={handleLockFocalLengthChangeForCanvas}
+              onOvalSnapModeChange={handleOvalSnapModeChangeForCanvas}
+              onFivePtEnableCenterChange={
+                handleFivePtEnableCenterChangeForCanvas
+              }
+              onFivePtEnableLRChange={handleFivePtEnableLRChangeForCanvas}
+              onFivePtEnableUDChange={handleFivePtEnableUDChangeForCanvas}
+              onGridReset={handleGridResetForCanvas}
+              onCropHandlePointerDown={handleCropHandlePointerDown}
+              onResetView={resetView}
+              onCanvasDoubleClick={handleCanvasDoubleClick}
+              onSelectionOverlayCanvasRef={handleSelectionOverlayCanvasRef}
+              onRulerCanvasRef={handleRulerCanvasRef}
+            />
+          </div>
+          {/* Right panel: Navigator + Layers */}
+          {/* On mobile: hidden when collapsed (button in canvas overlay handles toggle) */}
+          {(!isMobile || !rightSidebarCollapsed) && (
+            <RightSidebarArea
+              isMobile={isMobile}
+              rightSidebarCollapsed={rightSidebarCollapsed}
+              rightPanelWidth={rightPanelWidth}
+              setRightPanelWidth={setRightPanelWidth}
+              setRightSidebarCollapsed={setRightSidebarCollapsed}
+              viewTransform={viewTransform}
+              onSetTransform={(t) => {
+                setViewTransform(t);
+                applyTransformToDOM(t);
+              }}
+              canvasWidth={canvasWidth}
+              canvasHeight={canvasHeight}
+              thumbnailCanvas={navigatorCanvasRef.current}
+              thumbnailVersion={navigatorVersion}
+              isFlipped={isFlipped}
+              layers={layers}
+              layerTree={layerTree}
+              activeLayerId={activeLayerId}
+              selectedLayerIds={selectedLayerIds}
+              layerThumbnails={layerThumbnails}
+              onSetActive={(id) => {
+                const clickedLayer = layersRef.current.find((l) => l.id === id);
 
-            {/* Divider */}
-            <div className="border-t border-border" />
+                // If a move/transform is in progress, commit it to history before switching layers
+                const wasTransformActive =
+                  transformActiveRef.current || isDraggingFloatRef.current;
+                if (wasTransformActive && !clickedLayer?.isRuler) {
+                  selectionActionsRef.current.commitFloat({
+                    keepSelection: false,
+                  });
+                }
 
-            {/* Tool Presets Panel */}
-            <div className="flex-1 overflow-hidden">
-              {activeSubpanel === "brush" ||
-              activeSubpanel === "smear" ||
-              activeSubpanel === "eraser" ? (
-                <ToolPresetsPanel
-                  tool={activeSubpanel}
-                  availableTips={(() => {
-                    const seen = new Set<string>();
-                    const tips: {
-                      id: string;
-                      name: string;
-                      tipImageData?: string;
-                    }[] = [];
-                    for (const toolType of [
-                      "brush",
-                      "smear",
-                      "eraser",
-                    ] as const) {
-                      for (const preset of presets[toolType]) {
-                        const key =
-                          preset.settings.tipImageData ??
-                          `__no-tip-${preset.id}`;
-                        if (!seen.has(key)) {
-                          seen.add(key);
-                          tips.push({
-                            id: preset.id,
-                            name: preset.name,
-                            tipImageData: preset.settings.tipImageData,
-                          });
+                if (clickedLayer?.isRuler) {
+                  // Switch to ruler tool when clicking a ruler layer
+                  lastPaintToolRef2.current =
+                    activeToolRef.current !== "ruler"
+                      ? activeToolRef.current
+                      : lastPaintToolRef2.current;
+                  lastPaintLayerIdRef.current =
+                    activeLayerIdRef.current !== id
+                      ? activeLayerIdRef.current
+                      : lastPaintLayerIdRef.current;
+                  // Sync active preset type from the ruler layer
+                  const presetType = (clickedLayer.rulerPresetType ??
+                    "perspective-1pt") as RulerPresetType;
+                  setActiveRulerPresetType(presetType);
+                  activeRulerPresetTypeRef.current = presetType;
+                  setActiveTool("ruler");
+                  setActiveSubpanel("ruler");
+                } else if (activeToolRef.current === "ruler") {
+                  // Switching away from ruler layer: restore paint tool
+                  collapseRulerHistory();
+                  const tool = lastPaintToolRef2.current;
+                  setActiveTool(tool);
+                  if (
+                    tool === "brush" ||
+                    tool === "smudge" ||
+                    tool === "eraser"
+                  ) {
+                    setActiveSubpanel(tool);
+                  } else {
+                    setActiveSubpanel(null);
+                  }
+                }
+                setActiveLayerId(id);
+                activeLayerIdRef.current = id;
+                if (!clickedLayer?.isRuler) {
+                  lastPaintLayerIdRef.current = id;
+                }
+
+                // If a transform was active, begin a new transform on the newly selected layer
+                if (
+                  wasTransformActive &&
+                  !clickedLayer?.isRuler &&
+                  activeToolRef.current === "move"
+                ) {
+                  const newLayerId = id;
+                  const lc = layerCanvasesRef.current.get(newLayerId);
+                  if (lc) {
+                    const ctx = lc.getContext("2d", {
+                      willReadFrequently: !isIPad,
+                    });
+                    if (ctx) {
+                      const imageData = ctx.getImageData(
+                        0,
+                        0,
+                        lc.width,
+                        lc.height,
+                      );
+                      const { data, width, height } = imageData;
+                      let minX = width;
+                      let minY = height;
+                      let maxX = -1;
+                      let maxY = -1;
+                      for (let y = 0; y < height; y++) {
+                        for (let x = 0; x < width; x++) {
+                          const a = data[(y * width + x) * 4 + 3];
+                          if (a > 0) {
+                            if (x < minX) minX = x;
+                            if (x > maxX) maxX = x;
+                            if (y < minY) minY = y;
+                            if (y > maxY) maxY = y;
+                          }
                         }
                       }
+                      if (maxX >= minX && maxY >= minY) {
+                        const maskCanvas = document.createElement("canvas");
+                        maskCanvas.width = canvasWidthRef.current;
+                        maskCanvas.height = canvasHeightRef.current;
+                        const mCtx = maskCanvas.getContext("2d")!;
+                        mCtx.fillStyle = "white";
+                        mCtx.fillRect(
+                          minX,
+                          minY,
+                          maxX - minX + 1,
+                          maxY - minY + 1,
+                        );
+                        selectionMaskRef.current = maskCanvas;
+                        selectionGeometryRef.current = {
+                          type: "rect" as const,
+                          x: minX,
+                          y: minY,
+                          w: maxX - minX + 1,
+                          h: maxY - minY + 1,
+                        };
+                        selectionShapesRef.current = [
+                          selectionGeometryRef.current,
+                        ];
+                        selectionBoundaryPathRef.current.dirty = true;
+                        setSelectionActive(true);
+                        selectionActiveRef.current = true;
+                        selectionActionsRef.current.extractFloat(true);
+                      }
                     }
-                    return tips;
-                  })()}
-                  presets={presets[activeSubpanel]}
-                  activePresetId={activePresetIds[activeSubpanel] ?? null}
-                  currentSettings={brushSettings}
-                  onSelectPreset={(preset: Preset) => {
-                    setActivePresetIds((prev) => ({
-                      ...prev,
-                      [activeSubpanel]: preset.id,
-                    }));
-                    setBrushSettings(preset.settings);
-                    if (preset.size !== undefined) {
-                      const sizeKey =
-                        activeSubpanel === "eraser" ? "eraser" : "brush";
-                      setBrushSizes((prev) => ({
-                        ...prev,
-                        [sizeKey]: preset.size!,
-                      }));
-                      setToolSizes((prev) => ({
-                        ...prev,
-                        [activeSubpanel]: preset.size!,
-                      }));
+                  }
+                }
+              }}
+              onToggleVisible={(id) => {
+                const layer = layersRef.current.find((l) => l.id === id);
+                if (layer?.isRuler) {
+                  const nowHiding = layer.visible;
+                  const updFn = (l: Layer): Layer => {
+                    if (l.id !== id) return l;
+                    if (nowHiding) {
+                      // Hiding: save current rulerActive state, then turn ruler OFF
+                      return {
+                        ...l,
+                        visible: false,
+                        rulerActiveBeforeHide: l.rulerActive ?? true,
+                        rulerActive: false,
+                      };
                     }
-                    if (preset.opacity !== undefined) {
-                      setColor((prev) => ({ ...prev, a: preset.opacity! }));
-                      setToolOpacities((prev) => ({
-                        ...prev,
-                        [activeSubpanel]: preset.opacity!,
-                      }));
-                    }
-                    if (preset.defaultSize !== undefined) {
-                      const sizeKey =
-                        activeSubpanel === "eraser" ? "eraser" : "brush";
-                      setBrushSizes((prev) => ({
-                        ...prev,
-                        [sizeKey]: preset.defaultSize!,
-                      }));
-                      setToolSizes((prev) => ({
-                        ...prev,
-                        [activeSubpanel]: preset.defaultSize!,
-                      }));
-                    }
-                  }}
-                  onUpdatePreset={(updated: Preset) => {
-                    setPresets((prev) => ({
-                      ...prev,
-                      [activeSubpanel]: prev[activeSubpanel].map((p) =>
-                        p.id === updated.id ? updated : p,
-                      ),
-                    }));
-                    if (activePresetIds[activeSubpanel] === updated.id)
-                      setBrushSettings(updated.settings);
-                  }}
-                  onAddPreset={(tipImageData?: string) => {
-                    const newId = `${activeSubpanel}-custom-${Date.now()}`;
-                    const newPreset: Preset = {
-                      id: newId,
-                      name: "New Preset",
-                      settings: {
-                        ...brushSettings,
-                        ...(tipImageData !== undefined ? { tipImageData } : {}),
-                      },
+                    // Showing: restore previously saved rulerActive state
+                    return {
+                      ...l,
+                      visible: true,
+                      rulerActive:
+                        l.rulerActiveBeforeHide ?? l.rulerActive ?? true,
+                      rulerActiveBeforeHide: undefined,
                     };
-                    setPresets((prev) => ({
-                      ...prev,
-                      [activeSubpanel]: [...prev[activeSubpanel], newPreset],
-                    }));
-                    setActivePresetIds((prev) => ({
-                      ...prev,
-                      [activeSubpanel]: newId,
-                    }));
-                    setBrushSettings(newPreset.settings);
-                  }}
-                  onDeletePreset={(presetId: string) => {
-                    setPresets((prev) => ({
-                      ...prev,
-                      [activeSubpanel]: prev[activeSubpanel].filter(
-                        (p) => p.id !== presetId,
-                      ),
-                    }));
-                    if (activePresetIds[activeSubpanel] === presetId)
-                      setActivePresetIds((prev) => ({
-                        ...prev,
-                        [activeSubpanel]: null,
-                      }));
-                  }}
-                  onActivate={() => {
-                    setActiveTool(
-                      activeSubpanel as "brush" | "smear" | "eraser",
-                    );
-                  }}
-                  onClose={() => setActiveSubpanel(null)}
-                  onReorderPresets={(fromIndex: number, toIndex: number) => {
-                    if (fromIndex === toIndex) return;
-                    setPresets((prev) => {
-                      const arr = [...prev[activeSubpanel]];
-                      const [moved] = arr.splice(fromIndex, 1);
-                      arr.splice(toIndex, 0, moved);
-                      return { ...prev, [activeSubpanel]: arr };
-                    });
-                  }}
-                  currentSize={currentBrushSize}
-                  currentOpacity={color.a}
-                  onSaveCurrentToPreset={(presetId, size, opacity) => {
-                    setPresets((prev) => ({
-                      ...prev,
-                      [activeSubpanel]: prev[activeSubpanel].map((p) =>
-                        p.id === presetId ? { ...p, size, opacity } : p,
-                      ),
-                    }));
-                  }}
-                />
-              ) : activeSubpanel === "lasso" ? (
-                <LassoPresetsPanel
-                  lassoMode={lassoMode}
-                  onSelectMode={(mode) => {
-                    setLassoMode(mode);
-                  }}
-                  onClose={() => setActiveSubpanel(null)}
-                  accentColor="var(--primary)"
-                  isDarkMode={false}
-                  wandTolerance={wandTolerance}
-                  wandContiguous={wandContiguous}
-                  onWandToleranceChange={setWandTolerance}
-                  onWandContiguousChange={setWandContiguous}
-                />
-              ) : activeSubpanel === "adjustments" ? (
-                <AdjustmentsPresetsPanel
-                  activeLayerId={activeLayerId}
-                  layerCanvasesRef={layerCanvasesRef}
-                  selectionMaskRef={selectionMaskRef}
-                  selectionActive={selectionActive}
-                  onPushUndo={(layerId, before, after) => {
-                    undoStackRef.current.push({
-                      type: "pixels",
-                      layerId,
-                      before,
-                      after,
-                    });
-                    if (undoStackRef.current.length > 50)
-                      undoStackRef.current.shift();
-                    redoStackRef.current = [];
-                    setUndoCount(undoStackRef.current.length);
-                    setRedoCount(0);
-                  }}
-                  onPreview={() => {
-                    composite();
-                  }}
-                  onComposite={() => {
-                    composite();
-                    // Revert to pre-adjustment subpanel
-                    setActiveSubpanel(
-                      preAdjustmentSubpanelRef.current as Tool | null,
-                    );
-                  }}
-                />
-              ) : activeSubpanel === "fill" ? (
-                <FillPresetsPanel
-                  fillMode={fillMode}
-                  fillSettings={fillSettings}
-                  onSelectMode={(mode) => {
-                    setFillMode(mode);
-                    fillModeRef.current = mode;
-                  }}
-                  onSettingsChange={(settings) => {
-                    setFillSettings(settings);
-                    fillSettingsRef.current = settings;
-                  }}
-                  onClose={() => setActiveSubpanel(null)}
-                />
-              ) : (
-                <div className="flex items-center justify-center h-16 text-muted-foreground text-xs select-none opacity-40">
-                  No presets
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* Collapse / expand toggle button — hidden when active tool has presets */}
-        {(leftSidebarCollapsed ||
-          !(
-            activeTool === "brush" ||
-            activeTool === "smear" ||
-            activeTool === "eraser" ||
-            activeTool === "lasso" ||
-            activeTool === "fill"
-          )) && (
-          <button
-            type="button"
-            data-ocid="left_sidebar.toggle"
-            onClick={() => setLeftSidebarCollapsed((c) => !c)}
-            className="absolute top-1/2 -translate-y-1/2 right-0 translate-x-full z-20 flex items-center justify-center bg-card border border-border rounded-r-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-            style={{ width: 14, height: 40, fontSize: 9 }}
-            title={leftSidebarCollapsed ? "Expand panel" : "Collapse panel"}
-          >
-            {leftSidebarCollapsed ? "›" : "‹"}
-          </button>
-        )}
-      </div>
-
-      {/* Hidden layer canvases */}
-      <div
-        style={{
-          position: "absolute",
-          left: -9999,
-          top: -9999,
-          pointerEvents: "none",
-        }}
-      >
-        {layers.map((layer) => (
-          <canvas
-            key={layer.id}
-            ref={(el) => {
-              if (el) layerCanvasesRef.current.set(layer.id, el);
-              else layerCanvasesRef.current.delete(layer.id);
+                  };
+                  setLayers((prev) => prev.map(updFn));
+                  layersRef.current = layersRef.current.map(updFn);
+                  scheduleRulerOverlay();
+                } else {
+                  handleToggleVisible(id);
+                }
+              }}
+              onSetOpacity={handleSetOpacity}
+              onSetBlendMode={handleSetLayerBlendMode}
+              onAddLayer={handleAddLayer}
+              onDeleteLayer={(id) => {
+                const isRuler = layersRef.current.find(
+                  (l) => l.id === id,
+                )?.isRuler;
+                handleDeleteLayer(id);
+                if (isRuler) scheduleRulerOverlay();
+              }}
+              onReorderLayers={handleReorderLayers}
+              onClearLayer={handleClear}
+              onToggleClippingMask={handleToggleClippingMask}
+              onMergeLayers={handleMergeLayers}
+              onRenameLayer={handleRenameLayer}
+              onToggleAlphaLock={handleToggleAlphaLock}
+              onCtrlClickLayer={handleCtrlClickLayer}
+              onToggleRulerActive={(id) => {
+                setLayers((prev) =>
+                  prev.map((l) =>
+                    l.id === id
+                      ? { ...l, rulerActive: !(l.rulerActive ?? true) }
+                      : l,
+                  ),
+                );
+                layersRef.current = layersRef.current.map((l) =>
+                  l.id === id
+                    ? { ...l, rulerActive: !(l.rulerActive ?? true) }
+                    : l,
+                );
+                scheduleRulerOverlay();
+              }}
+              onToggleGroupCollapse={_handleToggleGroupCollapse}
+              onRenameGroup={_handleRenameGroup}
+              onSetGroupOpacity={_handleSetGroupOpacity}
+              onToggleGroupVisible={_handleToggleGroupVisible}
+              onOpenDeleteGroup={(groupId) => {
+                const loc = findNode(layerTreeRef.current, groupId);
+                const groupName =
+                  loc?.node.kind === "group" ? loc.node.name : "Group";
+                setDeleteGroupConfirm({ groupId, groupName });
+              }}
+              onReorderTree={_handleReorderTree}
+              onToggleLayerSelection={_handleToggleLayerSelection}
+              onCreateGroup={handleCreateGroup}
+            />
+          )}{" "}
+          {/* end mobile right panel conditional */}
+          {/* Settings Panel */}
+          <SettingsPanel
+            open={settingsOpen}
+            onClose={() => setSettingsOpen(false)}
+            onExportBrushes={handleExportBrushes}
+            onImportBrushes={handleImportBrushes}
+            cursorType={cursorType}
+            cursorCenter={cursorCenter}
+            onCursorSettingsChange={(type, center) => {
+              setCursorType(type);
+              setCursorCenter(center);
+              localStorage.setItem("sk-cursor-type", type);
+              localStorage.setItem("sk-cursor-center", center);
+            }}
+            pressureCurve={universalPressureCurve}
+            onPressureCurveChange={(v) => {
+              setUniversalPressureCurve(v);
+              localStorage.setItem("sk-pressure-curve", JSON.stringify(v));
+            }}
+            isLoggedIn={isLoggedIn}
+            principalId={
+              isLoggedIn && identity ? identity.getPrincipal().toString() : null
+            }
+            onLogin={onLogin}
+            onLogout={onLogout}
+            isMobile={isMobile || forceDesktop}
+            forceDesktop={forceDesktop}
+            onForceDesktopChange={(v) => {
+              setForceDesktop(v);
+              if (v) setRightSidebarCollapsed(false);
+            }}
+            leftHanded={leftHanded}
+            onLeftHandedChange={setLeftHanded}
+          />
+          {/* Cloud Overwrite Confirmation Dialog */}
+          <CloudOverwriteDialog
+            open={showCloudOverwriteDialog}
+            onOpenChange={setShowCloudOverwriteDialog}
+            onCancel={() => {
+              pendingCloudSaveRef.current = null;
+              setShowCloudOverwriteDialog(false);
+            }}
+            onConfirm={() => {
+              setShowCloudOverwriteDialog(false);
+              pendingCloudSaveRef.current?.();
+              pendingCloudSaveRef.current = null;
             }}
           />
-        ))}
-      </div>
-
-      {/* Canvas + bottom bar */}
-      <div className="flex flex-col flex-1 min-w-0">
-        <div
-          ref={containerRef}
-          className="flex-1 relative overflow-hidden canvas-workspace-bg"
-          style={{ cursor: getCursorStyle() }}
-        >
-          {/* Transform wrapper with optional horizontal flip */}
-          <div
-            ref={canvasWrapperRef}
-            style={{
-              position: "absolute",
-              width: CANVAS_WIDTH,
-              height: CANVAS_HEIGHT,
-              left: "50%",
-              top: "50%",
-              marginLeft: -CANVAS_WIDTH / 2,
-              marginTop: -CANVAS_HEIGHT / 2,
-              transform: `translate(${panX}px, ${panY}px) scaleX(${isFlipped ? -1 : 1}) rotate(${rotation}deg) scale(${zoom})`,
-              transformOrigin: "center center",
-              backgroundImage:
-                "linear-gradient(45deg, #ccc 25%, transparent 25%), linear-gradient(-45deg, #ccc 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #ccc 75%), linear-gradient(-45deg, transparent 75%, #ccc 75%)",
-              backgroundSize: "16px 16px",
-              backgroundPosition: "0 0, 0 8px, 8px -8px, -8px 0px",
-              backgroundColor: "#fff",
-              boxShadow:
-                "0 0 0 1px rgba(0,0,0,0.25), 0 8px 32px rgba(0,0,0,0.4)",
+          {/* Delete Group Confirmation Dialog */}
+          <DeleteGroupDialog
+            deleteGroupConfirm={deleteGroupConfirm}
+            onOpenChange={() => setDeleteGroupConfirm(null)}
+            onCancel={() => setDeleteGroupConfirm(null)}
+            onRelease={(groupId) => {
+              handleDeleteGroup(groupId, false);
+              setDeleteGroupConfirm(null);
             }}
-          >
-            <canvas
-              ref={displayCanvasRef}
-              data-ocid="canvas.canvas_target"
-              style={{
-                display: "block",
-                width: "100%",
-                height: "100%",
-                touchAction: "none",
-              }}
-              onPointerDown={handlePointerDown}
-              onPointerMove={handlePointerMove}
-              onPointerUp={(e) => handlePointerUp(e)}
-              onPointerLeave={() => handlePointerUp()}
-              onDoubleClick={(_e) => {
-                if (
-                  activeToolRef.current === "lasso" &&
-                  lassoModeRef.current === "poly" &&
-                  isDrawingSelectionRef.current
-                ) {
-                  const pts = selectionDraftPointsRef.current;
-                  if (pts.length > 2) {
-                    selectionGeometryRef.current = {
-                      type: "poly",
-                      points: [...pts],
-                    };
-                    rasterizeSelectionMask();
-                    setSelectionActive(true);
-                  } else {
-                    clearSelection();
-                  }
-                  selectionDraftPointsRef.current = [];
-                  selectionDraftCursorRef.current = null;
-                  isDrawingSelectionRef.current = false;
-                }
-              }}
-            />
-            {/* Selection / Transform overlay canvas */}
-            <canvas
-              ref={(el) => {
-                selectionOverlayCanvasRef.current = el;
-                if (el) {
-                  el.width = CANVAS_WIDTH;
-                  el.height = CANVAS_HEIGHT;
-                }
-              }}
-              style={{
-                position: "absolute",
-                top: 0,
-                left: 0,
-                width: "100%",
-                height: "100%",
-                pointerEvents: "none",
-              }}
-            />
-          </div>
-
-          {/* View HUD */}
-          <div
-            data-ocid="canvas.panel"
-            style={{
-              position: "absolute",
-              bottom: 12,
-              left: 12,
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              background: "rgba(0,0,0,0.55)",
-              backdropFilter: "blur(6px)",
-              borderRadius: 6,
-              padding: "4px 8px",
-              fontSize: 11,
-              color: "rgba(255,255,255,0.85)",
-              fontFamily: "monospace",
-              pointerEvents: "auto",
-              userSelect: "none",
-              zIndex: 10,
+            onDeleteAll={(groupId) => {
+              handleDeleteGroup(groupId, true);
+              setDeleteGroupConfirm(null);
             }}
-          >
-            <span title="Zoom: Ctrl+Space drag or scroll">
-              {Math.round(zoom * 100)}%
-            </span>
-            <span style={{ opacity: 0.4 }}>|</span>
-            <span title="Rotation: R + drag">{Math.round(rotation)}°</span>
-            {isFlipped && (
-              <>
-                <span style={{ opacity: 0.4 }}>|</span>
-                <span style={{ color: "rgba(255,200,100,0.9)" }}>Flipped</span>
-              </>
-            )}
-            {!isDefaultTransform && (
-              <>
-                <span style={{ opacity: 0.4 }}>|</span>
-                <button
-                  type="button"
-                  data-ocid="canvas.reset_button"
-                  onClick={resetView}
-                  title="Reset view (press 0)"
-                  style={{
-                    background: "rgba(255,255,255,0.15)",
-                    border: "none",
-                    borderRadius: 4,
-                    color: "rgba(255,255,255,0.9)",
-                    cursor: "pointer",
-                    fontSize: 11,
-                    padding: "1px 6px",
-                    fontFamily: "monospace",
-                  }}
-                >
-                  ⌂ Reset
-                </button>
-              </>
-            )}
-          </div>
-
-          {/* Cancel transform floating button */}
-          {(isDraggingFloatRef.current || transformActiveRef.current) && (
-            <div
-              style={{
-                position: "absolute",
-                bottom: 60,
-                right: 12,
-                zIndex: 21,
-                pointerEvents: "auto",
-              }}
-            >
-              <button
-                type="button"
-                data-ocid="transform.cancel_button"
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  selectionActionsRef.current.revertTransform();
-                }}
-                title="Cancel Transform (Esc)"
-                style={{
-                  background: "rgba(180,0,0,0.75)",
-                  backdropFilter: "blur(6px)",
-                  border: "1.5px solid rgba(255,255,255,0.25)",
-                  borderRadius: 8,
-                  color: "rgba(255,255,255,0.92)",
-                  cursor: "pointer",
-                  fontSize: 13,
-                  fontFamily: "system-ui, sans-serif",
-                  fontWeight: 500,
-                  padding: "8px 18px",
-                  minWidth: 80,
-                  minHeight: 40,
-                  letterSpacing: "0.02em",
-                  userSelect: "none",
-                  WebkitTapHighlightColor: "transparent",
-                }}
-              >
-                Cancel
-              </button>
-            </div>
-          )}
-          {/* Deselect floating button – shown when a selection is active */}
-          {selectionActive && (
-            <div
-              style={{
-                position: "absolute",
-                bottom: 12,
-                right: 12,
-                zIndex: 20,
-                pointerEvents: "auto",
-              }}
-            >
-              <button
-                type="button"
-                data-ocid="selection.deselect_button"
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  selectionActionsRef.current.commitFloat();
-                  selectionActionsRef.current.clearSelection();
-                }}
-                title="Deselect (Ctrl+D)"
-                style={{
-                  background: "rgba(0,0,0,0.65)",
-                  backdropFilter: "blur(6px)",
-                  border: "1.5px solid rgba(255,255,255,0.25)",
-                  borderRadius: 8,
-                  color: "rgba(255,255,255,0.92)",
-                  cursor: "pointer",
-                  fontSize: 13,
-                  fontFamily: "system-ui, sans-serif",
-                  fontWeight: 500,
-                  padding: "8px 18px",
-                  minWidth: 80,
-                  minHeight: 40,
-                  letterSpacing: "0.02em",
-                  userSelect: "none",
-                  WebkitTapHighlightColor: "transparent",
-                }}
-              >
-                Deselect
-              </button>
-            </div>
-          )}
+          />
+          {/* Merge Strategy Dialog */}
+          <MergeStrategyDialog
+            open={showMergeDialog}
+            onOpenChange={setShowMergeDialog}
+            importParsed={importParsed}
+            presets={presets}
+            processImportAppend={processImportAppend}
+            setPresets={setPresets}
+            setActivePresetIds={setActivePresetIds}
+            setBrushSettings={setBrushSettings}
+          />
+          {/* Conflict Resolution Dialog */}
+          <BrushConflictDialog
+            currentConflict={currentConflict}
+            onOpenChange={(open) => {
+              if (!open) {
+                setCurrentConflict(null);
+                setPendingMerged(null);
+                setConflictQueue([]);
+              }
+            }}
+            onCancel={() => {
+              setCurrentConflict(null);
+              setPendingMerged(null);
+              setConflictQueue([]);
+            }}
+            onResolve={resolveConflict}
+          />
+          {/* Rotate center crosshair — shown when rotate tool is active */}
+          <RotateCrosshairOverlay visible={rotateLocked} />
+          {/* Fixed brush size overlay ring — stays at drag-start position during Alt+Shift resize */}
+          <BrushSizeOverlayCanvas canvasRef={brushSizeOverlayRef} />
+          {/* Software cursor for pen/stylus input — browser suppresses CSS cursors for pen during capture */}
+          <SoftwareCursorCanvas canvasRef={softwareCursorRef} />
         </div>
-
-        <BottomBar
-          brushSize={currentBrushSize}
-          brushOpacity={color.a}
-          brushBlendMode={brushBlendMode}
-          activeTool={activeTool}
-          onBrushSizeChange={(v) => {
-            const key = activeTool === "eraser" ? "eraser" : "brush";
-            setBrushSizes((prev) => ({ ...prev, [key]: v }));
-            setToolSizes((prev) => ({ ...prev, [activeTool]: v }));
-          }}
-          onBrushOpacityChange={(v) => {
-            setColor((prev) => ({ ...prev, a: v }));
-            setToolOpacities((prev) => ({ ...prev, [activeTool]: v }));
-          }}
-          onBrushBlendModeChange={setBrushBlendMode}
-          canUndo={undoCount > 0}
-          canRedo={redoCount > 0}
-          onUndo={handleUndo}
-          onRedo={handleRedo}
-          onClear={handleClear}
-          onExport={handleExport}
-          onSave={handleSave}
-        />
       </div>
-
-      {/* Right panel: Navigator + Layers */}
-      <div
-        className="flex flex-col border-l border-border bg-card overflow-hidden"
-        style={{
-          width: rightPanelWidth,
-          minWidth: 160,
-          maxWidth: 380,
-          position: "relative",
-        }}
-      >
-        {/* Resize handle */}
-        <div
-          style={{
-            position: "absolute",
-            left: 0,
-            top: 0,
-            bottom: 0,
-            width: 4,
-            cursor: "col-resize",
-            zIndex: 10,
-          }}
-          onPointerDown={(e) => {
-            e.preventDefault();
-            const startX = e.clientX;
-            const startW = rightPanelWidth;
-            const onMove = (me: PointerEvent) => {
-              const delta = startX - me.clientX;
-              setRightPanelWidth(Math.min(380, Math.max(160, startW + delta)));
-            };
-            const onUp = () => {
-              window.removeEventListener("pointermove", onMove);
-              window.removeEventListener("pointerup", onUp);
-            };
-            window.addEventListener("pointermove", onMove);
-            window.addEventListener("pointerup", onUp);
-          }}
-        />
-        <NavigatorPanel
-          viewTransform={viewTransform}
-          onSetTransform={(t) => {
-            setViewTransform(t);
-            applyTransformToDOM(t);
-          }}
-          canvasWidth={CANVAS_WIDTH}
-          canvasHeight={CANVAS_HEIGHT}
-          thumbnailDataUrl={navigatorThumbnail}
-        />
-        <div className="border-t border-border" />
-        <LayersPanel
-          layers={layers}
-          activeLayerId={activeLayerId}
-          onSetActive={setActiveLayerId}
-          onToggleVisible={handleToggleVisible}
-          onSetOpacity={handleSetOpacity}
-          onSetBlendMode={handleSetLayerBlendMode}
-          onAddLayer={handleAddLayer}
-          onDeleteLayer={handleDeleteLayer}
-          onReorderLayers={handleReorderLayers}
-          onClearLayer={handleClear}
-          onToggleClippingMask={handleToggleClippingMask}
-          onAddMask={handleAddMask}
-          onToggleMaskActive={handleToggleMaskActive}
-          onMergeLayers={handleMergeLayers}
-          backgroundColor={backgroundColor}
-          onBackgroundColorChange={setBackgroundColor}
-          backgroundLayerId="layer-background"
-          thumbnails={layerThumbnails}
-          onCtrlClickLayer={handleCtrlClickLayer}
-        />
-      </div>
-
-      {/* Settings Panel */}
-      <SettingsPanel
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        onExportBrushes={handleExportBrushes}
-        onImportBrushes={handleImportBrushes}
-        cursorType={cursorType}
-        cursorCrosshair={cursorCrosshair}
-        onCursorSettingsChange={(type, crosshair) => {
-          setCursorType(type);
-          setCursorCrosshair(crosshair);
-          localStorage.setItem("sk-cursor-type", type);
-          localStorage.setItem("sk-cursor-crosshair", String(crosshair));
-        }}
-      />
-
-      {/* Merge Strategy Dialog */}
-      <AlertDialog open={showMergeDialog} onOpenChange={setShowMergeDialog}>
-        <AlertDialogContent data-ocid="settings.dialog">
-          <AlertDialogHeader>
-            <AlertDialogTitle>Import Brushes</AlertDialogTitle>
-            <AlertDialogDescription>
-              How would you like to merge the imported brushes with your current
-              presets?
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel data-ocid="settings.cancel_button">
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              data-ocid="settings.secondary_button"
-              onClick={() => {
-                setShowMergeDialog(false);
-                if (importParsed) processImportAppend(importParsed, presets);
-              }}
-            >
-              Append
-            </AlertDialogAction>
-            <AlertDialogAction
-              data-ocid="settings.primary_button"
-              onClick={() => {
-                setShowMergeDialog(false);
-                if (importParsed) {
-                  const merged: typeof DEFAULT_PRESETS = {
-                    brush: importParsed.brush || [],
-                    smear: importParsed.smear || [],
-                    eraser: importParsed.eraser || [],
-                  };
-                  setPresets(merged);
-                  toast.success("Brushes replaced successfully!");
-                }
-              }}
-            >
-              Replace All
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      {/* Conflict Resolution Dialog */}
-      <AlertDialog
-        open={!!currentConflict}
-        onOpenChange={(open) => {
-          if (!open) {
-            setCurrentConflict(null);
-            setPendingMerged(null);
-            setConflictQueue([]);
-          }
-        }}
-      >
-        <AlertDialogContent data-ocid="settings.conflict_dialog">
-          <AlertDialogHeader>
-            <AlertDialogTitle>Brush Conflict</AlertDialogTitle>
-            <AlertDialogDescription>
-              A brush named &ldquo;{currentConflict?.preset.name}&rdquo; already
-              exists. What would you like to do?
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel
-              data-ocid="settings.conflict_cancel_button"
-              onClick={() => resolveConflict("skip")}
-            >
-              Skip
-            </AlertDialogCancel>
-            <AlertDialogAction
-              data-ocid="settings.conflict_rename_button"
-              onClick={() => resolveConflict("rename")}
-            >
-              Rename
-            </AlertDialogAction>
-            <AlertDialogAction
-              data-ocid="settings.conflict_overwrite_button"
-              onClick={() => resolveConflict("overwrite")}
-            >
-              Overwrite
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </div>
+    </PaintingContextProvider>
   );
 }

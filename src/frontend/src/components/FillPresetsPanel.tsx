@@ -7,7 +7,7 @@ export type GradientMode = "linear" | "radial";
 export interface FillSettings {
   tolerance: number;
   gradientMode: GradientMode;
-  colorJitter: number;
+  contiguous: boolean;
 }
 
 interface FillPresetsPanelProps {
@@ -61,9 +61,44 @@ function SliderRow({
         value={value}
         data-ocid={ocid}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full h-1.5 accent-primary cursor-pointer"
+        style={
+          {
+            "--fill-pct": `${((value - min) / (max - min)) * 100}%`,
+          } as React.CSSProperties
+        }
+        className="w-full h-1.5 cursor-pointer"
       />
     </div>
+  );
+}
+
+/** A simple, reliable toggle that doesn't rely on Tailwind arbitrary translate values */
+function Toggle({
+  checked,
+  ocid,
+  onChange,
+}: {
+  checked: boolean;
+  ocid?: string;
+  onChange: (v: boolean) => void;
+}) {
+  // Track: 40×20px  Knob: 16×16px  Padding: 2px each side
+  // ON  translateX = 40 - 16 - 2 = 22px
+  // OFF translateX = 2px
+  return (
+    <button
+      type="button"
+      data-ocid={ocid}
+      onClick={() => onChange(!checked)}
+      className={`relative w-10 h-5 rounded-full transition-colors flex-shrink-0 ${
+        checked ? "bg-primary" : "bg-muted border border-border"
+      }`}
+    >
+      <span
+        className="absolute top-0.5 left-0 w-4 h-4 rounded-full bg-white shadow-sm transition-transform"
+        style={{ transform: `translateX(${checked ? 22 : 2}px)` }}
+      />
+    </button>
   );
 }
 
@@ -131,73 +166,53 @@ export function FillPresetsPanel({
                     onSettingsChange({ ...fillSettings, tolerance: v })
                   }
                 />
-                <SliderRow
-                  label="Color Jitter"
-                  value={fillSettings.colorJitter}
-                  min={0}
-                  max={100}
-                  ocid="fill_presets.flood_color_jitter.input"
-                  onChange={(v) =>
-                    onSettingsChange({ ...fillSettings, colorJitter: v })
-                  }
-                />
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-muted-foreground font-medium">
+                    Contiguous
+                  </span>
+                  <Toggle
+                    checked={fillSettings.contiguous}
+                    ocid="fill_presets.contiguous.toggle"
+                    onChange={(v) =>
+                      onSettingsChange({ ...fillSettings, contiguous: v })
+                    }
+                  />
+                </div>
               </>
             )}
 
             {fillMode === "gradient" && (
-              <>
-                <div className="flex flex-col gap-2">
-                  <span className="text-xs text-muted-foreground">Mode</span>
-                  <div className="flex gap-1">
-                    {(["linear", "radial"] as GradientMode[]).map((mode) => (
-                      <button
-                        key={mode}
-                        type="button"
-                        data-ocid={`fill_presets.gradient_mode.${mode}`}
-                        onClick={() =>
-                          onSettingsChange({
-                            ...fillSettings,
-                            gradientMode: mode,
-                          })
-                        }
-                        className={`flex-1 py-1 text-xs rounded border transition-colors ${
-                          fillSettings.gradientMode === mode
-                            ? "bg-primary/10 border-primary text-primary"
-                            : "border-border bg-muted/30 text-foreground hover:bg-muted/60"
-                        }`}
-                      >
-                        {mode.charAt(0).toUpperCase() + mode.slice(1)}
-                      </button>
-                    ))}
-                  </div>
+              <div className="flex flex-col gap-2">
+                <span className="text-xs text-muted-foreground">Mode</span>
+                <div className="flex gap-1">
+                  {(["linear", "radial"] as GradientMode[]).map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      data-ocid={`fill_presets.gradient_mode.${mode}`}
+                      onClick={() =>
+                        onSettingsChange({
+                          ...fillSettings,
+                          gradientMode: mode,
+                        })
+                      }
+                      className={`flex-1 py-1 text-xs rounded border transition-colors ${
+                        fillSettings.gradientMode === mode
+                          ? "bg-primary/10 border-primary text-primary"
+                          : "border-border bg-muted/30 text-foreground hover:bg-muted/60"
+                      }`}
+                    >
+                      {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                    </button>
+                  ))}
                 </div>
-                <SliderRow
-                  label="Color Jitter"
-                  value={fillSettings.colorJitter}
-                  min={0}
-                  max={100}
-                  ocid="fill_presets.gradient_color_jitter.input"
-                  onChange={(v) =>
-                    onSettingsChange({ ...fillSettings, colorJitter: v })
-                  }
-                />
-              </>
+              </div>
             )}
 
             {fillMode === "lasso" && (
               <div className="flex flex-col gap-1.5">
-                <SliderRow
-                  label="Color Jitter"
-                  value={fillSettings.colorJitter}
-                  min={0}
-                  max={100}
-                  ocid="fill_presets.color_jitter.input"
-                  onChange={(v) =>
-                    onSettingsChange({ ...fillSettings, colorJitter: v })
-                  }
-                />
                 <p className="text-xs text-muted-foreground/70 leading-tight mt-0.5">
-                  Draw a closed lasso shape to fill with color jitter applied.
+                  Draw a closed lasso shape to fill with the current color.
                 </p>
               </div>
             )}

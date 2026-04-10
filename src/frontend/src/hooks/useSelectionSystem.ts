@@ -1,0 +1,510 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import type React from "react";
+import type { Layer } from "../components/LayersPanel";
+import type { LassoMode, Tool } from "../components/Toolbar";
+import type { SelectionGeom, SelectionSnapshot } from "../selectionTypes";
+import { computeMaskBounds } from "../utils/selectionUtils";
+
+const CANVAS_WIDTH_DEFAULT = 2560;
+const CANVAS_HEIGHT_DEFAULT = 1440;
+
+interface UseSelectionSystemParams {
+  canvasWidth?: number;
+  canvasHeight?: number;
+  /** Stable refs that always hold the current canvas dimensions — avoids stale-closure
+   * issues when the canvas is resized (e.g. by the crop tool) between renders. Used in
+   * rasterizeSelectionMask and handleCtrlClickLayer so mask canvases are always created
+   * at the correct size even if React state hasn't flushed yet. */
+  canvasWidthRef?: React.MutableRefObject<number>;
+  canvasHeightRef?: React.MutableRefObject<number>;
+  layersRef: React.RefObject<Layer[]>;
+  newLayerFn: () => Layer;
+  pushHistory: (entry: unknown) => void;
+  // Refs/callbacks passed directly from PaintingApp (cannot use context — hooks are called before provider)
+  layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
+  activeLayerIdRef: React.MutableRefObject<string>;
+  pendingLayerPixelsRef: React.MutableRefObject<Map<string, ImageData>>;
+  setLayers: React.Dispatch<React.SetStateAction<Layer[]>>;
+  setActiveLayerId: React.Dispatch<React.SetStateAction<string>>;
+  setActiveTool: React.Dispatch<React.SetStateAction<Tool>>;
+  selectionOverlayCanvasRef: React.RefObject<HTMLCanvasElement | null>;
+  compositeRef: React.MutableRefObject<() => void>;
+  markLayerBitmapDirty: (id: string) => void;
+  rebuildChainsNowRef: React.MutableRefObject<
+    (mask: HTMLCanvasElement) => void
+  >;
+}
+
+export function useSelectionSystem({
+  canvasWidth = CANVAS_WIDTH_DEFAULT,
+  canvasHeight = CANVAS_HEIGHT_DEFAULT,
+  canvasWidthRef,
+  canvasHeightRef,
+  layersRef,
+  newLayerFn,
+  pushHistory,
+  layerCanvasesRef,
+  activeLayerIdRef,
+  pendingLayerPixelsRef,
+  setLayers,
+  setActiveLayerId,
+  setActiveTool,
+  selectionOverlayCanvasRef,
+  compositeRef,
+  markLayerBitmapDirty,
+  rebuildChainsNowRef,
+}: UseSelectionSystemParams) {
+  // ---- Selection state & refs ----
+  const [selectionActive, setSelectionActive] = useState(false);
+  const selectionActiveRef = useRef(false);
+  const selectionGeometryRef = useRef<{
+    type: LassoMode;
+    points?: { x: number; y: number }[];
+    x?: number;
+    y?: number;
+    w?: number;
+    h?: number;
+  } | null>(null);
+  const selectionShapesRef = useRef<NonNullable<SelectionGeom>[]>([]);
+  const selectionBoundaryPathRef = useRef<{
+    segments: Array<[number, number, number, number]>;
+    chains: Array<Array<[number, number]>>;
+    generation: number;
+    dirty: boolean;
+    lastRebuildMs: number;
+  }>({
+    segments: [],
+    chains: [],
+    generation: 0,
+    dirty: true,
+    lastRebuildMs: 0,
+  });
+  const selectionMaskRef = useRef<HTMLCanvasElement | null>(null);
+  // In-progress selection drawing
+  const isDrawingSelectionRef = useRef(false);
+  const selectionPolyClosingRef = useRef(false);
+  const selectionDraftPointsRef = useRef<{ x: number; y: number }[]>([]);
+  const selectionDraftCursorRef = useRef<{ x: number; y: number } | null>(null);
+  const selectionDraftBoundsRef = useRef<{
+    sx: number;
+    sy: number;
+    ex: number;
+    ey: number;
+  } | null>(null);
+  // Captured at selection start for undo tracking
+  const selectionBeforeRef = useRef<SelectionSnapshot | null>(null);
+
+  // Sync selectionActive state → ref
+  useEffect(() => {
+    selectionActiveRef.current = selectionActive;
+  }, [selectionActive]);
+
+  // Actions ref to avoid forward-reference issues in keyboard handler
+  // (commitFloat, revertTransform, extractFloat are populated by PaintingApp)
+  const selectionActionsRef = useRef({
+    clearSelection: () => {},
+    deleteSelection: () => {},
+    cutOrCopyToLayer: (_cut: boolean) => {},
+    commitFloat: (_opts?: { keepSelection?: boolean }) => {},
+    revertTransform: () => {},
+    rasterizeSelectionMask: () => {},
+    extractFloat: (_fromSel: boolean) => {},
+  });
+
+  // Wired by PaintingApp to atomically reset _boundaryRebuildPending.
+  // Called at the top of clearSelection so no stale idle rebuild can fire after deselect.
+  const cancelBoundaryRebuildRef = useRef<() => void>(() => {});
+
+  // Helper: snapshot current selection state for undo
+  const snapshotSelection = useCallback((): SelectionSnapshot => {
+    const mc = selectionMaskRef.current;
+    let maskDataURL: string | null = null;
+    if (mc) {
+      maskDataURL = mc.toDataURL();
+    }
+    const geom = selectionGeometryRef.current;
+    return {
+      geometry: geom
+        ? { ...geom, points: geom.points ? [...geom.points] : undefined }
+        : null,
+      maskDataURL,
+      active: selectionActiveRef.current,
+      shapes: selectionShapesRef.current.map((s) => ({
+        ...s,
+        points: s.points ? [...s.points] : undefined,
+      })),
+    };
+  }, []);
+
+  // When the canvas is resized (e.g. by the crop tool), expand the selection mask canvas to
+  // match. Without this the mask canvas stays at the original canvas size, meaning selections
+  // are silently capped to that size and fill/transform tools behave incorrectly on the new areas.
+  useEffect(() => {
+    const mc = selectionMaskRef.current;
+    if (!mc) return;
+    if (mc.width === canvasWidth && mc.height === canvasHeight) return;
+    // Grow the mask canvas to the new size, preserving existing mask content
+    const oldW = mc.width;
+    const oldH = mc.height;
+    const tmpCanvas = document.createElement("canvas");
+    tmpCanvas.width = oldW;
+    tmpCanvas.height = oldH;
+    const tmpCtx = tmpCanvas.getContext("2d", { willReadFrequently: true });
+    if (tmpCtx) {
+      tmpCtx.drawImage(mc, 0, 0);
+    }
+    mc.width = canvasWidth;
+    mc.height = canvasHeight;
+    const mctx = mc.getContext("2d", { willReadFrequently: true });
+    if (mctx && tmpCtx) {
+      mctx.clearRect(0, 0, canvasWidth, canvasHeight);
+      mctx.drawImage(tmpCanvas, 0, 0);
+    }
+    // Fix 3: also clear stale chains/segments when the canvas is resized so the
+    // ant loop never renders outlines sized for the old canvas dimensions.
+    selectionBoundaryPathRef.current.dirty = true;
+    selectionBoundaryPathRef.current.chains = [];
+    selectionBoundaryPathRef.current.segments = [];
+  }, [canvasWidth, canvasHeight]);
+
+  // Helper: restore selection snapshot
+  const restoreSelectionSnapshot = useCallback(
+    (snap: SelectionSnapshot) => {
+      selectionGeometryRef.current = snap.geometry;
+      selectionShapesRef.current = snap.shapes ?? [];
+      // Fix 2: clear stale chains/segments immediately when marking dirty so the ant
+      // loop never renders outlines from the snapshot being replaced.
+      selectionBoundaryPathRef.current.dirty = true;
+      selectionBoundaryPathRef.current.chains = [];
+      selectionBoundaryPathRef.current.segments = [];
+      if (snap.maskDataURL) {
+        const mc = document.createElement("canvas");
+        mc.width = canvasWidth;
+        mc.height = canvasHeight;
+        const mctx = mc.getContext("2d", { willReadFrequently: true })!;
+        const img = new Image();
+        img.onload = () => {
+          mctx.clearRect(0, 0, canvasWidth, canvasHeight);
+          mctx.drawImage(img, 0, 0);
+          // Synchronously rebuild chains after the mask image loads so the ant
+          // loop has fresh chain data immediately rather than waiting for idle.
+          if (rebuildChainsNowRef?.current) {
+            rebuildChainsNowRef.current(mc);
+          }
+        };
+        img.src = snap.maskDataURL;
+        selectionMaskRef.current = mc;
+      } else {
+        selectionMaskRef.current = null;
+      }
+      selectionActiveRef.current = snap.active;
+      setSelectionActive(snap.active);
+    },
+    [canvasWidth, canvasHeight, rebuildChainsNowRef],
+  );
+
+  const rasterizeSelectionMask = useCallback(() => {
+    const geom = selectionGeometryRef.current;
+    if (!geom) return;
+    // Use the live ref dimensions if available — they are updated synchronously when the
+    // canvas is resized (e.g. by the crop tool), whereas the closed-over canvasWidth/Height
+    // React state values may lag behind by one render cycle.
+    const cw = canvasWidthRef?.current ?? canvasWidth;
+    const ch = canvasHeightRef?.current ?? canvasHeight;
+    if (!selectionMaskRef.current) {
+      const mc = document.createElement("canvas");
+      mc.width = cw;
+      mc.height = ch;
+      selectionMaskRef.current = mc;
+    }
+    const mc = selectionMaskRef.current;
+    mc.width = cw;
+    mc.height = ch;
+    const mctx = mc.getContext("2d", { willReadFrequently: true })!;
+    mctx.clearRect(0, 0, cw, ch);
+    mctx.fillStyle = "white";
+    if (geom.type === "rect" && geom.w !== undefined && geom.h !== undefined) {
+      const x = geom.w! < 0 ? geom.x! + geom.w! : geom.x!;
+      const y = geom.h! < 0 ? geom.y! + geom.h! : geom.y!;
+      const w = Math.abs(geom.w!);
+      const h = Math.abs(geom.h!);
+      mctx.fillRect(x, y, w, h);
+    } else if (
+      geom.type === "ellipse" &&
+      geom.w !== undefined &&
+      geom.h !== undefined
+    ) {
+      const cx = geom.x! + geom.w! / 2;
+      const cy = geom.y! + geom.h! / 2;
+      const rx = Math.abs(geom.w! / 2);
+      const ry = Math.abs(geom.h! / 2);
+      mctx.beginPath();
+      mctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+      mctx.fill();
+    } else if (
+      (geom.type === "free" || geom.type === "poly") &&
+      geom.points &&
+      geom.points.length > 2
+    ) {
+      mctx.beginPath();
+      mctx.moveTo(geom.points[0].x, geom.points[0].y);
+      for (let i = 1; i < geom.points.length; i++) {
+        mctx.lineTo(geom.points[i].x, geom.points[i].y);
+      }
+      mctx.closePath();
+      mctx.fill();
+    }
+  }, [canvasWidth, canvasHeight, canvasWidthRef, canvasHeightRef]);
+
+  // Sync to actions ref
+  useEffect(() => {
+    selectionActionsRef.current.rasterizeSelectionMask = rasterizeSelectionMask;
+  }, [rasterizeSelectionMask]);
+
+  const handleCtrlClickLayer = useCallback(
+    (id: string) => {
+      const lc = layerCanvasesRef.current.get(id);
+      if (!lc) return;
+      const ctx = lc.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return;
+      // Use the layer canvas dimensions directly — they are the ground truth after a crop.
+      // The closed-over canvasWidth/Height React state may be one render cycle behind.
+      const cw = lc.width;
+      const ch = lc.height;
+      const imgData = ctx.getImageData(0, 0, cw, ch);
+      const data = imgData.data;
+      const maskCanvas = document.createElement("canvas");
+      maskCanvas.width = cw;
+      maskCanvas.height = ch;
+      const mCtx = maskCanvas.getContext("2d", { willReadFrequently: true })!;
+      const maskImgData = mCtx.createImageData(cw, ch);
+      const md = maskImgData.data;
+      let hasPixels = false;
+      for (let i = 0; i < data.length; i += 4) {
+        if (data[i + 3] > 0) {
+          md[i] = 255;
+          md[i + 1] = 255;
+          md[i + 2] = 255;
+          md[i + 3] = 255;
+          hasPixels = true;
+        }
+      }
+      if (!hasPixels) return;
+      mCtx.putImageData(maskImgData, 0, 0);
+      selectionMaskRef.current = maskCanvas;
+      // Purely mask-based selection — no stale geometry needed
+      selectionGeometryRef.current = { type: "mask" as LassoMode };
+      selectionShapesRef.current = [];
+      selectionBoundaryPathRef.current.dirty = true;
+      // Synchronously rebuild chains so the ant loop has correct data immediately.
+      rebuildChainsNowRef?.current?.(maskCanvas);
+      setActiveTool("lasso");
+      setSelectionActive(true);
+    },
+    [layerCanvasesRef, setActiveTool, rebuildChainsNowRef],
+  );
+
+  const clearSelection = useCallback(() => {
+    // Null geometry and mask FIRST so that if a RAF frame fires between here and
+    // cancelBoundaryRebuildRef, buildGeomPath sees geom=null and draws nothing.
+    selectionGeometryRef.current = null;
+    selectionShapesRef.current = [];
+    selectionMaskRef.current = null;
+    // Cancel any pending idle boundary rebuild AFTER nulling geometry/mask, so the
+    // idle callback can never write chains back for a now-dead session.
+    cancelBoundaryRebuildRef.current();
+    selectionBoundaryPathRef.current.dirty = true;
+    selectionBoundaryPathRef.current.chains = [];
+    selectionBoundaryPathRef.current.segments = [];
+    isDrawingSelectionRef.current = false;
+    selectionDraftPointsRef.current = [];
+    selectionDraftCursorRef.current = null;
+    selectionDraftBoundsRef.current = null;
+    selectionActiveRef.current = false;
+    setSelectionActive(false);
+    // Clear overlay
+    const overlay = selectionOverlayCanvasRef.current;
+    if (overlay) {
+      const ctx = overlay.getContext("2d", { willReadFrequently: true });
+      if (ctx) ctx.clearRect(0, 0, overlay.width, overlay.height);
+    }
+  }, [selectionOverlayCanvasRef]);
+
+  useEffect(() => {
+    selectionActionsRef.current.clearSelection = clearSelection;
+  }, [clearSelection]);
+
+  const deleteSelection = useCallback(() => {
+    if (!selectionActiveRef.current || !selectionMaskRef.current) return;
+    const layerId = activeLayerIdRef.current;
+    const lc = layerCanvasesRef.current.get(layerId!);
+    if (!lc) return;
+    const ctx = lc.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
+    const before = ctx.getImageData(0, 0, lc.width, lc.height);
+    ctx.save();
+    ctx.globalCompositeOperation = "destination-out";
+    ctx.drawImage(selectionMaskRef.current, 0, 0);
+    ctx.restore();
+    const after = ctx.getImageData(0, 0, lc.width, lc.height);
+    pushHistory({
+      type: "pixels",
+      layerId,
+      before,
+      after,
+    });
+    compositeRef.current();
+  }, [activeLayerIdRef, layerCanvasesRef, pushHistory, compositeRef]);
+
+  useEffect(() => {
+    selectionActionsRef.current.deleteSelection = deleteSelection;
+  }, [deleteSelection]);
+
+  const cutOrCopyToLayer = useCallback(
+    (cut: boolean) => {
+      const layerId = activeLayerIdRef.current;
+      const lc = layerCanvasesRef.current.get(layerId!);
+      if (!lc) return;
+
+      // No selection: only copy (not cut) duplicates the whole layer
+      if (!selectionActiveRef.current || !selectionMaskRef.current) {
+        if (cut) return;
+        const dupLayerData = newLayerFn();
+        dupLayerData.name = `${
+          layersRef.current.find((l) => l.id === layerId)?.name ?? "Layer"
+        } copy`;
+        const dupCanvas = document.createElement("canvas");
+        dupCanvas.width = canvasWidth;
+        dupCanvas.height = canvasHeight;
+        const dupCtx = dupCanvas.getContext("2d", {
+          willReadFrequently: true,
+        })!;
+        dupCtx.drawImage(lc, 0, 0);
+        const srcIdx = layersRef.current.findIndex((l) => l.id === layerId);
+        const insertIdx = Math.max(0, srcIdx);
+        const newLayers = [...layersRef.current];
+        newLayers.splice(insertIdx, 0, dupLayerData);
+        layersRef.current = newLayers;
+
+        const pixels = dupCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+        pendingLayerPixelsRef.current.set(dupLayerData.id, pixels);
+        setLayers(newLayers);
+        setActiveLayerId(dupLayerData.id);
+
+        pushHistory({
+          type: "layer-add-pixels",
+          layer: dupLayerData,
+          index: insertIdx,
+          pixels,
+        });
+
+        // toast called from PaintingApp via effect if needed — skip here to avoid import
+        return;
+      }
+
+      const srcCtx = lc.getContext("2d", { willReadFrequently: true });
+      if (!srcCtx) return;
+
+      // Capture source before state (for cut undo)
+      const srcBefore = cut
+        ? srcCtx.getImageData(0, 0, canvasWidth, canvasHeight)
+        : undefined;
+
+      // Create new layer canvas with just the selected pixels
+      const newLayerData = newLayerFn();
+      const nl = document.createElement("canvas");
+      nl.width = canvasWidth;
+      nl.height = canvasHeight;
+      const nlCtx = nl.getContext("2d", { willReadFrequently: true })!;
+      nlCtx.drawImage(lc, 0, 0);
+      nlCtx.globalCompositeOperation = "destination-in";
+      nlCtx.drawImage(selectionMaskRef.current!, 0, 0);
+      nlCtx.globalCompositeOperation = "source-over";
+      const newLayerPixels = nlCtx.getImageData(
+        0,
+        0,
+        canvasWidth,
+        canvasHeight,
+      );
+
+      let srcAfter: ImageData | undefined;
+      if (cut) {
+        srcCtx.save();
+        srcCtx.globalCompositeOperation = "destination-out";
+        srcCtx.drawImage(selectionMaskRef.current!, 0, 0);
+        srcCtx.restore();
+        srcAfter = srcCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+        markLayerBitmapDirty?.(layerId!);
+      }
+
+      // Insert new layer above active (sync ref before composite)
+      const srcIdx = layersRef.current.findIndex((l) => l.id === layerId);
+      const insertIdx = Math.max(0, srcIdx);
+      const newLayers = [...layersRef.current];
+      newLayers.splice(insertIdx, 0, newLayerData);
+      layersRef.current = newLayers;
+      pendingLayerPixelsRef.current.set(newLayerData.id, newLayerPixels);
+      setLayers(newLayers);
+      setActiveLayerId(newLayerData.id);
+
+      // Push single atomic history entry
+      pushHistory({
+        type: "layer-add-pixels",
+        layer: newLayerData,
+        index: insertIdx,
+        pixels: newLayerPixels,
+        ...(cut ? { srcLayerId: layerId, srcBefore, srcAfter } : {}),
+      });
+    },
+    [
+      activeLayerIdRef,
+      layerCanvasesRef,
+      layersRef,
+      pushHistory,
+      pendingLayerPixelsRef,
+      setLayers,
+      setActiveLayerId,
+      canvasWidth,
+      canvasHeight,
+      newLayerFn,
+      markLayerBitmapDirty,
+    ],
+  );
+
+  useEffect(() => {
+    selectionActionsRef.current.cutOrCopyToLayer = cutOrCopyToLayer;
+  }, [cutOrCopyToLayer]);
+
+  return {
+    // State
+    selectionActive,
+    setSelectionActive,
+    // Refs
+    selectionActiveRef,
+    selectionGeometryRef,
+    selectionShapesRef,
+    selectionBoundaryPathRef,
+    selectionMaskRef,
+    isDrawingSelectionRef,
+    selectionPolyClosingRef,
+    selectionDraftPointsRef,
+    selectionDraftCursorRef,
+    selectionDraftBoundsRef,
+    selectionBeforeRef,
+    selectionActionsRef,
+    cancelBoundaryRebuildRef,
+    // Functions
+    snapshotSelection,
+    restoreSelectionSnapshot,
+    rasterizeSelectionMask,
+    clearSelection,
+    deleteSelection,
+    cutOrCopyToLayer,
+    handleCtrlClickLayer,
+  };
+}
+
+export type { SelectionGeom, SelectionSnapshot };
+
+// Re-export computeMaskBounds so callers can import from one place
+export { computeMaskBounds } from "../utils/selectionUtils";

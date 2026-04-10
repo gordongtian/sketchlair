@@ -7,6 +7,7 @@ import {
   Sliders,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getLuminance } from "../utils/colorUtils";
 
 // ============================================================
 // Color utilities
@@ -74,6 +75,45 @@ function hsvToRgb(h: number, s: number, v: number): [number, number, number] {
   return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
 }
 
+// HSL helpers for the Lightness slider
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h = 0;
+  if (max === rn) h = ((gn - bn) / d + (gn < bn ? 6 : 0)) / 6;
+  else if (max === gn) h = ((bn - rn) / d + 2) / 6;
+  else h = ((rn - gn) / d + 4) / 6;
+  return [h * 360, s, l];
+}
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  const hn = ((h % 360) + 360) % 360;
+  if (s === 0) {
+    const v = Math.round(l * 255);
+    return [v, v, v];
+  }
+  function hue2rgb(p: number, q: number, t: number) {
+    const tv = t < 0 ? t + 1 : t > 1 ? t - 1 : t;
+    if (tv < 1 / 6) return p + (q - p) * 6 * tv;
+    if (tv < 1 / 2) return q;
+    if (tv < 2 / 3) return p + (q - p) * (2 / 3 - tv) * 6;
+    return p;
+  }
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const r = hue2rgb(p, q, hn / 360 + 1 / 3);
+  const g = hue2rgb(p, q, hn / 360);
+  const b = hue2rgb(p, q, hn / 360 - 1 / 3);
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+
 function clamp(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v));
 }
@@ -81,10 +121,11 @@ function clamp(v: number, lo: number, hi: number) {
 // ============================================================
 // Pixel manipulation helpers
 // ============================================================
-export function applyHSV(
+export function applyHSLB(
   data: Uint8ClampedArray,
   hueOffset: number,
   satOffset: number,
+  lightOffset: number,
   valOffset: number,
   selectionMask?: HTMLCanvasElement | null,
 ) {
@@ -105,16 +146,25 @@ export function applyHSV(
       const pxIdx = i / 4;
       if (maskData[pxIdx * 4 + 3] < 128) continue;
     }
+    // Apply Brightness (V channel) via HSV
     const [h, s, v] = rgbToHsv(data[i], data[i + 1], data[i + 2]);
     const nh = h + hueOffset;
     const ns = clamp(s + satOffset / 100, 0, 1);
     const nv = clamp(v + valOffset / 100, 0, 1);
-    const [r, g, b] = hsvToRgb(nh, ns, nv);
+    let [r, g, b] = hsvToRgb(nh, ns, nv);
+    // Apply Lightness (L channel) via HSL — shifts toward white/black
+    if (lightOffset !== 0) {
+      const [lh, ls, ll] = rgbToHsl(r, g, b);
+      const nl = clamp(ll + lightOffset / 100, 0, 1);
+      [r, g, b] = hslToRgb(lh, ls, nl);
+    }
     data[i] = r;
     data[i + 1] = g;
     data[i + 2] = b;
   }
 }
+// Keep old name as alias for any external callers
+export const applyHSV = applyHSLB;
 
 export function applyLevels(
   data: Uint8ClampedArray,
@@ -266,12 +316,15 @@ export function applyCurves(
 // ============================================================
 export interface AdjustmentsPanelProps {
   activeLayerId: string | null;
+  activeLayerIsRuler: boolean;
   layerCanvasesRef: React.RefObject<Map<string, HTMLCanvasElement>>;
   selectionMaskRef: React.RefObject<HTMLCanvasElement | null>;
   selectionActive: boolean;
   onPushUndo: (layerId: string, before: ImageData, after: ImageData) => void;
   onPreview: () => void;
   onComposite: () => void;
+  onThumbnailUpdate: (layerId: string) => void;
+  onMarkLayerDirty?: (id: string) => void;
 }
 
 type AdjType = "hsv" | "levels" | "curves";
@@ -284,39 +337,45 @@ const DEFAULT_CURVE_POINTS: CurvePoint[] = [
 // ============================================================
 // HSV Panel
 // ============================================================
-function HSVPanel({
+function HSLBPanel({
   layerCanvas,
-  selectionMask,
+  selectionMaskRef,
   selectionActive,
   onApply,
   onCancel,
   onPreview,
+  onOriginalCaptured,
 }: {
   layerCanvas: HTMLCanvasElement;
-  selectionMask: HTMLCanvasElement | null;
+  selectionMaskRef: React.RefObject<HTMLCanvasElement | null>;
   selectionActive: boolean;
   onApply: (before: ImageData, after: ImageData) => void;
   onCancel: () => void;
   onPreview: () => void;
+  onOriginalCaptured: (orig: ImageData) => void;
 }) {
   const [hue, setHue] = useState(0);
   const [sat, setSat] = useState(0);
+  const [light, setLight] = useState(0);
   const [val, setVal] = useState(0);
   const originalRef = useRef<ImageData | null>(null);
 
   useEffect(() => {
     const ctx = layerCanvas.getContext("2d");
-    if (ctx)
-      originalRef.current = ctx.getImageData(
+    if (ctx) {
+      const snap = ctx.getImageData(
         0,
         0,
         layerCanvas.width,
         layerCanvas.height,
       );
-  }, [layerCanvas]);
+      originalRef.current = snap;
+      onOriginalCaptured(snap);
+    }
+  }, [layerCanvas, onOriginalCaptured]);
 
   const applyPreview = useCallback(
-    (h: number, s: number, v: number) => {
+    (h: number, s: number, l: number, v: number) => {
       const orig = originalRef.current;
       if (!orig) return;
       const copy = new ImageData(
@@ -324,12 +383,19 @@ function HSVPanel({
         orig.width,
         orig.height,
       );
-      applyHSV(copy.data, h, s, v, selectionActive ? selectionMask : null);
+      applyHSLB(
+        copy.data,
+        h,
+        s,
+        l,
+        v,
+        selectionActive ? selectionMaskRef.current : null,
+      );
       const ctx = layerCanvas.getContext("2d");
       if (ctx) ctx.putImageData(copy, 0, 0);
       onPreview();
     },
-    [layerCanvas, selectionMask, selectionActive, onPreview],
+    [layerCanvas, selectionMaskRef, selectionActive, onPreview],
   );
 
   const handleApply = () => {
@@ -340,7 +406,14 @@ function HSVPanel({
       orig.width,
       orig.height,
     );
-    applyHSV(after.data, hue, sat, val, selectionActive ? selectionMask : null);
+    applyHSLB(
+      after.data,
+      hue,
+      sat,
+      light,
+      val,
+      selectionActive ? selectionMaskRef.current : null,
+    );
     const ctx = layerCanvas.getContext("2d");
     if (ctx) ctx.putImageData(after, 0, 0);
     onApply(orig, after);
@@ -364,7 +437,7 @@ function HSVPanel({
         max={180}
         onChange={(v) => {
           setHue(v);
-          applyPreview(v, sat, val);
+          applyPreview(v, sat, light, val);
         }}
       />
       <AdjSlider
@@ -374,7 +447,17 @@ function HSVPanel({
         max={100}
         onChange={(v) => {
           setSat(v);
-          applyPreview(hue, v, val);
+          applyPreview(hue, v, light, val);
+        }}
+      />
+      <AdjSlider
+        label="Lightness"
+        value={light}
+        min={-100}
+        max={100}
+        onChange={(v) => {
+          setLight(v);
+          applyPreview(hue, sat, v, val);
         }}
       />
       <AdjSlider
@@ -384,7 +467,7 @@ function HSVPanel({
         max={100}
         onChange={(v) => {
           setVal(v);
-          applyPreview(hue, sat, v);
+          applyPreview(hue, sat, light, v);
         }}
       />
       <AdjButtons onApply={handleApply} onCancel={handleCancel} />
@@ -465,7 +548,9 @@ function LevelsTriangleTrack({
 
 // Gamma <-> position helpers (module-level, pure functions)
 function gammaToPos(gamma: number, ib: number, iw: number): number {
-  const t = 0.5 ** (1 / gamma);
+  // t = 0.5^gamma: the input fraction whose output is 0.5 (midpoint) at this gamma.
+  // gamma>1 (brightening) → handle moves left; gamma<1 (darkening) → handle moves right.
+  const t = 0.5 ** gamma;
   return ib + (iw - ib) * t;
 }
 
@@ -474,24 +559,27 @@ function posToGamma(pos: number, ib: number, iw: number): number {
   if (range <= 0) return 1.0;
   const t = (pos - ib) / range;
   const tc = clamp(t, 0.001, 0.999);
-  const gamma = Math.log(0.5) / Math.log(tc);
+  // Inverse of t = 0.5^gamma: gamma = log(t)/log(0.5)
+  const gamma = Math.log(tc) / Math.log(0.5);
   return clamp(gamma, 0.1, 9.99);
 }
 
 function LevelsPanel({
   layerCanvas,
-  selectionMask,
+  selectionMaskRef,
   selectionActive,
   onApply,
   onCancel,
   onPreview,
+  onOriginalCaptured,
 }: {
   layerCanvas: HTMLCanvasElement;
-  selectionMask: HTMLCanvasElement | null;
+  selectionMaskRef: React.RefObject<HTMLCanvasElement | null>;
   selectionActive: boolean;
   onApply: (before: ImageData, after: ImageData) => void;
   onCancel: () => void;
   onPreview: () => void;
+  onOriginalCaptured: (orig: ImageData) => void;
 }) {
   const [inBlack, setInBlack] = useState(0);
   const [inGamma, setInGamma] = useState(1.0);
@@ -503,6 +591,7 @@ function LevelsPanel({
   const trackRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef<LevelsDragTarget>(null);
   const trackWidthRef = useRef(180);
+  const previewRafRef = useRef<number | null>(null);
 
   // State refs so drag handlers can read current values without stale closure
   const stateRef = useRef({ inBlack, inGamma, inWhite, outBlack, outWhite });
@@ -511,23 +600,18 @@ function LevelsPanel({
   useEffect(() => {
     const ctx = layerCanvas.getContext("2d");
     if (!ctx) return;
-    originalRef.current = ctx.getImageData(
-      0,
-      0,
-      layerCanvas.width,
-      layerCanvas.height,
-    );
+    const snap = ctx.getImageData(0, 0, layerCanvas.width, layerCanvas.height);
+    originalRef.current = snap;
+    onOriginalCaptured(snap);
     // Draw histogram
     const hc = histCanvasRef.current;
     if (!hc) return;
     const hCtx = hc.getContext("2d");
     if (!hCtx) return;
-    const data = originalRef.current.data;
+    const data = snap.data;
     const buckets = new Array(256).fill(0);
     for (let i = 0; i < data.length; i += 4) {
-      const lum = Math.round(
-        0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2],
-      );
+      const lum = Math.round(getLuminance(data[i], data[i + 1], data[i + 2]));
       buckets[lum]++;
     }
     const maxBucket = Math.max(...buckets);
@@ -545,31 +629,37 @@ function LevelsPanel({
       hCtx.fillStyle = `rgb(${lightness},${lightness},${lightness})`;
       hCtx.fillRect(x, hc.height - barH, w, barH);
     }
-  }, [layerCanvas]);
+  }, [layerCanvas, onOriginalCaptured]);
 
   const doApplyPreview = useCallback(
     (ib: number, ig: number, iw: number, ob: number, ow: number) => {
-      const orig = originalRef.current;
-      if (!orig) return;
-      const copy = new ImageData(
-        new Uint8ClampedArray(orig.data),
-        orig.width,
-        orig.height,
-      );
-      applyLevels(
-        copy.data,
-        ib,
-        ig,
-        iw,
-        ob,
-        ow,
-        selectionActive ? selectionMask : null,
-      );
-      const ctx = layerCanvas.getContext("2d");
-      if (ctx) ctx.putImageData(copy, 0, 0);
-      onPreview();
+      if (previewRafRef.current !== null) {
+        cancelAnimationFrame(previewRafRef.current);
+      }
+      previewRafRef.current = requestAnimationFrame(() => {
+        previewRafRef.current = null;
+        const orig = originalRef.current;
+        if (!orig) return;
+        const copy = new ImageData(
+          new Uint8ClampedArray(orig.data),
+          orig.width,
+          orig.height,
+        );
+        applyLevels(
+          copy.data,
+          ib,
+          ig,
+          iw,
+          ob,
+          ow,
+          selectionActive ? selectionMaskRef.current : null,
+        );
+        const ctx = layerCanvas.getContext("2d");
+        if (ctx) ctx.putImageData(copy, 0, 0);
+        onPreview();
+      });
     },
-    [layerCanvas, selectionMask, selectionActive, onPreview],
+    [layerCanvas, selectionMaskRef, selectionActive, onPreview],
   );
 
   // Pointer drag handling — attached to window so we can drag outside the element
@@ -647,7 +737,7 @@ function LevelsPanel({
       inWhite,
       outBlack,
       outWhite,
-      selectionActive ? selectionMask : null,
+      selectionActive ? selectionMaskRef.current : null,
     );
     const ctx = layerCanvas.getContext("2d");
     if (ctx) ctx.putImageData(after, 0, 0);
@@ -837,18 +927,20 @@ const ANCHOR_RADIUS = 5;
 
 function CurvesPanel({
   layerCanvas,
-  selectionMask,
+  selectionMaskRef,
   selectionActive,
   onApply,
   onCancel,
   onPreview,
+  onOriginalCaptured,
 }: {
   layerCanvas: HTMLCanvasElement;
-  selectionMask: HTMLCanvasElement | null;
+  selectionMaskRef: React.RefObject<HTMLCanvasElement | null>;
   selectionActive: boolean;
   onApply: (before: ImageData, after: ImageData) => void;
   onCancel: () => void;
   onPreview: () => void;
+  onOriginalCaptured: (orig: ImageData) => void;
 }) {
   type Channel = "rgb" | "r" | "g" | "b";
   const [activeChannel, setActiveChannel] = useState<Channel>("rgb");
@@ -867,17 +959,21 @@ function CurvesPanel({
   const originalRef = useRef<ImageData | null>(null);
   const curveCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const draggingIdxRef = useRef<number | null>(null);
+  const previewRafRef = useRef<number | null>(null);
 
   useEffect(() => {
     const ctx = layerCanvas.getContext("2d");
-    if (ctx)
-      originalRef.current = ctx.getImageData(
+    if (ctx) {
+      const snap = ctx.getImageData(
         0,
         0,
         layerCanvas.width,
         layerCanvas.height,
       );
-  }, [layerCanvas]);
+      originalRef.current = snap;
+      onOriginalCaptured(snap);
+    }
+  }, [layerCanvas, onOriginalCaptured]);
 
   const getPoints = useCallback(() => {
     if (activeChannel === "rgb") return pointsRGB;
@@ -972,26 +1068,32 @@ function CurvesPanel({
 
   const applyPreview = useCallback(
     (rgb: CurvePoint[], r: CurvePoint[], g: CurvePoint[], b: CurvePoint[]) => {
-      const orig = originalRef.current;
-      if (!orig) return;
-      const copy = new ImageData(
-        new Uint8ClampedArray(orig.data),
-        orig.width,
-        orig.height,
-      );
-      applyCurves(
-        copy.data,
-        rgb,
-        r,
-        g,
-        b,
-        selectionActive ? selectionMask : null,
-      );
-      const ctx = layerCanvas.getContext("2d");
-      if (ctx) ctx.putImageData(copy, 0, 0);
-      onPreview();
+      if (previewRafRef.current !== null) {
+        cancelAnimationFrame(previewRafRef.current);
+      }
+      previewRafRef.current = requestAnimationFrame(() => {
+        previewRafRef.current = null;
+        const orig = originalRef.current;
+        if (!orig) return;
+        const copy = new ImageData(
+          new Uint8ClampedArray(orig.data),
+          orig.width,
+          orig.height,
+        );
+        applyCurves(
+          copy.data,
+          rgb,
+          r,
+          g,
+          b,
+          selectionActive ? selectionMaskRef.current : null,
+        );
+        const ctx = layerCanvas.getContext("2d");
+        if (ctx) ctx.putImageData(copy, 0, 0);
+        onPreview();
+      });
     },
-    [layerCanvas, selectionMask, selectionActive, onPreview],
+    [layerCanvas, selectionMaskRef, selectionActive, onPreview],
   );
 
   const ptFromEvent = (
@@ -1094,7 +1196,7 @@ function CurvesPanel({
       pointsR,
       pointsG,
       pointsB,
-      selectionActive ? selectionMask : null,
+      selectionActive ? selectionMaskRef.current : null,
     );
     const ctx = layerCanvas.getContext("2d");
     if (ctx) ctx.putImageData(after, 0, 0);
@@ -1192,8 +1294,12 @@ function AdjSlider({
         step={step}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full h-1 rounded appearance-none bg-muted cursor-pointer accent-primary"
-        style={{ accentColor: "var(--primary)" }}
+        className="w-full h-1 rounded appearance-none cursor-pointer"
+        style={
+          {
+            "--fill-pct": `${((value - min) / (max - min)) * 100}%`,
+          } as React.CSSProperties
+        }
         data-ocid={`adjustments.${label.toLowerCase().replace(/\s+/g, "_")}_input`}
       />
     </div>
@@ -1233,36 +1339,66 @@ function AdjButtons({
 // Main AdjustmentsPresetsPanel
 // ============================================================
 const ADJ_TOOLS: { id: AdjType; label: string; icon: React.ReactNode }[] = [
-  { id: "hsv", label: "HSV / Color", icon: <Sliders size={14} /> },
+  { id: "hsv", label: "HSLB", icon: <Sliders size={14} /> },
   { id: "levels", label: "Levels", icon: <BarChart2 size={14} /> },
   { id: "curves", label: "Curves", icon: <Activity size={14} /> },
 ];
 
 export function AdjustmentsPresetsPanel({
   activeLayerId,
+  activeLayerIsRuler,
   layerCanvasesRef,
   selectionMaskRef,
   selectionActive,
   onPushUndo,
   onPreview,
   onComposite,
+  onThumbnailUpdate,
+  onMarkLayerDirty,
 }: AdjustmentsPanelProps) {
   const [openAdj, setOpenAdj] = useState<AdjType | null>(null);
+  // Bug 1 fix: hold a snapshot of the layer pixels at the moment any sub-panel opens,
+  // so we can restore it before switching panels (avoiding corrupted originalRef).
+  const outerOriginalRef = useRef<ImageData | null>(null);
 
   const layerCanvas = activeLayerId
     ? (layerCanvasesRef.current?.get(activeLayerId) ?? null)
     : null;
 
-  const selMask = selectionMaskRef.current ?? null;
+  // Bug 1: restore pixels before switching away from an open panel
+  const handleOpenAdj = (next: AdjType | null) => {
+    if (
+      openAdj !== null &&
+      openAdj !== next &&
+      outerOriginalRef.current &&
+      layerCanvas
+    ) {
+      const ctx = layerCanvas.getContext("2d");
+      if (ctx) ctx.putImageData(outerOriginalRef.current, 0, 0);
+      onPreview();
+    }
+    outerOriginalRef.current = null;
+    setOpenAdj(next);
+  };
+
+  // Called by sub-panels once their originalRef is captured
+  const handleOriginalCaptured = useCallback((orig: ImageData) => {
+    outerOriginalRef.current = orig;
+  }, []);
 
   const handleApply = (before: ImageData, after: ImageData) => {
     if (!activeLayerId) return;
+    onMarkLayerDirty?.(activeLayerId);
     onPushUndo(activeLayerId, before, after);
+    outerOriginalRef.current = null;
     setOpenAdj(null);
+    // Bug 2 fix: update the layer thumbnail after applying an adjustment
+    onThumbnailUpdate(activeLayerId);
     onComposite();
   };
 
   const handleCancel = () => {
+    outerOriginalRef.current = null;
     setOpenAdj(null);
     onComposite();
   };
@@ -1284,7 +1420,9 @@ export function AdjustmentsPresetsPanel({
           {ADJ_TOOLS.map((adj, idx) => {
             const isOpen = openAdj === adj.id;
             const canApply =
-              layerCanvas !== null && activeLayerId !== "layer-background";
+              layerCanvas !== null &&
+              activeLayerId !== "layer-background" &&
+              !activeLayerIsRuler;
             return (
               <div key={adj.id} className="flex flex-col">
                 <button
@@ -1292,7 +1430,7 @@ export function AdjustmentsPresetsPanel({
                   data-ocid={`adjustments.tool.item.${idx + 1}`}
                   onClick={() => {
                     if (!canApply) return;
-                    setOpenAdj(isOpen ? null : adj.id);
+                    handleOpenAdj(isOpen ? null : adj.id);
                   }}
                   className={`flex items-center gap-2.5 px-3 py-2 rounded-md text-xs font-medium w-full text-left transition-all duration-100 ${
                     isOpen
@@ -1324,36 +1462,39 @@ export function AdjustmentsPresetsPanel({
                 {isOpen && layerCanvas && (
                   <div className="mt-1 rounded-md border border-border bg-card/60 overflow-hidden">
                     {adj.id === "hsv" && (
-                      <HSVPanel
-                        key={`hsv-${activeLayerId}`}
+                      <HSLBPanel
+                        key={`hslb-${activeLayerId}`}
                         layerCanvas={layerCanvas}
-                        selectionMask={selMask}
+                        selectionMaskRef={selectionMaskRef}
                         selectionActive={selectionActive}
                         onApply={handleApply}
                         onCancel={handleCancel}
                         onPreview={onPreview}
+                        onOriginalCaptured={handleOriginalCaptured}
                       />
                     )}
                     {adj.id === "levels" && (
                       <LevelsPanel
                         key={`levels-${activeLayerId}`}
                         layerCanvas={layerCanvas}
-                        selectionMask={selMask}
+                        selectionMaskRef={selectionMaskRef}
                         selectionActive={selectionActive}
                         onApply={handleApply}
                         onCancel={handleCancel}
                         onPreview={onPreview}
+                        onOriginalCaptured={handleOriginalCaptured}
                       />
                     )}
                     {adj.id === "curves" && (
                       <CurvesPanel
                         key={`curves-${activeLayerId}`}
                         layerCanvas={layerCanvas}
-                        selectionMask={selMask}
+                        selectionMaskRef={selectionMaskRef}
                         selectionActive={selectionActive}
                         onApply={handleApply}
                         onCancel={handleCancel}
                         onPreview={onPreview}
+                        onOriginalCaptured={handleOriginalCaptured}
                       />
                     )}
                   </div>
@@ -1362,9 +1503,9 @@ export function AdjustmentsPresetsPanel({
             );
           })}
 
-          {activeLayerId === "layer-background" && (
+          {(activeLayerId === "layer-background" || activeLayerIsRuler) && (
             <div className="px-3 py-4 text-xs text-muted-foreground text-center">
-              Adjustments cannot be applied to the background layer.
+              Adjustments cannot be applied to this layer.
             </div>
           )}
 

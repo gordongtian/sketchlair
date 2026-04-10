@@ -36,7 +36,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 
 interface ToolPresetsPanelProps {
-  tool: "brush" | "smear" | "eraser";
+  tool: "brush" | "smudge" | "eraser";
   presets: Preset[];
   activePresetId: string | null;
   currentSettings: BrushSettings;
@@ -57,9 +57,9 @@ interface ToolPresetsPanelProps {
   currentOpacity?: number;
 }
 
-const TOOL_LABELS: Record<"brush" | "smear" | "eraser", string> = {
+const TOOL_LABELS: Record<"brush" | "smudge" | "eraser", string> = {
   brush: "Brush",
-  smear: "Smudge",
+  smudge: "Smudge",
   eraser: "Eraser",
 };
 
@@ -120,7 +120,7 @@ function BrushTipPickerDialog({
                 >
                   {tip.tipImageData ? (
                     <img
-                      src={tip.tipImageData}
+                      src={tip.tipImageData!}
                       alt={tip.name}
                       className="w-full h-full object-cover"
                       style={{ imageRendering: "pixelated" }}
@@ -211,9 +211,6 @@ export function ToolPresetsPanel({
   onClose: _onClose,
   onDeletePreset,
   onReorderPresets,
-  onSaveCurrentToPreset,
-  currentSize,
-  currentOpacity,
 }: ToolPresetsPanelProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
@@ -265,7 +262,7 @@ export function ToolPresetsPanel({
 
   return (
     <div
-      className="flex flex-col border-r border-border bg-card h-full"
+      className="flex flex-col border-r border-border flex-1 min-h-0"
       style={{ width: "100%", minWidth: 0 }}
     >
       {/* Header */}
@@ -276,10 +273,11 @@ export function ToolPresetsPanel({
       </div>
 
       {/* Presets list — scrollable, fills available height */}
-      <ScrollArea
+      <div
         className="flex-1 min-h-0"
         style={{
-          WebkitOverflowScrolling: "touch" as any,
+          overflowY: "auto",
+          WebkitOverflowScrolling: "touch",
           overscrollBehavior: "contain",
         }}
       >
@@ -295,7 +293,7 @@ export function ToolPresetsPanel({
                 data-ocid={`tool_presets.preset.item.${itemIndex}`}
                 className={`rounded-md border transition-all duration-100 overflow-hidden min-w-0 ${
                   isActive
-                    ? "border-primary bg-primary/10"
+                    ? "border-primary bg-[oklch(var(--accent)/0.2)]"
                     : "border-border bg-muted/30 hover:bg-muted/60"
                 }`}
               >
@@ -388,7 +386,57 @@ export function ToolPresetsPanel({
                             defaultSize: Math.round(v),
                           });
                         }}
-                        className="w-full min-w-0 h-1 accent-primary cursor-pointer"
+                        style={
+                          {
+                            "--fill-pct": `${defaultSizeToSlider(preset.defaultSize ?? 1)}%`,
+                          } as React.CSSProperties
+                        }
+                        className="w-full min-w-0 h-1 cursor-pointer"
+                      />
+                    </div>
+                    {/* Default Flow slider */}
+                    <div className="flex flex-col gap-0.5 min-w-0 w-full">
+                      <div className="flex items-center justify-between min-w-0">
+                        <span className="text-xs text-muted-foreground">
+                          Default Flow
+                        </span>
+                        <input
+                          type="number"
+                          min={0}
+                          max={100}
+                          value={Math.round((preset.defaultFlow ?? 1.0) * 100)}
+                          onChange={(e) => {
+                            const v =
+                              e.target.value === ""
+                                ? 100
+                                : Math.min(
+                                    100,
+                                    Math.max(0, Number(e.target.value)),
+                                  );
+                            onUpdatePreset({ ...preset, defaultFlow: v / 100 });
+                          }}
+                          className="text-xs text-foreground bg-transparent border border-border rounded px-1 text-right focus:outline-none focus:border-primary [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                          style={{ width: 48 }}
+                        />
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={Math.round((preset.defaultFlow ?? 1.0) * 100)}
+                        onChange={(e) => {
+                          onUpdatePreset({
+                            ...preset,
+                            defaultFlow: Number(e.target.value) / 100,
+                          });
+                        }}
+                        style={
+                          {
+                            "--fill-pct": `${Math.round((preset.defaultFlow ?? 1.0) * 100)}%`,
+                          } as React.CSSProperties
+                        }
+                        className="w-full min-w-0 h-1 cursor-pointer"
                       />
                     </div>
                     {/* Mini brush settings — auto-save on every change */}
@@ -410,25 +458,6 @@ export function ToolPresetsPanel({
                       />
                     </div>
 
-                    {/* Save Size & Opacity */}
-                    {onSaveCurrentToPreset &&
-                      currentSize !== undefined &&
-                      currentOpacity !== undefined && (
-                        <button
-                          type="button"
-                          data-ocid={`tool_presets.preset.save_size_button.${itemIndex}`}
-                          onClick={() =>
-                            onSaveCurrentToPreset(
-                              preset.id,
-                              currentSize!,
-                              currentOpacity!,
-                            )
-                          }
-                          className="w-full h-7 text-xs rounded bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground transition-colors flex items-center justify-center gap-1"
-                        >
-                          Save Current Size &amp; Opacity to Preset
-                        </button>
-                      )}
                     {/* Actions row: Delete */}
                     <div className="flex items-center justify-between gap-2">
                       {presets.length > 1 ? (
@@ -511,7 +540,7 @@ export function ToolPresetsPanel({
                     >
                       {preset.settings.tipImageData ? (
                         <img
-                          src={preset.settings.tipImageData}
+                          src={preset.settings.tipImageData!}
                           alt="tip"
                           className="w-full h-full object-cover"
                           style={{ imageRendering: "pixelated" }}
@@ -526,7 +555,29 @@ export function ToolPresetsPanel({
                     <button
                       type="button"
                       className="flex-1 text-left px-2 py-2 text-xs font-medium truncate"
-                      onClick={() => {
+                      style={{ touchAction: "manipulation", cursor: "pointer" }}
+                      onPointerDown={(e) => {
+                        (
+                          e.currentTarget as HTMLButtonElement & {
+                            _pdX?: number;
+                            _pdY?: number;
+                          }
+                        )._pdX = e.clientX;
+                        (
+                          e.currentTarget as HTMLButtonElement & {
+                            _pdX?: number;
+                            _pdY?: number;
+                          }
+                        )._pdY = e.clientY;
+                      }}
+                      onPointerUp={(e) => {
+                        const btn = e.currentTarget as HTMLButtonElement & {
+                          _pdX?: number;
+                          _pdY?: number;
+                        };
+                        const dx = (btn._pdX ?? e.clientX) - e.clientX;
+                        const dy = (btn._pdY ?? e.clientY) - e.clientY;
+                        if (Math.sqrt(dx * dx + dy * dy) > 5) return;
                         if (editingId !== null && editingId !== preset.id) {
                           setEditingId(null);
                         }
@@ -535,14 +586,20 @@ export function ToolPresetsPanel({
                       }}
                     >
                       <span
-                        className={
-                          isActive ? "text-primary" : "text-foreground"
+                        className={isActive ? "" : "text-foreground"}
+                        style={
+                          isActive
+                            ? { color: "oklch(var(--highlighted-text))" }
+                            : undefined
                         }
                       >
                         {preset.name}
                       </span>
                       {isActive && (
-                        <span className="ml-1.5 text-primary opacity-70">
+                        <span
+                          className="ml-1.5 opacity-70"
+                          style={{ color: "oklch(var(--highlighted-text))" }}
+                        >
                           ✓
                         </span>
                       )}
@@ -562,35 +619,35 @@ export function ToolPresetsPanel({
               </div>
             );
           })}
-        </div>
-      </ScrollArea>
 
-      {/* Add new preset button */}
-      <div className="p-2 border-t border-border shrink-0">
-        <Dialog open={tipPickerOpen} onOpenChange={setTipPickerOpen}>
-          <Button
-            variant="ghost"
-            size="sm"
-            data-ocid="tool_presets.add_button"
-            className="w-full h-8 text-xs justify-start gap-1.5"
-            onClick={() => setTipPickerOpen(true)}
-          >
-            <Plus size={13} />
-            New Preset
-          </Button>
-          <BrushTipPickerDialog
-            availableTips={
-              availableTips ??
-              presets.map((p) => ({
-                id: p.id,
-                name: p.name,
-                tipImageData: p.settings.tipImageData,
-              }))
-            }
-            onPick={handlePickTip}
-            onCancel={() => setTipPickerOpen(false)}
-          />
-        </Dialog>
+          {/* Add new preset button — inside scroll area */}
+          <div className="pt-1 mt-1 border-t border-border">
+            <Dialog open={tipPickerOpen} onOpenChange={setTipPickerOpen}>
+              <Button
+                variant="ghost"
+                size="sm"
+                data-ocid="tool_presets.add_button"
+                className="w-full h-8 text-xs justify-start gap-1.5"
+                onClick={() => setTipPickerOpen(true)}
+              >
+                <Plus size={13} />
+                New Preset
+              </Button>
+              <BrushTipPickerDialog
+                availableTips={
+                  availableTips ??
+                  presets.map((p) => ({
+                    id: p.id,
+                    name: p.name,
+                    tipImageData: p.settings.tipImageData,
+                  }))
+                }
+                onPick={handlePickTip}
+                onCancel={() => setTipPickerOpen(false)}
+              />
+            </Dialog>
+          </div>
+        </div>
       </div>
     </div>
   );

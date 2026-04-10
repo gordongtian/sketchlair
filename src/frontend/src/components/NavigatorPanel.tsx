@@ -1,19 +1,15 @@
-import { Minus, Plus, RotateCcw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-
-interface ViewTransform {
-  panX: number;
-  panY: number;
-  zoom: number;
-  rotation: number;
-}
+import type { ViewTransform } from "../types";
 
 interface NavigatorPanelProps {
   viewTransform: ViewTransform;
   onSetTransform: (t: ViewTransform) => void;
   canvasWidth: number;
   canvasHeight: number;
-  thumbnailDataUrl: string | null;
+  thumbnailCanvas: HTMLCanvasElement | null;
+  thumbnailVersion: number;
+  /** Whether the canvas is horizontally flipped — affects the viewport indicator direction */
+  isFlipped?: boolean;
 }
 
 export function NavigatorPanel({
@@ -21,14 +17,16 @@ export function NavigatorPanel({
   onSetTransform,
   canvasWidth,
   canvasHeight,
-  thumbnailDataUrl,
+  thumbnailCanvas,
+  thumbnailVersion,
+  isFlipped = false,
 }: NavigatorPanelProps) {
   const [collapsed, setCollapsed] = useState(false);
   const thumbRef = useRef<HTMLCanvasElement>(null);
   const isDragging = useRef(false);
-  const THUMB_W = 204;
+  const THUMB_W = 1024;
   const thumbH = Math.round((canvasHeight / canvasWidth) * THUMB_W);
-
+  // biome-ignore lint/correctness/useExhaustiveDependencies: thumbnailVersion signals new pixels in the same canvas ref
   useEffect(() => {
     const canvas = thumbRef.current;
     if (!canvas) return;
@@ -37,38 +35,84 @@ export function NavigatorPanel({
 
     const drawViewport = (c: CanvasRenderingContext2D) => {
       const zoom = viewTransform.zoom;
-      const vw = (THUMB_W / canvasWidth) * (canvasWidth / zoom);
-      const vh = (thumbH / canvasHeight) * (canvasHeight / zoom);
-      const cx2 = THUMB_W / 2 - (viewTransform.panX / canvasWidth) * THUMB_W;
-      const cy2 = thumbH / 2 - (viewTransform.panY / canvasHeight) * thumbH;
-      c.strokeStyle = "rgba(255,200,0,0.9)";
-      c.lineWidth = 1.5;
-      c.strokeRect(cx2 - vw / 2, cy2 - vh / 2, vw, vh);
+      // Viewport dimensions in thumbnail-space (how much of the canvas is visible)
+      const vw = THUMB_W / zoom;
+      const vh = thumbH / zoom;
+
+      // The canvas center in thumbnail-space is (THUMB_W/2, thumbH/2).
+      // panX/panY are in screen-space pixels offset from center, so we convert:
+      //   screenPanX moves the canvas right by panX px → canvas center shifts right
+      //   In thumbnail coords: shiftX = panX * (THUMB_W / canvasWidth) / zoom ... but pan is
+      //   screen-space not canvas-space. Actually pan is applied as CSS translate in screen px,
+      //   so 1 screen px of pan corresponds to (THUMB_W / canvasWidth) / zoom thumbnail pixels.
+      //   Simpler: the viewport center in canvas coords = canvas_center - (panX/zoom, panY/zoom)
+      //   Then map canvas coords to thumb coords by scaling.
+      const canvasCenterX = canvasWidth / 2 - viewTransform.panX / zoom;
+      const canvasCenterY = canvasHeight / 2 - viewTransform.panY / zoom;
+      const cx2 = (canvasCenterX / canvasWidth) * THUMB_W;
+      const cy2 = (canvasCenterY / canvasHeight) * thumbH;
+
+      const rot = (viewTransform.rotation * Math.PI) / 180;
+      const flipSign = isFlipped ? -1 : 1;
+
+      // Compute minimum stroke width so each line is at least 2 CSS pixels wide.
+      // The canvas is THUMB_W internal pixels displayed at clientWidth CSS pixels,
+      // so 1 CSS pixel = (THUMB_W / clientWidth) canvas pixels.
+      const displayWidth = thumbRef.current?.clientWidth ?? 0;
+      const cssToCanvas = displayWidth > 0 ? THUMB_W / displayWidth : 8;
+      const minStroke = 2 * cssToCanvas; // 2 CSS pixels in canvas-space units
+
+      c.save();
+      c.translate(cx2, cy2);
+      c.rotate(rot * flipSign);
+      // Outer dark shadow stroke for contrast on any background
+      c.strokeStyle = "rgba(0,0,0,0.7)";
+      c.lineWidth = Math.max(6, minStroke);
+      c.strokeRect(-vw / 2, -vh / 2, vw, vh);
+      // Main bright indicator stroke
+      c.strokeStyle = "rgba(255,200,0,1)";
+      c.lineWidth = Math.max(4, minStroke);
+      c.strokeRect(-vw / 2, -vh / 2, vw, vh);
+      // Draw a small cross at the center for reference
+      const cross = 7;
+      c.lineWidth = Math.max(3, minStroke);
+      c.strokeStyle = "rgba(0,0,0,0.7)";
+      c.beginPath();
+      c.moveTo(-cross, 0);
+      c.lineTo(cross, 0);
+      c.moveTo(0, -cross);
+      c.lineTo(0, cross);
+      c.stroke();
+      c.strokeStyle = "rgba(255,200,0,1)";
+      c.lineWidth = Math.max(2, minStroke);
+      c.beginPath();
+      c.moveTo(-cross, 0);
+      c.lineTo(cross, 0);
+      c.moveTo(0, -cross);
+      c.lineTo(0, cross);
+      c.stroke();
+      c.restore();
     };
 
-    if (thumbnailDataUrl) {
-      const img = new Image();
-      img.onload = () => {
-        const offscreen = document.createElement("canvas");
-        offscreen.width = THUMB_W;
-        offscreen.height = thumbH;
-        const offCtx = offscreen.getContext("2d");
-        if (offCtx) {
-          offCtx.drawImage(img, 0, 0, THUMB_W, thumbH);
-          drawViewport(offCtx);
-          ctx.clearRect(0, 0, THUMB_W, thumbH);
-          ctx.drawImage(offscreen, 0, 0);
-        }
-      };
-      img.src = thumbnailDataUrl;
+    ctx.clearRect(0, 0, THUMB_W, thumbH);
+    if (thumbnailCanvas) {
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(thumbnailCanvas, 0, 0, THUMB_W, thumbH);
     } else {
-      ctx.clearRect(0, 0, THUMB_W, thumbH);
       ctx.fillStyle = "#555";
       ctx.fillRect(0, 0, THUMB_W, thumbH);
-      drawViewport(ctx);
     }
-    // biome-ignore lint/correctness/useExhaustiveDependencies: THUMB_W is constant
-  }, [thumbnailDataUrl, viewTransform, thumbH, canvasWidth, canvasHeight]);
+    drawViewport(ctx);
+  }, [
+    thumbnailCanvas,
+    thumbnailVersion,
+    viewTransform,
+    thumbH,
+    canvasWidth,
+    canvasHeight,
+    isFlipped,
+  ]);
 
   const handleThumbPointer = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -86,8 +130,8 @@ export function NavigatorPanel({
       const rect = canvas.getBoundingClientRect();
       const tx = (e.clientX - rect.left) / rect.width;
       const ty = (e.clientY - rect.top) / rect.height;
-      const panX = -(tx - 0.5) * canvasWidth;
-      const panY = -(ty - 0.5) * canvasHeight;
+      const panX = -(tx - 0.5) * canvasWidth * viewTransform.zoom;
+      const panY = -(ty - 0.5) * canvasHeight * viewTransform.zoom;
       onSetTransform({ ...viewTransform, panX, panY });
     },
     [viewTransform, onSetTransform, canvasWidth, canvasHeight],
@@ -96,108 +140,61 @@ export function NavigatorPanel({
   return (
     <div
       data-ocid="navigator.panel"
-      className="rounded-lg bg-card overflow-hidden"
-      style={{ width: "100%" }}
+      style={{
+        width: "100%",
+        flex: 1,
+        minHeight: 0,
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+      }}
     >
-      {/* Header */}
+      {/* Header — fixed height, never shrinks */}
       <button
         type="button"
         className="flex items-center justify-between w-full px-2 py-1 cursor-pointer select-none text-left"
+        style={{ flexShrink: 0 }}
         onClick={() => setCollapsed((c) => !c)}
       >
         <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
           Navigator
         </span>
         <span className="text-muted-foreground text-[10px]">
-          {collapsed ? "+" : "−"}
+          {collapsed ? "+" : "\u2212"}
         </span>
       </button>
 
       {!collapsed && (
-        <div className="flex flex-col gap-1 px-1.5 pb-1.5">
-          {/* Thumbnail */}
+        /* Canvas wrapper: takes all remaining height in the 25%-capped container,
+           centers the canvas so it scales down with aspect ratio preserved (object-fit: contain style) */
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflow: "hidden",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
           <canvas
             ref={thumbRef}
             width={THUMB_W}
             height={thumbH}
             data-ocid="navigator.canvas_target"
-            className="rounded cursor-crosshair border border-border/50"
-            style={{ display: "block", width: THUMB_W, height: thumbH }}
+            className="cursor-crosshair"
+            style={{
+              display: "block",
+              maxWidth: "100%",
+              maxHeight: "100%",
+              width: "auto",
+              height: "auto",
+            }}
             onPointerDown={handleThumbPointer}
             onPointerMove={handleThumbPointer}
             onPointerUp={handleThumbPointer}
             onPointerCancel={handleThumbPointer}
           />
-
-          {/* Zoom row */}
-          <div className="flex items-center gap-1">
-            <button
-              type="button"
-              data-ocid="navigator.zoom_out_button"
-              onClick={() =>
-                onSetTransform({
-                  ...viewTransform,
-                  zoom: Math.max(0.05, viewTransform.zoom / 1.25),
-                })
-              }
-              className="w-6 h-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-muted"
-            >
-              <Minus size={11} />
-            </button>
-            <span className="flex-1 text-center text-[10px] text-muted-foreground">
-              {Math.round(viewTransform.zoom * 100)}%
-            </span>
-            <button
-              type="button"
-              data-ocid="navigator.zoom_in_button"
-              onClick={() =>
-                onSetTransform({
-                  ...viewTransform,
-                  zoom: Math.min(20, viewTransform.zoom * 1.25),
-                })
-              }
-              className="w-6 h-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-muted"
-            >
-              <Plus size={11} />
-            </button>
-          </div>
-
-          {/* Rotation row */}
-          <div className="flex items-center gap-1">
-            <span className="text-[10px] text-muted-foreground shrink-0">
-              ↺
-            </span>
-            <input
-              type="range"
-              min={-180}
-              max={180}
-              step={1}
-              value={Math.round(viewTransform.rotation)}
-              onChange={(e) =>
-                onSetTransform({
-                  ...viewTransform,
-                  rotation: Number(e.target.value),
-                })
-              }
-              className="flex-1 h-1.5 accent-primary cursor-pointer"
-            />
-            <span className="text-[10px] text-muted-foreground w-8 text-right shrink-0">
-              {Math.round(viewTransform.rotation)}°
-            </span>
-          </div>
-
-          {/* Reset button */}
-          <button
-            type="button"
-            data-ocid="navigator.reset_button"
-            onClick={() =>
-              onSetTransform({ panX: 0, panY: 0, zoom: 1, rotation: 0 })
-            }
-            className="flex items-center justify-center gap-1 w-full py-0.5 rounded text-[10px] text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-          >
-            <RotateCcw size={10} />
-            Reset
-          </button>
         </div>
       )}
     </div>

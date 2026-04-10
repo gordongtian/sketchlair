@@ -9,7 +9,7 @@ import {
 import { Input } from "@/components/ui/input";
 import type { HSVAColor } from "@/utils/colorUtils";
 import { hexToRgb, hsvToRgb, hsvaToHex, rgbToHsv } from "@/utils/colorUtils";
-import { ChevronDown, ChevronUp, SlidersHorizontal } from "lucide-react";
+import { SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 interface ColorPickerPanelProps {
@@ -18,8 +18,6 @@ interface ColorPickerPanelProps {
   recentColors: string[];
   onRecentColorClick: (hex: string) => void;
 }
-
-type ColorMode = "hsv" | "rgb";
 
 // ---- Photoshop-style Gradient Slider ----
 interface GradientSliderProps {
@@ -83,7 +81,6 @@ function GradientSlider({
         borderRadius: 2,
         background: gradient,
         touchAction: "none",
-        // Extra bottom padding for triangle to poke out
         paddingBottom: 0,
       }}
       onPointerDown={handlePointerDown}
@@ -107,7 +104,7 @@ function GradientSlider({
           width: 12,
           height: 10,
           clipPath: "polygon(50% 0%, 0% 100%, 100% 100%)",
-          background: "white",
+          background: "oklch(var(--slider-handle))",
           filter: "drop-shadow(0 0 1px rgba(0,0,0,0.8))",
         }}
       />
@@ -136,18 +133,39 @@ export function ColorPickerPanel({
   onRecentColorClick,
 }: ColorPickerPanelProps) {
   const svCanvasRef = useRef<HTMLCanvasElement>(null);
+  const svContainerRef = useRef<HTMLDivElement>(null);
   const hueCanvasRef = useRef<HTMLCanvasElement>(null);
   const [hexInput, setHexInput] = useState(hsvaToHex(color));
-  const [colorMode, setColorMode] = useState<ColorMode>("hsv");
   const isDraggingSV = useRef(false);
   const isDraggingHue = useRef(false);
-  const [collapsed, setCollapsed] = useState(false);
-
+  const colorRef = useRef(color);
+  const onColorChangeRef = useRef(onColorChange);
   const [showSV, setShowSV] = useState(true);
   const [showHue, setShowHue] = useState(true);
-  const [showHex, setShowHex] = useState(true);
-  const [showSliders, setShowSliders] = useState(true);
+  const [showHex, setShowHex] = useState(false);
+  const [showHsvSliders, setShowHsvSliders] = useState(false);
+  const [showRgbSliders, setShowRgbSliders] = useState(false);
   const [showRecent, setShowRecent] = useState(true);
+
+  // Track the canvas pixel dimensions so we can draw at the right resolution
+  const [svPixelW, setSvPixelW] = useState(194);
+  const SV_HEIGHT = 150;
+
+  // ResizeObserver: keep canvas pixel width in sync with its CSS display width.
+  // showSV is included so we re-observe whenever the container remounts.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: showSV triggers re-observe after container remount
+  useEffect(() => {
+    const container = svContainerRef.current;
+    if (!container) return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = Math.round(entry.contentRect.width);
+        if (w > 0) setSvPixelW(w);
+      }
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [showSV]);
 
   const drawSVSquare = useCallback(() => {
     const canvas = svCanvasRef.current;
@@ -168,15 +186,19 @@ export function ColorPickerPanel({
     blackGrad.addColorStop(1, "rgba(0,0,0,1)");
     ctx.fillStyle = blackGrad;
     ctx.fillRect(0, 0, width, height);
+    // Draw selection circle — always use pixel-space radius so it stays circular
+    // regardless of canvas CSS display size (canvas pixel dims match display dims
+    // because we sync them via ResizeObserver).
     const cx = color.s * width;
     const cy = (1 - color.v) * height;
+    const r = 6;
     ctx.beginPath();
-    ctx.arc(cx, cy, 6, 0, Math.PI * 2);
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.strokeStyle = "rgba(255,255,255,0.9)";
     ctx.lineWidth = 2;
     ctx.stroke();
     ctx.beginPath();
-    ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+    ctx.arc(cx, cy, r - 1, 0, Math.PI * 2);
     ctx.strokeStyle = "rgba(0,0,0,0.5)";
     ctx.lineWidth = 1;
     ctx.stroke();
@@ -202,10 +224,11 @@ export function ColorPickerPanel({
     ctx.fillRect(cx - 1, 0, 2, height);
   }, [color.h]);
 
+  // Redraw SV square whenever color or canvas pixel width changes
   // biome-ignore lint/correctness/useExhaustiveDependencies: showSV triggers redraw after canvas remount
   useEffect(() => {
     drawSVSquare();
-  }, [drawSVSquare, showSV]);
+  }, [drawSVSquare, showSV, svPixelW]);
   // biome-ignore lint/correctness/useExhaustiveDependencies: showHue triggers redraw after canvas remount
   useEffect(() => {
     drawHueBar();
@@ -230,6 +253,14 @@ export function ColorPickerPanel({
     [color, onColorChange],
   );
 
+  // Keep refs in sync with latest props so the window listener (registered once) always has current values
+  useEffect(() => {
+    colorRef.current = color;
+  });
+  useEffect(() => {
+    onColorChangeRef.current = onColorChange;
+  });
+
   useEffect(() => {
     const handlePointerMove = (e: PointerEvent) => {
       if (isDraggingSV.current) {
@@ -244,7 +275,7 @@ export function ColorPickerPanel({
           0,
           Math.min(1, 1 - (e.clientY - rect.top) / rect.height),
         );
-        onColorChange({ ...color, s, v });
+        onColorChangeRef.current({ ...colorRef.current, s, v });
       }
       if (isDraggingHue.current) {
         const canvas = hueCanvasRef.current;
@@ -254,7 +285,7 @@ export function ColorPickerPanel({
           0,
           Math.min(360, ((e.clientX - rect.left) / rect.width) * 360),
         );
-        onColorChange({ ...color, h });
+        onColorChangeRef.current({ ...colorRef.current, h });
       }
     };
     const handlePointerUp = () => {
@@ -267,7 +298,7 @@ export function ColorPickerPanel({
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
     };
-  }, [color, onColorChange]);
+  }, []); // register once — color/onColorChange accessed via refs
 
   const handleHexChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value;
@@ -328,14 +359,9 @@ export function ColorPickerPanel({
     <div className="flex flex-col">
       {/* Header row */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-        <button
-          type="button"
-          onClick={() => setCollapsed((c) => !c)}
-          className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
-        >
-          {collapsed ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
+        <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           Color
-        </button>
+        </span>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button
@@ -370,10 +396,16 @@ export function ColorPickerPanel({
               Hex input
             </DropdownMenuCheckboxItem>
             <DropdownMenuCheckboxItem
-              checked={showSliders}
-              onCheckedChange={setShowSliders}
+              checked={showHsvSliders}
+              onCheckedChange={setShowHsvSliders}
             >
-              Channel sliders
+              HSV sliders
+            </DropdownMenuCheckboxItem>
+            <DropdownMenuCheckboxItem
+              checked={showRgbSliders}
+              onCheckedChange={setShowRgbSliders}
+            >
+              RGB sliders
             </DropdownMenuCheckboxItem>
             <DropdownMenuCheckboxItem
               checked={showRecent}
@@ -386,200 +418,181 @@ export function ColorPickerPanel({
       </div>
 
       {/* Color picker body */}
-      {!collapsed && (
-        <div className="flex flex-col gap-2 p-3">
-          {/* SV Square */}
-          {showSV && (
+      <div className="flex flex-col gap-2 p-3">
+        {/* SV Square — container measured by ResizeObserver so canvas pixel
+              dimensions always match CSS display size, keeping the selection
+              circle perfectly round at any panel width. */}
+        {showSV && (
+          <div ref={svContainerRef} className="w-full">
             <canvas
               ref={svCanvasRef}
-              width={194}
-              height={150}
-              className="w-full rounded cursor-crosshair"
-              style={{ height: 150, touchAction: "none" }}
+              width={svPixelW}
+              height={SV_HEIGHT}
+              className="w-full rounded cursor-crosshair block"
+              style={{ height: SV_HEIGHT, touchAction: "none" }}
               onPointerDown={handleSVPointerDown}
             />
-          )}
+          </div>
+        )}
 
-          {/* Hue bar */}
-          {showHue && (
-            <canvas
-              ref={hueCanvasRef}
-              width={194}
-              height={14}
-              className="w-full rounded cursor-crosshair"
-              style={{ height: 14, touchAction: "none" }}
-              onPointerDown={(e) => {
-                isDraggingHue.current = true;
-                const canvas = hueCanvasRef.current;
-                if (!canvas) return;
-                const rect = canvas.getBoundingClientRect();
-                const h = Math.max(
-                  0,
-                  Math.min(360, ((e.clientX - rect.left) / rect.width) * 360),
-                );
-                onColorChange({ ...color, h });
-              }}
+        {/* Hue bar */}
+        {showHue && (
+          <canvas
+            ref={hueCanvasRef}
+            width={194}
+            height={14}
+            className="w-full rounded cursor-crosshair"
+            style={{ height: 14, touchAction: "none" }}
+            onPointerDown={(e) => {
+              isDraggingHue.current = true;
+              const canvas = hueCanvasRef.current;
+              if (!canvas) return;
+              const rect = canvas.getBoundingClientRect();
+              const h = Math.max(
+                0,
+                Math.min(360, ((e.clientX - rect.left) / rect.width) * 360),
+              );
+              onColorChange({ ...color, h });
+            }}
+          />
+        )}
+
+        {/* Hex + preview */}
+        {showHex && (
+          <div className="flex items-center gap-2">
+            <div
+              className="w-7 h-7 rounded border border-border flex-shrink-0"
+              style={previewStyle}
             />
-          )}
+            <Input
+              data-ocid="color.hex_input"
+              value={hexInput}
+              onChange={handleHexChange}
+              onBlur={() => setHexInput(hexDisplay)}
+              className="h-7 text-xs font-mono bg-muted border-border"
+              maxLength={7}
+            />
+          </div>
+        )}
 
-          {/* Hex + preview */}
-          {showHex && (
-            <div className="flex items-center gap-2">
-              <div
-                className="w-7 h-7 rounded border border-border flex-shrink-0"
-                style={previewStyle}
+        {/* HSV sliders */}
+        {showHsvSliders && (
+          <div className="flex flex-col gap-3">
+            <SliderRow
+              label="H"
+              ocid="color.h_slider"
+              value={Math.round(color.h)}
+              max={360}
+              onNumChange={(v) => handleHsvChange("h", v)}
+            >
+              <GradientSlider
+                value={Math.round(color.h)}
+                min={0}
+                max={360}
+                gradient={hGradient}
+                onChange={(v) => handleHsvChange("h", v)}
               />
-              <Input
-                data-ocid="color.hex_input"
-                value={hexInput}
-                onChange={handleHexChange}
-                onBlur={() => setHexInput(hexDisplay)}
-                className="h-7 text-xs font-mono bg-muted border-border"
-                maxLength={7}
+            </SliderRow>
+            <SliderRow
+              label="S"
+              ocid="color.s_slider"
+              value={Math.round(color.s * 100)}
+              max={100}
+              onNumChange={(v) => handleHsvChange("s", v)}
+            >
+              <GradientSlider
+                value={Math.round(color.s * 100)}
+                min={0}
+                max={100}
+                gradient={sGradient}
+                onChange={(v) => handleHsvChange("s", v)}
               />
-            </div>
-          )}
+            </SliderRow>
+            <SliderRow
+              label="V"
+              ocid="color.v_slider"
+              value={Math.round(color.v * 100)}
+              max={100}
+              onNumChange={(v) => handleHsvChange("v", v)}
+            >
+              <GradientSlider
+                value={Math.round(color.v * 100)}
+                min={0}
+                max={100}
+                gradient={vGradient}
+                onChange={(v) => handleHsvChange("v", v)}
+              />
+            </SliderRow>
+          </div>
+        )}
 
-          {/* Channel sliders */}
-          {showSliders && (
-            <>
-              <div className="flex gap-1">
-                {(["hsv", "rgb"] as ColorMode[]).map((mode) => (
-                  <button
-                    key={mode}
-                    type="button"
-                    data-ocid={`color.${mode}_toggle`}
-                    onClick={() => setColorMode(mode)}
-                    className={`flex-1 text-[10px] py-1 rounded transition-all duration-100 uppercase tracking-wider ${
-                      colorMode === mode
-                        ? "bg-primary text-primary-foreground"
-                        : "bg-muted/50 text-muted-foreground hover:text-foreground hover:bg-muted"
-                    }`}
-                  >
-                    {mode}
-                  </button>
-                ))}
-              </div>
+        {/* RGB sliders */}
+        {showRgbSliders && (
+          <div className="flex flex-col gap-3">
+            <SliderRow
+              label="R"
+              ocid="color.r_slider"
+              value={rVal}
+              max={255}
+              onNumChange={(v) => handleRgbChange("r", v)}
+            >
+              <GradientSlider
+                value={rVal}
+                min={0}
+                max={255}
+                gradient={rGradient}
+                onChange={(v) => handleRgbChange("r", v)}
+              />
+            </SliderRow>
+            <SliderRow
+              label="G"
+              ocid="color.g_slider"
+              value={gVal}
+              max={255}
+              onNumChange={(v) => handleRgbChange("g", v)}
+            >
+              <GradientSlider
+                value={gVal}
+                min={0}
+                max={255}
+                gradient={gGradient}
+                onChange={(v) => handleRgbChange("g", v)}
+              />
+            </SliderRow>
+            <SliderRow
+              label="B"
+              ocid="color.b_slider"
+              value={bVal}
+              max={255}
+              onNumChange={(v) => handleRgbChange("b", v)}
+            >
+              <GradientSlider
+                value={bVal}
+                min={0}
+                max={255}
+                gradient={bGradient}
+                onChange={(v) => handleRgbChange("b", v)}
+              />
+            </SliderRow>
+          </div>
+        )}
 
-              <div className="flex flex-col gap-3">
-                {colorMode === "rgb" ? (
-                  <>
-                    <SliderRow
-                      label="R"
-                      ocid="color.r_slider"
-                      value={rVal}
-                      max={255}
-                      onNumChange={(v) => handleRgbChange("r", v)}
-                    >
-                      <GradientSlider
-                        value={rVal}
-                        min={0}
-                        max={255}
-                        gradient={rGradient}
-                        onChange={(v) => handleRgbChange("r", v)}
-                      />
-                    </SliderRow>
-                    <SliderRow
-                      label="G"
-                      ocid="color.g_slider"
-                      value={gVal}
-                      max={255}
-                      onNumChange={(v) => handleRgbChange("g", v)}
-                    >
-                      <GradientSlider
-                        value={gVal}
-                        min={0}
-                        max={255}
-                        gradient={gGradient}
-                        onChange={(v) => handleRgbChange("g", v)}
-                      />
-                    </SliderRow>
-                    <SliderRow
-                      label="B"
-                      ocid="color.b_slider"
-                      value={bVal}
-                      max={255}
-                      onNumChange={(v) => handleRgbChange("b", v)}
-                    >
-                      <GradientSlider
-                        value={bVal}
-                        min={0}
-                        max={255}
-                        gradient={bGradient}
-                        onChange={(v) => handleRgbChange("b", v)}
-                      />
-                    </SliderRow>
-                  </>
-                ) : (
-                  <>
-                    <SliderRow
-                      label="H"
-                      ocid="color.h_slider"
-                      value={Math.round(color.h)}
-                      max={360}
-                      onNumChange={(v) => handleHsvChange("h", v)}
-                    >
-                      <GradientSlider
-                        value={Math.round(color.h)}
-                        min={0}
-                        max={360}
-                        gradient={hGradient}
-                        onChange={(v) => handleHsvChange("h", v)}
-                      />
-                    </SliderRow>
-                    <SliderRow
-                      label="S"
-                      ocid="color.s_slider"
-                      value={Math.round(color.s * 100)}
-                      max={100}
-                      onNumChange={(v) => handleHsvChange("s", v)}
-                    >
-                      <GradientSlider
-                        value={Math.round(color.s * 100)}
-                        min={0}
-                        max={100}
-                        gradient={sGradient}
-                        onChange={(v) => handleHsvChange("s", v)}
-                      />
-                    </SliderRow>
-                    <SliderRow
-                      label="V"
-                      ocid="color.v_slider"
-                      value={Math.round(color.v * 100)}
-                      max={100}
-                      onNumChange={(v) => handleHsvChange("v", v)}
-                    >
-                      <GradientSlider
-                        value={Math.round(color.v * 100)}
-                        min={0}
-                        max={100}
-                        gradient={vGradient}
-                        onChange={(v) => handleHsvChange("v", v)}
-                      />
-                    </SliderRow>
-                  </>
-                )}
-              </div>
-            </>
-          )}
-
-          {/* Recent colors */}
-          {showRecent && recentColors.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {recentColors.map((hex) => (
-                <button
-                  type="button"
-                  key={hex}
-                  className="w-5 h-5 rounded-sm border border-border hover:scale-110 transition-transform flex-shrink-0"
-                  style={{ background: hex }}
-                  onClick={() => onRecentColorClick(hex)}
-                  title={hex}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+        {/* Recent colors */}
+        {showRecent && recentColors.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {recentColors.map((hex) => (
+              <button
+                type="button"
+                key={hex}
+                className="w-5 h-5 rounded-sm border border-border hover:scale-110 transition-transform flex-shrink-0"
+                style={{ background: hex }}
+                onClick={() => onRecentColorClick(hex)}
+                title={hex}
+              />
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

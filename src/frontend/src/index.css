@@ -11,77 +11,580 @@
 
 @layer base {
   :root {
-    /* Light mode defaults */
-    --background: 0.97 0.005 250;
-    --foreground: 0.1 0.01 250;
-    --card: 0.99 0.002 250;
-    --card-foreground: 0.1 0.01 250;
-    --popover: 0.99 0.002 250;
-    --popover-foreground: 0.1 0.01 250;
-    --primary: 0.72 0.18 50;
-    --primary-foreground: 0.1 0.01 50;
-    --secondary: 0.93 0.005 250;
-    --secondary-foreground: 0.2 0.01 250;
-    --muted: 0.94 0.005 250;
-    --muted-foreground: 0.5 0.01 250;
-    --accent: 0.72 0.18 50;
-    --accent-foreground: 0.1 0.01 50;
+    /* ── Semantic palette (13 vars) ── */
+    --toolbar: 0.97 0.005 250;
+    --sidebar-left: 0.94 0.005 250;
+    --sidebar-right: 0.94 0.005 250;
+    --sidebar-item: 0.9 0.005 250;
+    --accent: 0.7094 0.1175 90.72;
+    --canvas-bg: 0.9431 0.0 0.0;
+    --slider-bg: 0.88 0.005 250;
+    --slider-handle: 0.4365 0.0632 81.91;
+    --slider-highlight: 0.7094 0.1175 90.72;
+    --text: 0.1 0.01 250;
+    --accent-text: 0.4365 0.0632 81.91;
+    --highlighted-text: 0.4365 0.0632 81.91;
+    --muted-text: 0.5 0.01 250;
+    --outline: 0.88 0.005 250;
+
+    /* ── Tailwind token aliases ── */
+    --background: var(--toolbar);
+    --foreground: var(--text);
+    --card: var(--toolbar);
+    --card-foreground: var(--text);
+    --popover: var(--toolbar);
+    --popover-foreground: var(--text);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-text);
+    --secondary: var(--sidebar-item);
+    --secondary-foreground: var(--text);
+    --muted: var(--sidebar-item);
+    --muted-foreground: var(--muted-text);
+    --accent-foreground: var(--accent-text);
     --destructive: 0.55 0.22 25;
-    --destructive-foreground: 0.95 0.01 250;
-    --border: 0.88 0.005 250;
-    --input: 0.88 0.005 250;
-    --ring: 0.72 0.18 50;
+    --destructive-foreground: var(--text);
+    --border: var(--outline);
+    --input: var(--outline);
+    --ring: var(--accent);
     --radius: 4px;
     --chart-1: 0.72 0.18 50;
     --chart-2: 0.65 0.15 200;
     --chart-3: 0.6 0.14 150;
     --chart-4: 0.68 0.16 280;
     --chart-5: 0.63 0.18 320;
-    --sidebar: 0.95 0.005 250;
-    --sidebar-foreground: 0.1 0.01 250;
-    --sidebar-primary: 0.72 0.18 50;
-    --sidebar-primary-foreground: 0.1 0.01 50;
-    --sidebar-accent: 0.93 0.005 250;
-    --sidebar-accent-foreground: 0.2 0.01 250;
-    --sidebar-border: 0.88 0.005 250;
-    --sidebar-ring: 0.72 0.18 50;
-    --canvas-workspace: 0.88 0.005 250;
+    --sidebar: var(--sidebar-right);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent);
+    --sidebar-primary-foreground: var(--accent-text);
+    --sidebar-accent: var(--sidebar-item);
+    --sidebar-accent-foreground: var(--muted-text);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--accent);
+    --canvas-workspace: var(--canvas-bg);
+    --layer-highlight: var(--accent);
+    --slider-track: var(--slider-bg);
   }
 
   .dark {
-    --background: 0.14 0.01 250;
-    --foreground: 0.9 0.01 250;
-    --card: 0.18 0.01 250;
-    --card-foreground: 0.9 0.01 250;
-    --popover: 0.18 0.01 250;
-    --popover-foreground: 0.9 0.01 250;
-    --primary: 0.72 0.18 50;
-    --primary-foreground: 0.1 0.01 50;
-    --secondary: 0.22 0.01 250;
-    --secondary-foreground: 0.9 0.01 250;
-    --muted: 0.22 0.01 250;
-    --muted-foreground: 0.6 0.01 250;
-    --accent: 0.72 0.18 50;
-    --accent-foreground: 0.1 0.01 50;
+    /* ── Semantic palette (13 vars) ── */
+    --toolbar: 0.14 0.01 250;
+    --sidebar-left: 0.18 0.01 250;
+    --sidebar-right: 0.18 0.01 250;
+    --sidebar-item: 0.22 0.01 250;
+    --accent: 0.7036 0.1441 233.05;
+    --canvas-bg: 0.23 0.005 250;
+    --slider-bg: 0.28 0.01 250;
+    --slider-handle: 0.75 0.01 250;
+    --slider-highlight: 0.7036 0.1441 233.05;
+    --text: 0.9 0.01 250;
+    --accent-text: 0.1 0.01 50;
+    --highlighted-text: 0.1 0.01 50;
+    --muted-text: 0.5527 0.011 273.24;
+    --outline: 0.28 0.01 250;
+
+    /* ── Tailwind token aliases ── */
+    --background: var(--toolbar);
+    --foreground: var(--text);
+    --card: var(--toolbar);
+    --card-foreground: var(--text);
+    --popover: var(--toolbar);
+    --popover-foreground: var(--text);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-text);
+    --secondary: var(--sidebar-item);
+    --secondary-foreground: var(--text);
+    --muted: var(--sidebar-item);
+    --muted-foreground: var(--muted-text);
+    --accent-foreground: var(--accent-text);
     --destructive: 0.55 0.22 25;
-    --destructive-foreground: 0.95 0.01 250;
-    --border: 0.28 0.01 250;
-    --input: 0.28 0.01 250;
-    --ring: 0.72 0.18 50;
+    --destructive-foreground: var(--text);
+    --border: var(--outline);
+    --input: var(--outline);
+    --ring: var(--accent);
     --chart-1: 0.72 0.18 50;
     --chart-2: 0.65 0.15 200;
     --chart-3: 0.6 0.14 150;
     --chart-4: 0.68 0.16 280;
     --chart-5: 0.63 0.18 320;
-    --sidebar: 0.18 0.01 250;
-    --sidebar-foreground: 0.9 0.01 250;
-    --sidebar-primary: 0.72 0.18 50;
-    --sidebar-primary-foreground: 0.1 0.01 50;
-    --sidebar-accent: 0.22 0.01 250;
-    --sidebar-accent-foreground: 0.9 0.01 250;
-    --sidebar-border: 0.28 0.01 250;
-    --sidebar-ring: 0.72 0.18 50;
-    --canvas-workspace: 0.23 0.005 250;
+    --sidebar: var(--sidebar-right);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent);
+    --sidebar-primary-foreground: var(--accent-text);
+    --sidebar-accent: var(--sidebar-item);
+    --sidebar-accent-foreground: var(--muted-text);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--accent);
+    --canvas-workspace: var(--canvas-bg);
+    --layer-highlight: var(--accent);
+    --slider-track: var(--slider-bg);
+  }
+
+  /* ── Bubble Pop ── warm peach/coral/blush palette */
+  .theme-bubble-pop {
+    /* ── Semantic palette (13 vars) ── */
+    --toolbar: 0.9254 0.0294 47.29;
+    --sidebar-left: 0.898 0.034 42.0;
+    --sidebar-right: 0.898 0.034 42.0;
+    --sidebar-item: 0.6754 0.0577 18.69;
+    --accent: 0.724 0.0776 31.25;
+    --canvas-bg: 0.686 0.0885 9.54;
+    --slider-bg: 0.9104 0.0338 33.77;
+    --slider-handle: 0.9084 0.0403 58.76;
+    --slider-highlight: 0.9931 0.012 96.42;
+    --text: 0.2616 0.103 13.56;
+    --accent-text: 0.724 0.0776 31.25;
+    --highlighted-text: 0.724 0.0776 31.25;
+    --muted-text: 0.4115 0.1519 15.55;
+    --outline: 0.82 0.028 44.0;
+
+    /* ── Tailwind token aliases ── */
+    --background: var(--toolbar);
+    --foreground: var(--text);
+    --card: var(--toolbar);
+    --card-foreground: var(--text);
+    --popover: var(--toolbar);
+    --popover-foreground: var(--text);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-text);
+    --secondary: var(--sidebar-item);
+    --secondary-foreground: var(--text);
+    --muted: var(--sidebar-item);
+    --muted-foreground: var(--muted-text);
+    --accent-foreground: var(--accent-text);
+    --destructive: 0.55 0.22 25;
+    --destructive-foreground: var(--text);
+    --border: var(--outline);
+    --input: var(--outline);
+    --ring: var(--accent);
+    --radius: 4px;
+    --chart-1: 0.65 0.16 15;
+    --chart-2: 0.62 0.14 160;
+    --chart-3: 0.6 0.14 200;
+    --chart-4: 0.68 0.14 280;
+    --chart-5: 0.63 0.18 320;
+    --sidebar: var(--sidebar-right);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent);
+    --sidebar-primary-foreground: var(--accent-text);
+    --sidebar-accent: var(--sidebar-item);
+    --sidebar-accent-foreground: var(--muted-text);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--accent);
+    --canvas-workspace: var(--canvas-bg);
+    --layer-highlight: var(--accent);
+    --slider-track: var(--slider-bg);
+  }
+
+  /* ── All Business ── warm cream bg, red-tinted borders */
+  .theme-all-business {
+    /* ── Semantic palette (13 vars) ── */
+    --toolbar: 0.95 0.015 80;
+    --sidebar-left: 0.8825 0.0249 71.44;
+    --sidebar-right: 0.8825 0.0249 71.44;
+    --sidebar-item: 0.9511 0.0148 80.71;
+    --accent: 0.5002 0.1284 46.83;
+    --canvas-bg: 0.9 0.015 80;
+    --slider-bg: 0.8975 0.0 0.0;
+    --slider-handle: 0.6416 0.1162 57.41;
+    --slider-highlight: 0.6359 0.0625 58.68;
+    --text: 0.18 0.02 65;
+    --accent-text: 0.97 0.01 20;
+    --highlighted-text: 0.97 0.01 20;
+    --muted-text: 0.5161 0.0127 17.57;
+    --outline: 0.591 0.0741 74.15;
+
+    /* ── Tailwind token aliases ── */
+    --background: var(--toolbar);
+    --foreground: var(--text);
+    --card: var(--toolbar);
+    --card-foreground: var(--text);
+    --popover: var(--toolbar);
+    --popover-foreground: var(--text);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-text);
+    --secondary: var(--sidebar-item);
+    --secondary-foreground: var(--text);
+    --muted: var(--sidebar-item);
+    --muted-foreground: var(--muted-text);
+    --accent-foreground: var(--accent-text);
+    --destructive: 0.55 0.22 25;
+    --destructive-foreground: var(--text);
+    --border: var(--outline);
+    --input: var(--outline);
+    --ring: var(--accent);
+    --radius: 4px;
+    --chart-1: 0.58 0.12 20;
+    --chart-2: 0.62 0.1 200;
+    --chart-3: 0.6 0.1 150;
+    --chart-4: 0.65 0.1 280;
+    --chart-5: 0.6 0.12 320;
+    --sidebar: var(--sidebar-right);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent);
+    --sidebar-primary-foreground: var(--accent-text);
+    --sidebar-accent: var(--sidebar-item);
+    --sidebar-accent-foreground: var(--muted-text);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--accent);
+    --canvas-workspace: var(--canvas-bg);
+    --layer-highlight: var(--accent);
+    --slider-track: var(--slider-bg);
+  }
+
+  /* ── Fireside ── dark brown base, warm gold accents */
+  .theme-fireside {
+    /* ── Semantic palette (13 vars) ── */
+    --toolbar: 0.2541 0.003 17.35;
+    --sidebar-left: 0.3533 0.0313 40.14;
+    --sidebar-right: 0.3533 0.0313 40.14;
+    --sidebar-item: 0.2213 0.0313 56.56;
+    --accent: 0.5559 0.1361 54.65;
+    --canvas-bg: 0.1578 0.0282 64.79;
+    --slider-bg: 0.35 0.06 52;
+    --slider-handle: 0.6684 0.1624 49.78;
+    --slider-highlight: 0.8287 0.1401 80.26;
+    --text: 0.8407 0.0842 70.95;
+    --accent-text: 0.9012 0.1158 87.49;
+    --highlighted-text: 0.9012 0.1158 87.49;
+    --muted-text: 0.8705 0.098 68.91;
+    --outline: 0.5071 0.1117 51.89;
+
+    /* ── Tailwind token aliases ── */
+    --background: var(--toolbar);
+    --foreground: var(--text);
+    --card: var(--toolbar);
+    --card-foreground: var(--text);
+    --popover: var(--toolbar);
+    --popover-foreground: var(--text);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-text);
+    --secondary: var(--sidebar-item);
+    --secondary-foreground: var(--text);
+    --muted: var(--sidebar-item);
+    --muted-foreground: var(--muted-text);
+    --accent-foreground: var(--accent-text);
+    --destructive: 0.55 0.22 25;
+    --destructive-foreground: var(--text);
+    --border: var(--outline);
+    --input: var(--outline);
+    --ring: var(--accent);
+    --radius: 4px;
+    --chart-1: 0.72 0.14 68;
+    --chart-2: 0.65 0.1 200;
+    --chart-3: 0.6 0.12 150;
+    --chart-4: 0.65 0.12 280;
+    --chart-5: 0.6 0.14 320;
+    --sidebar: var(--sidebar-right);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent);
+    --sidebar-primary-foreground: var(--accent-text);
+    --sidebar-accent: var(--sidebar-item);
+    --sidebar-accent-foreground: var(--muted-text);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--accent);
+    --canvas-workspace: var(--canvas-bg);
+    --layer-highlight: var(--accent);
+    --slider-track: var(--slider-bg);
+  }
+
+  /* ── SketchLair 95 ── Windows 95 classic gray + navy blue */
+  .theme-sketchlair-95 {
+    /* ── Semantic palette (13 vars) ── */
+    --toolbar: 0.79 0.003 250;
+    --sidebar-left: 0.76 0.003 250;
+    --sidebar-right: 0.76 0.003 250;
+    --sidebar-item: 0.72 0.003 250;
+    --accent: 0.5332 0.1182 249.86;
+    --canvas-bg: 0.6133 0.0 0.0;
+    --slider-bg: 0.55 0.003 250;
+    --slider-handle: 0.276 0.0662 260.68;
+    --slider-highlight: 0.5332 0.1182 249.86;
+    --text: 0.1 0.002 250;
+    --accent-text: 0.97 0.005 250;
+    --highlighted-text: 0.97 0.005 250;
+    --muted-text: 0.0 0.0 0.0;
+    --outline: 0.4757 0.0013 17.2;
+
+    /* ── Tailwind token aliases ── */
+    --background: var(--toolbar);
+    --foreground: var(--text);
+    --card: var(--toolbar);
+    --card-foreground: var(--text);
+    --popover: var(--toolbar);
+    --popover-foreground: var(--text);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-text);
+    --secondary: var(--sidebar-item);
+    --secondary-foreground: var(--text);
+    --muted: var(--sidebar-item);
+    --muted-foreground: var(--muted-text);
+    --accent-foreground: var(--accent-text);
+    --destructive: 0.55 0.22 25;
+    --destructive-foreground: var(--text);
+    --border: var(--outline);
+    --input: var(--outline);
+    --ring: var(--accent);
+    --radius: 2px;
+    --chart-1: 0.35 0.13 255;
+    --chart-2: 0.55 0.15 200;
+    --chart-3: 0.5 0.14 150;
+    --chart-4: 0.55 0.14 280;
+    --chart-5: 0.5 0.16 320;
+    --sidebar: var(--sidebar-right);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent);
+    --sidebar-primary-foreground: var(--accent-text);
+    --sidebar-accent: var(--sidebar-item);
+    --sidebar-accent-foreground: var(--muted-text);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--accent);
+    --canvas-workspace: var(--canvas-bg);
+    --layer-highlight: var(--accent);
+    --slider-track: var(--slider-bg);
+  }
+
+  /* ── Mainframe ── 80s phosphor-green terminal on near-black */
+  .theme-mainframe {
+    /* ── Semantic palette (13 vars) ── */
+    --toolbar: 0.08 0.02 140;
+    --sidebar-left: 0.11 0.025 140;
+    --sidebar-right: 0.11 0.025 140;
+    --sidebar-item: 0.15 0.032 140;
+    --accent: 0.72 0.22 142;
+    --canvas-bg: 0.06 0.015 140;
+    --slider-bg: 0.17 0.04 140;
+    --slider-handle: 0.65 0.2 142;
+    --slider-highlight: 0.72 0.22 142;
+    --text: 0.8 0.18 142;
+    --accent-text: 0.08 0.02 140;
+    --highlighted-text: 0.08 0.02 140;
+    --muted-text: 0.46 0.1 142;
+    --outline: 0.22 0.065 140;
+
+    /* ── Tailwind token aliases ── */
+    --background: var(--toolbar);
+    --foreground: var(--text);
+    --card: var(--toolbar);
+    --card-foreground: var(--text);
+    --popover: var(--toolbar);
+    --popover-foreground: var(--text);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-text);
+    --secondary: var(--sidebar-item);
+    --secondary-foreground: var(--text);
+    --muted: var(--sidebar-item);
+    --muted-foreground: var(--muted-text);
+    --accent-foreground: var(--accent-text);
+    --destructive: 0.55 0.22 25;
+    --destructive-foreground: var(--text);
+    --border: var(--outline);
+    --input: var(--outline);
+    --ring: var(--accent);
+    --radius: 2px;
+    --chart-1: 0.72 0.22 142;
+    --chart-2: 0.6 0.18 142;
+    --chart-3: 0.5 0.14 142;
+    --chart-4: 0.4 0.1 142;
+    --chart-5: 0.3 0.06 142;
+    --sidebar: var(--sidebar-right);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent);
+    --sidebar-primary-foreground: var(--accent-text);
+    --sidebar-accent: var(--sidebar-item);
+    --sidebar-accent-foreground: var(--muted-text);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--accent);
+    --canvas-workspace: var(--canvas-bg);
+    --layer-highlight: var(--accent);
+    --slider-track: var(--slider-bg);
+  }
+
+  /* ── Rose Pine ── desaturated dark purples, pine-green accent, gold highlights */
+  .theme-rose-pine {
+    /* ── Semantic palette (13 vars) ── */
+    --toolbar: 0.135 0.03 295;
+    --sidebar-left: 0.165 0.033 293;
+    --sidebar-right: 0.165 0.033 293;
+    --sidebar-item: 0.195 0.04 291;
+    --accent: 0.52 0.086 222;
+    --canvas-bg: 0.115 0.025 295;
+    --slider-bg: 0.225 0.042 291;
+    --slider-handle: 0.752 0.098 295;
+    --slider-highlight: 0.52 0.086 222;
+    --text: 0.898 0.024 290;
+    --accent-text: 0.98 0.005 250;
+    --highlighted-text: 0.98 0.005 250;
+    --muted-text: 0.499 0.042 293;
+    --outline: 0.24 0.045 291;
+
+    /* ── Tailwind token aliases ── */
+    --background: var(--toolbar);
+    --foreground: var(--text);
+    --card: var(--toolbar);
+    --card-foreground: var(--text);
+    --popover: var(--toolbar);
+    --popover-foreground: var(--text);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-text);
+    --secondary: var(--sidebar-item);
+    --secondary-foreground: var(--text);
+    --muted: var(--sidebar-item);
+    --muted-foreground: var(--muted-text);
+    --accent-foreground: var(--accent-text);
+    --destructive: 0.55 0.22 25;
+    --destructive-foreground: var(--text);
+    --border: var(--outline);
+    --input: var(--outline);
+    --ring: var(--accent);
+    --radius: 4px;
+    --chart-1: 0.52 0.086 222;
+    --chart-2: 0.836 0.128 76;
+    --chart-3: 0.6 0.1 295;
+    --chart-4: 0.752 0.098 295;
+    --chart-5: 0.65 0.09 180;
+    --sidebar: var(--sidebar-right);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent);
+    --sidebar-primary-foreground: var(--accent-text);
+    --sidebar-accent: var(--sidebar-item);
+    --sidebar-accent-foreground: var(--muted-text);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--accent);
+    --canvas-workspace: var(--canvas-bg);
+    --layer-highlight: var(--accent);
+    --slider-track: var(--slider-bg);
+  }
+
+  /* ── Everforest Dark Soft ── #2d353b base, warm cream fg, forest green accent */
+  .theme-everforest-dark {
+    /* ── Semantic palette (13 vars) ── */
+    /* bg2=#3d484d toolbar, bg1=#343f44 sidebars, bg3=#475258 items, bg_dim=#232a2e canvas */
+    --toolbar: 0.31 0.018 200;
+    --sidebar-left: 0.27 0.016 200;
+    --sidebar-right: 0.27 0.016 200;
+    --sidebar-item: 0.35 0.018 200;
+    /* green=#a7c080 accent */
+    --accent: 0.74 0.11 138;
+    /* bg_dim=#232a2e canvas background */
+    --canvas-bg: 0.19 0.015 200;
+    /* bg3=#475258 slider track */
+    --slider-bg: 0.35 0.018 200;
+    /* fg=#d3c6aa slider handle */
+    --slider-handle: 0.82 0.025 82;
+    /* green=#a7c080 slider highlight */
+    --slider-highlight: 0.74 0.11 138;
+    /* fg=#d3c6aa text */
+    --text: 0.82 0.025 82;
+    /* bg0=#2d353b accent text */
+    --accent-text: 0.23 0.016 200;
+    --highlighted-text: 0.23 0.016 200;
+    /* grey1=#859289 muted text */
+    --muted-text: 0.59 0.018 160;
+    /* bg4=#4f585e outline */
+    --outline: 0.39 0.02 200;
+
+    /* ── Tailwind token aliases ── */
+    --background: var(--toolbar);
+    --foreground: var(--text);
+    --card: var(--toolbar);
+    --card-foreground: var(--text);
+    --popover: var(--toolbar);
+    --popover-foreground: var(--text);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-text);
+    --secondary: var(--sidebar-item);
+    --secondary-foreground: var(--text);
+    --muted: var(--sidebar-item);
+    --muted-foreground: var(--muted-text);
+    --accent-foreground: var(--accent-text);
+    --destructive: 0.55 0.22 25;
+    --destructive-foreground: var(--text);
+    --border: var(--outline);
+    --input: var(--outline);
+    --ring: var(--accent);
+    --radius: 4px;
+    --chart-1: 0.74 0.11 138;
+    --chart-2: 0.73 0.09 162;
+    --chart-3: 0.78 0.09 82;
+    --chart-4: 0.65 0.15 20;
+    --chart-5: 0.7 0.12 330;
+    --sidebar: var(--sidebar-right);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent);
+    --sidebar-primary-foreground: var(--accent-text);
+    --sidebar-accent: var(--sidebar-item);
+    --sidebar-accent-foreground: var(--muted-text);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--accent);
+    --canvas-workspace: var(--canvas-bg);
+    --layer-highlight: var(--accent);
+    --slider-track: var(--slider-bg);
+  }
+
+  /* ── Everforest Light Soft ── #fffbe5 base, dark fg, olive green accent */
+  .theme-everforest-light {
+    /* ── Semantic palette (13 vars) ── */
+    /* bg0=#fffbe5 toolbar, bg2=#f2efdf sidebars, bg4=#e9e5d0 items, bg3=#efebd2 canvas */
+    --toolbar: 0.98 0.018 92;
+    --sidebar-left: 0.95 0.016 90;
+    --sidebar-right: 0.95 0.016 90;
+    --sidebar-item: 0.91 0.022 90;
+    /* green=#8da101 accent */
+    --accent: 0.62 0.14 122;
+    /* bg3=#efebd2 canvas background */
+    --canvas-bg: 0.93 0.022 90;
+    /* bg4=#e9e5d0 slider track */
+    --slider-bg: 0.91 0.022 90;
+    /* fg=#5c6a72 slider handle */
+    --slider-handle: 0.44 0.025 212;
+    /* green=#8da101 slider highlight */
+    --slider-highlight: 0.62 0.14 122;
+    /* fg=#5c6a72 text */
+    --text: 0.44 0.025 212;
+    /* bg0=#fffbe5 accent text */
+    --accent-text: 0.98 0.018 92;
+    --highlighted-text: 0.98 0.018 92;
+    /* grey1=#939f91 muted text */
+    --muted-text: 0.65 0.018 155;
+    /* bg5=#bdc3af outline */
+    --outline: 0.78 0.03 142;
+
+    /* ── Tailwind token aliases ── */
+    --background: var(--toolbar);
+    --foreground: var(--text);
+    --card: var(--toolbar);
+    --card-foreground: var(--text);
+    --popover: var(--toolbar);
+    --popover-foreground: var(--text);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-text);
+    --secondary: var(--sidebar-item);
+    --secondary-foreground: var(--text);
+    --muted: var(--sidebar-item);
+    --muted-foreground: var(--muted-text);
+    --accent-foreground: var(--accent-text);
+    --destructive: 0.55 0.22 25;
+    --destructive-foreground: var(--text);
+    --border: var(--outline);
+    --input: var(--outline);
+    --ring: var(--accent);
+    --radius: 4px;
+    --chart-1: 0.62 0.14 122;
+    --chart-2: 0.63 0.12 165;
+    --chart-3: 0.7 0.16 80;
+    --chart-4: 0.55 0.2 25;
+    --chart-5: 0.6 0.18 330;
+    --sidebar: var(--sidebar-right);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent);
+    --sidebar-primary-foreground: var(--accent-text);
+    --sidebar-accent: var(--sidebar-item);
+    --sidebar-accent-foreground: var(--muted-text);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--accent);
+    --canvas-workspace: var(--canvas-bg);
+    --layer-highlight: var(--accent);
+    --slider-track: var(--slider-bg);
   }
 
   * {
@@ -92,6 +595,7 @@
   body,
   #root {
     @apply h-full w-full overflow-hidden;
+    touch-action: none;
   }
 
   body {
@@ -99,6 +603,57 @@
     font-feature-settings: "cv11", "ss01";
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+  }
+
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+    outline: none;
+  }
+
+  input[type="range"]::-webkit-slider-runnable-track {
+    background: linear-gradient(
+      to right,
+      oklch(var(--slider-highlight)) var(--fill-pct, 0%),
+      oklch(var(--slider-bg)) var(--fill-pct, 0%)
+    );
+    height: 4px;
+    border-radius: 2px;
+  }
+
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    background: oklch(var(--slider-handle));
+    border: none;
+    height: 14px;
+    width: 14px;
+    border-radius: 50%;
+    margin-top: -5px;
+    cursor: pointer;
+  }
+
+  input[type="range"]::-moz-range-track {
+    background: oklch(var(--slider-bg));
+    height: 4px;
+    border-radius: 2px;
+    border: none;
+  }
+
+  input[type="range"]::-moz-range-thumb {
+    background: oklch(var(--slider-handle));
+    border: none;
+    height: 14px;
+    width: 14px;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+
+  input[type="range"]::-moz-range-progress {
+    background: oklch(var(--slider-highlight));
+    height: 4px;
+    border-radius: 2px;
   }
 }
 
@@ -141,5 +696,20 @@
 }
 
 .canvas-workspace-bg {
-  background-color: oklch(var(--canvas-workspace));
+  background-color: oklch(var(--canvas-bg));
+}
+
+/* Radix Slider: override Tailwind bg-muted/bg-primary with theme slider vars */
+[data-slot="slider-track"] {
+  background-color: oklch(var(--slider-bg));
+}
+
+[data-slot="slider-range"] {
+  background-color: oklch(var(--slider-highlight));
+}
+
+[data-slot="slider-thumb"] {
+  background-color: oklch(var(--slider-handle));
+  border-color: oklch(var(--slider-handle));
+  box-shadow: none;
 }

@@ -7,27 +7,25 @@ export interface None {
     __kind__: "None";
 }
 export type Option<T> = Some<T> | None;
-export class ExternalBlob {
-    getBytes(): Promise<Uint8Array<ArrayBuffer>>;
-    getDirectURL(): string;
-    static fromURL(url: string): ExternalBlob;
-    static fromBytes(blob: Uint8Array<ArrayBuffer>): ExternalBlob;
-    withUploadProgress(onProgress: (percentage: number) => void): ExternalBlob;
-}
-export interface UserSettings {
-    accentColor: string;
-    darkMode: boolean;
-}
-export interface BrushPreset {
-    tip: ExternalBlob;
+export type SettingsSave = string;
+export type CanvasSave = string;
+export interface UserProfile {
     name: string;
-    settings: string;
+}
+export enum UserRole {
+    admin = "admin",
+    user = "user",
+    guest = "guest"
 }
 export interface backendInterface {
-    deleteBrushPreset(userId: string, presetId: bigint): Promise<BrushPreset | null>;
-    getAllBrushPresetIds(userId: string): Promise<Array<bigint>>;
-    getBrushPreset(userId: string, presetId: bigint): Promise<BrushPreset | null>;
-    getUserSettings(userId: string): Promise<UserSettings>;
-    setUserSettings(userId: string, settings: UserSettings): Promise<void>;
-    storeBrushPreset(userId: string, presetId: bigint, name: string, settings: string, tip: ExternalBlob): Promise<void>;
+    assignCallerUserRole(user: Principal, role: UserRole): Promise<void>;
+    getCallerUserProfile(): Promise<UserProfile | null>;
+    getCallerUserRole(): Promise<UserRole>;
+    getCanvasHash(): Promise<CanvasSave | null>;
+    getUserProfile(user: Principal): Promise<UserProfile | null>;
+    getUserSettings(): Promise<SettingsSave | null>;
+    isCallerAdmin(): Promise<boolean>;
+    saveCallerUserProfile(profile: UserProfile): Promise<void>;
+    saveCanvasHash(canvasHash: CanvasSave): Promise<void>;
+    saveUserSettings(settings: SettingsSave): Promise<void>;
 }
