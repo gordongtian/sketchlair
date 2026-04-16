@@ -17,6 +17,7 @@ import type React from "react";
 import type { Layer } from "../components/LayersPanel";
 import type { Tool } from "../components/Toolbar";
 import type { ViewTransform } from "../types";
+import { applyCanvasResizeSideEffects } from "../utils/canvasResize";
 import type { WebGLBrushContext } from "../utils/webglBrush";
 import {
   invalidateAllLayerBitmaps,
@@ -290,18 +291,22 @@ export function useCropSystem(p: CropSystemParams) {
     // Dimensions changed — all cached bitmaps are now stale
     invalidateAllLayerBitmaps();
 
-    if (p.displayCanvasRef.current) {
-      p.displayCanvasRef.current.width = roundedW;
-      p.displayCanvasRef.current.height = roundedH;
-      // Canvas element resizing invalidates the existing 2D context object on some browsers.
-      // Null out all cached contexts so they are re-fetched on the next paint.
-      invalidateCompositeContextCaches();
-      p.onInvalidateOverlayCtx();
-    }
-    if (p.rulerCanvasRef.current) {
-      p.rulerCanvasRef.current.width = roundedW;
-      p.rulerCanvasRef.current.height = roundedH;
-    }
+    // Route all common canvas resize side effects through the central coordinator.
+    // This resizes: displayCanvas, rulerCanvas, WebGL brush FBO, and the four
+    // offscreen compositing canvases (belowActive, aboveActive, snapshot, activePreview).
+    applyCanvasResizeSideEffects(roundedW, roundedH, {
+      displayCanvasRef: p.displayCanvasRef,
+      rulerCanvasRef: p.rulerCanvasRef,
+      webglBrushRef: p.webglBrushRef,
+      belowActiveCanvasRef: p.belowActiveCanvasRef,
+      aboveActiveCanvasRef: p.aboveActiveCanvasRef,
+      snapshotCanvasRef: p.snapshotCanvasRef,
+      activePreviewCanvasRef: p.activePreviewCanvasRef,
+    });
+    // Canvas element resizing (done above) invalidates the existing 2D context object
+    // on some browsers. Null out all cached contexts so they are re-fetched on the next paint.
+    invalidateCompositeContextCaches();
+    p.onInvalidateOverlayCtx();
 
     p.setLayers(layersAfter);
     p.layersRef.current = layersAfter;
@@ -317,23 +322,6 @@ export function useCropSystem(p: CropSystemParams) {
     p.setCanvasHeight(roundedH);
     p.canvasWidthRef.current = roundedW;
     p.canvasHeightRef.current = roundedH;
-
-    // Resize WebGL stroke buffer to match new canvas dimensions
-    if (p.webglBrushRef.current) {
-      p.webglBrushRef.current.resize(roundedW, roundedH);
-    }
-    // Resize offscreen compositing canvases
-    for (const canvasRef of [
-      p.belowActiveCanvasRef,
-      p.aboveActiveCanvasRef,
-      p.snapshotCanvasRef,
-      p.activePreviewCanvasRef,
-    ]) {
-      if (canvasRef.current) {
-        canvasRef.current.width = roundedW;
-        canvasRef.current.height = roundedH;
-      }
-    }
 
     isCropActiveRef.current = false;
     setIsCropActive(false);

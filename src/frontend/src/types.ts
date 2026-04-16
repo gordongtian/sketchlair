@@ -1,41 +1,118 @@
-import type { Layer } from "./components/LayersPanel";
+// ── Flat-array layer architecture ─────────────────────────────────────────────
+//
+// The layer stack is a single flat array. Groups are represented by two special
+// marker entries — a group header and an end_group — with all child layers and
+// nested groups sitting between them. Nesting is determined purely by position
+// in the array, not by object references or parentId fields.
+//
+//   { type: 'group',     id: 'G', name: '...', ... }   ← group header
+//   { type: 'layer',     id: 'L', ... }                 ← regular layer inside group
+//   { type: 'end_group', id: 'G' }                      ← closing marker (same id as header)
 
-// ── Layer Tree Types ──────────────────────────────────────────────────────────
+// ── Painting / ruler layer ────────────────────────────────────────────────────
 
 /**
- * A LayerGroup — a collapsible folder containing LayerNodes.
- * Groups have opacity and visibility but no blending mode.
- * Nested groups are supported.
+ * A regular painting or ruler layer in the flat array.
+ * All pixel data, opacity, blend mode, and ruler geometry live here.
+ *
+ * The `type` field discriminates this variant. Ruler layers set `isRuler: true`
+ * in the RulerFields mixin — historically code also checks `layer.type === 'ruler'`
+ * for ruler layers; both patterns are supported (isRuler is the canonical flag,
+ * type === 'ruler' is accepted as an alias for PaintLayer with isRuler = true).
  */
-export interface LayerGroup {
-  kind: "group";
+export interface PaintLayer extends RulerFields {
+  type?: "layer" | "ruler"; // undefined is treated as 'layer' for legacy entries
   id: string;
   name: string;
-  /** If false, all children are hidden in render (children.visible is NOT modified) */
   visible: boolean;
-  /** 0–1. Effective opacity of children = child.opacity * this.opacity (cascading through all ancestors) */
   opacity: number;
-  /** UI state: whether children are visible in the layer panel */
-  collapsed: boolean;
-  /** Ordered list of child LayerNodes (index 0 = topmost) */
-  children: LayerNode[];
+  blendMode: string;
+  isClippingMask: boolean;
+  alphaLock: boolean;
 }
 
+// ── Group header marker ───────────────────────────────────────────────────────
+
 /**
- * A LayerItem — wraps an existing Layer leaf node in the tree.
- * The `id` field mirrors `layer.id` for uniform tree traversal.
+ * A group header marker. Appears at the start of a group slice in the flat
+ * array. All layers and nested groups between this entry and the matching
+ * EndGroup (same id) belong to this group.
+ *
+ * Group headers have NO canvas, imageData, or pixel content.
  */
+export interface GroupHeader {
+  type: "group";
+  id: string;
+  name: string;
+  visible: boolean;
+  opacity: number;
+  collapsed: boolean;
+  blendMode?: string;
+  locked?: boolean;
+}
+
+// ── End-group marker ──────────────────────────────────────────────────────────
+
+/**
+ * An end-group marker. Appears at the end of a group slice, sharing the same
+ * `id` as its corresponding GroupHeader.
+ *
+ * EndGroup entries are completely non-interactive — they cannot be selected,
+ * clicked, dragged, or operated on. They are invisible to all operations
+ * (selection, copy, cut, export, transform).
+ */
+export interface EndGroup {
+  type: "end_group";
+  id: string;
+}
+
+// ── Discriminated union ───────────────────────────────────────────────────────
+
+/**
+ * The Layer type — a discriminated union of all entry kinds in the flat array.
+ *
+ *   layer.type === 'layer'     → PaintLayer (regular painting layer)
+ *   layer.type === 'ruler'     → PaintLayer (ruler layer, isRuler = true)
+ *   layer.type === undefined   → PaintLayer (legacy entry without explicit type)
+ *   layer.type === 'group'     → GroupHeader
+ *   layer.type === 'end_group' → EndGroup
+ *
+ * Code that checks `layer.type === 'group'` narrows to GroupHeader.
+ * Code that checks `layer.type === 'end_group'` narrows to EndGroup.
+ * All other type values (or undefined) indicate a PaintLayer.
+ */
+export type Layer = PaintLayer | GroupHeader | EndGroup;
+
+// ── Legacy tree types (kept for files not yet migrated to flat-array) ─────────
+//
+// These types describe the OLD tree-based layer architecture. They are retained
+// here because PaintingApp.tsx, LayersPanel.tsx, and related files still
+// reference them during the ongoing migration. New code must NOT use these.
+// Use the Layer discriminated union above instead.
+
+/** A layer item (leaf node) in the legacy tree structure. */
 export interface LayerItem {
   kind: "layer";
   id: string;
   layer: Layer;
 }
 
-/** Union type for any node in the layer tree */
-export type LayerNode = LayerGroup | LayerItem;
+/** A group node in the legacy tree structure. */
+export interface LayerGroup {
+  kind: "group";
+  id: string;
+  name: string;
+  visible: boolean;
+  opacity: number;
+  collapsed: boolean;
+  blendMode?: string;
+  children: LayerNode[];
+}
 
-/** Utility type alias for node kind discrimination */
-export type LayerNodeKind = LayerNode["kind"];
+/** Union of all node types in the legacy tree. */
+export type LayerNode = LayerItem | LayerGroup;
+
+// ── View transform ────────────────────────────────────────────────────────────
 
 export interface ViewTransform {
   zoom: number;
@@ -43,6 +120,8 @@ export interface ViewTransform {
   panY: number;
   rotation: number;
 }
+
+// ── Ruler geometry fields ─────────────────────────────────────────────────────
 
 export interface RulerFields {
   isRuler?: boolean;

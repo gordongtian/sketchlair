@@ -13,7 +13,6 @@ import type { Layer } from "../components/LayersPanel";
 import type { Tool } from "../components/Toolbar";
 import type { UndoEntry } from "../hooks/useLayerSystem";
 import type { SelectionGeom } from "../selectionTypes";
-import type { LayerNode } from "../types";
 
 // The shape stored in selectionBoundaryPathRef
 export interface SelectionBoundaryPath {
@@ -60,9 +59,7 @@ export interface PaintingContextValue {
   layersRef: React.MutableRefObject<Layer[]>;
   pendingLayerPixelsRef: React.MutableRefObject<Map<string, ImageData>>;
 
-  // ---- Layer tree ----
-  /** Ref that always mirrors the current layerTree state (LayerNode[]). */
-  layerTreeRef: React.MutableRefObject<LayerNode[]>;
+  // ---- Layer state ----
   /** Ref that mirrors the selectedLayerIds Set state. */
   selectedLayerIdsRef: React.MutableRefObject<Set<string>>;
   /** Dispatcher for selectedLayerIds state (for external selection changes). */

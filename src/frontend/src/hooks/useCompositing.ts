@@ -18,19 +18,16 @@ import type { BrushSettings } from "@/components/BrushSettingsPanel";
 import type { Layer } from "@/components/LayersPanel";
 import type { Tool } from "@/components/Toolbar";
 import type { XfState } from "@/context/PaintingContext";
-import type { LayerNode } from "@/types";
 import {
-  flattenTree,
-  getEffectiveOpacity,
-  getEffectiveVisibility,
-} from "@/utils/layerTree";
+  isFlatEndGroup,
+  isFlatGroupHeader,
+  isFlatLayer,
+} from "@/utils/groupUtils";
+import type { FlatEntry } from "@/utils/groupUtils";
 import { useCallback, useRef } from "react";
 import type React from "react";
-
-// ─── isIPad (duplicated from PaintingApp so this module is self-contained) ───
-const isIPad =
-  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+import { isIPad } from "../utils/constants";
+import { getLiquifyStrokeActive } from "./useLiquifySystem";
 
 // ─── ImageBitmap cache ────────────────────────────────────────────────────────
 // GPU-resident bitmaps that avoid re-uploading layer pixel data on every drawImage call.
@@ -94,6 +91,26 @@ export function getBitmapOrCanvas(
   return lc;
 }
 
+// ─── scheduleComposite cancellation token ────────────────────────────────────
+// Module-level RAF ID so external callers (e.g. liquify pointer-down) can cancel
+// a pending scheduleComposite RAF that has already been enqueued. Without this,
+// the two-RAF chain  (_liqRafPendingRef → scheduleComposite inner RAF) means
+// cancelling only _liqRafPendingRef is insufficient when the first RAF already
+// fired and enqueued the scheduleComposite inner RAF before pointer-down ran.
+let _scheduleCompositeRafId: number | null = null;
+
+/**
+ * Cancel the pending scheduleComposite RAF if one is in flight.
+ * Call at liquify pointer-down to prevent a trailing composite from the previous
+ * stroke's last pointer-move from flashing inactive layers' pre-warp state.
+ */
+export function cancelScheduledComposite(): void {
+  if (_scheduleCompositeRafId !== null) {
+    cancelAnimationFrame(_scheduleCompositeRafId);
+    _scheduleCompositeRafId = null;
+  }
+}
+
 // ─── Canvas-dirty signal ─────────────────────────────────────────────────────
 // Lightweight subscription for "the display canvas was just fully composited".
 // PaintingApp registers updateNavigatorCanvas here so any code that calls
@@ -154,6 +171,11 @@ interface CanvasDirtyCallbacks {
   setNavigatorVersion: React.Dispatch<React.SetStateAction<number>>;
   /** Returns the current thumbnail data URL for a given layer canvas */
   getLayerThumbnail: (layerId: string) => string;
+  /**
+   * Returns the current flat layers array (used to skip thumbnails for
+   * collapsed-group children).
+   */
+  getLayers?: () => FlatEntry[];
 }
 
 let _dirtyCallbacks: CanvasDirtyCallbacks | null = null;
@@ -163,14 +185,60 @@ const _pendingThumbLayerIds = new Set<string>();
 let _thumbFlushTimerId: ReturnType<typeof setTimeout> | null = null;
 let _navFlushTimerId: ReturnType<typeof setTimeout> | null = null;
 
+/**
+ * Returns false if the layer is inside a collapsed group (and therefore not
+ * visible in the layer panel). Thumbnail regeneration is skipped for such layers
+ * because the user can't see them in the panel anyway — saving CPU on large layer stacks.
+ *
+ * A layer that is simply hidden (visible=false) still has its thumbnail updated
+ * so the panel can show the correct thumbnail when the layer is made visible again.
+ *
+ * Returns true for top-level layers and layers inside fully-expanded groups.
+ */
+function checkIsLayerVisibleInPanel(
+  layerId: string,
+  layers: FlatEntry[],
+): boolean {
+  const idx = layers.findIndex((e) => e.id === layerId);
+  if (idx === -1) return false;
+
+  // Walk backwards from the layer's position to find all ancestor group headers.
+  // If any ancestor group is collapsed, the layer is hidden in the panel.
+  let skipDepth = 0;
+  for (let i = idx - 1; i >= 0; i--) {
+    const e = layers[i];
+    if (isFlatEndGroup(e)) {
+      // Passing over a complete nested group while scanning backwards
+      skipDepth++;
+    } else if (isFlatGroupHeader(e)) {
+      if (skipDepth > 0) {
+        // This header belongs to the nested group we're skipping
+        skipDepth--;
+      } else {
+        // This is an ancestor group header
+        if (e.collapsed) return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 function _flushPendingThumbs(): void {
   _thumbFlushTimerId = null;
   if (!_dirtyCallbacks || _pendingThumbLayerIds.size === 0) return;
   const ids = [..._pendingThumbLayerIds];
   _pendingThumbLayerIds.clear();
+  // Snapshot the current flat layers once for all panel-visibility checks.
+  const currentLayers = _dirtyCallbacks.getLayers?.() ?? null;
   _dirtyCallbacks.setLayerThumbnails((prev) => {
     const next = { ...prev };
     for (const id of ids) {
+      // Skip thumbnail regeneration for layers inside collapsed groups — they
+      // are not visible in the panel so regenerating would be pure waste.
+      if (currentLayers && !checkIsLayerVisibleInPanel(id, currentLayers)) {
+        continue;
+      }
       const thumb = _dirtyCallbacks!.getLayerThumbnail(id);
       if (thumb) next[id] = thumb;
     }
@@ -255,13 +323,18 @@ export interface UseCompositingParams {
   activePreviewCanvasRef: React.MutableRefObject<HTMLCanvasElement | null>;
   strokeBufferRef: React.MutableRefObject<HTMLCanvasElement | null>;
   layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
-  layerTreeRef: React.MutableRefObject<LayerNode[]>;
   layersRef: React.MutableRefObject<Layer[]>;
   activeLayerIdRef: React.MutableRefObject<string>;
   activeLayerAlphaLockRef: React.MutableRefObject<boolean>;
   brushBlendModeRef: React.MutableRefObject<string>;
   tailRafIdRef: React.MutableRefObject<number | null>;
   needsFullCompositeRef: React.MutableRefObject<boolean>;
+  /**
+   * Set to true at pointer-down (stroke start) and false at flushStrokeBuffer commit.
+   * Any function that would write to a layer canvas checks this flag and blocks
+   * if a stroke is active — layer canvases are strictly read-only during a stroke.
+   */
+  strokeActiveRef: React.MutableRefObject<boolean>;
   strokeDirtyRectRef: React.MutableRefObject<{
     minX: number;
     minY: number;
@@ -275,6 +348,10 @@ export interface UseCompositingParams {
   } | null>;
   strokeCanvasCacheKeyRef: React.MutableRefObject<number>;
   strokeCanvasLastBuiltGenRef: React.MutableRefObject<number>;
+  /** Opacity locked at stroke start so compositeWithStrokePreview and flushStrokeBuffer
+   *  always use the same value — prevents mid-stroke opacity collapse when a move/transform
+   *  commits and updates layer state while a stroke is in flight (Symptom 3 fix). */
+  strokeActiveLayerOpacityRef: React.MutableRefObject<number | null>;
   selectionActiveRef: React.MutableRefObject<boolean>;
   selectionMaskRef: React.MutableRefObject<HTMLCanvasElement | null>;
   layersBeingExtractedRef: React.MutableRefObject<Set<string>>;
@@ -301,6 +378,68 @@ export interface UseCompositingParams {
   transformOrigFloatCanvasRef: React.MutableRefObject<HTMLCanvasElement | null>;
   webglBrushRef: React.MutableRefObject<{ clear(): void } | null>;
   getActiveSize: () => number;
+  /**
+   * Canvas integrity utility — returns a correctly-sized HTMLCanvasElement for
+   * the given layerId, creating or resizing it if necessary.
+   * Passed from PaintingApp so the implementation is never duplicated.
+   */
+  getOrCreateLayerCanvas: (layerId: string) => HTMLCanvasElement;
+}
+
+// ─── Group scope stack helpers ────────────────────────────────────────────────
+// Used during the bottom-to-top compositing loop to cascade opacity/visibility
+// from ancestor group headers to their child layers.
+//
+// The flat array is walked from ls.length-1 → 0 (bottom to top = painter's order).
+// When walking upward:
+//   end_group encountered → we are entering a group's content range → push scope
+//   group header encountered → we are leaving a group's content range → pop scope
+//
+// This means the stack always contains the enclosing group headers for the
+// current compositing position, in innermost-first order.
+
+interface GroupScope {
+  id: string;
+  opacity: number;
+  visible: boolean;
+  blendMode: string;
+  /** True when this group has its own offscreen compositing buffer */
+  hasOffscreen: boolean;
+  /** The offscreen canvas for this group scope, when hasOffscreen is true */
+  offscreenCanvas: HTMLCanvasElement | null;
+  offscreenCtx: CanvasRenderingContext2D | null;
+}
+
+/**
+ * Compute the cascaded effective opacity of a layer, given the current group scope stack.
+ * The stack is ordered innermost-first (top of stack = immediately enclosing group).
+ * Effective opacity = layer.opacity × product of all scope opacities.
+ */
+function effectiveOpacityFromStack(
+  layerOpacity: number,
+  stack: GroupScope[],
+): number {
+  let result = layerOpacity;
+  for (const scope of stack) {
+    result *= scope.opacity;
+  }
+  return result;
+}
+
+/**
+ * Returns true if the layer is effectively visible given the group scope stack.
+ * A layer is invisible if its own visible flag is false OR if any enclosing group
+ * has visible=false.
+ */
+function effectiveVisibleFromStack(
+  layerVisible: boolean,
+  stack: GroupScope[],
+): boolean {
+  if (!layerVisible) return false;
+  for (const scope of stack) {
+    if (!scope.visible) return false;
+  }
+  return true;
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
@@ -313,17 +452,18 @@ export function useCompositing({
   activePreviewCanvasRef,
   strokeBufferRef,
   layerCanvasesRef,
-  layerTreeRef,
   layersRef,
   activeLayerIdRef,
   activeLayerAlphaLockRef,
   brushBlendModeRef,
   tailRafIdRef,
   needsFullCompositeRef,
+  strokeActiveRef,
   strokeDirtyRectRef,
   strokeStartSnapshotRef,
   strokeCanvasCacheKeyRef,
   strokeCanvasLastBuiltGenRef,
+  strokeActiveLayerOpacityRef,
   selectionActiveRef,
   selectionMaskRef,
   layersBeingExtractedRef,
@@ -337,6 +477,7 @@ export function useCompositing({
   transformOrigFloatCanvasRef,
   webglBrushRef,
   getActiveSize,
+  getOrCreateLayerCanvas,
 }: UseCompositingParams) {
   // ── composite ──────────────────────────────────────────────────────────────
   // Composite all visible layers onto display canvas.
@@ -371,13 +512,24 @@ export function useCompositing({
       const drH = drY2 - drY;
       if (useDR) {
         ctx.clearRect(drX, drY, drW, drH);
+        // Safety net: fill the dirty region with opaque white so the HTML page background
+        // never shows through if the bottommost layer canvas is still transparent.
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(drX, drY, drW, drH);
       } else {
         ctx.clearRect(0, 0, dW, dH);
+        // Safety net: fill the full canvas with opaque white before drawing any layer.
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, dW, dH);
       }
-      // Build the flat layer list from the tree for this composite call.
-      // flattenTree gives compositing order (top-to-bottom), matching layersRef order.
-      const _tree = layerTreeRef.current;
-      const ls = flattenTree(_tree).map((item) => item.layer);
+
+      // Iterate the flat layers array directly (bottom-to-top = painter's algorithm).
+      // Group headers and end_group markers define compositing scope boundaries.
+      // Walking from the end of the array to the start means:
+      //   end_group → entering a group's content range (push scope)
+      //   group header → leaving a group's content range (pop scope)
+      const ls = layersRef.current as unknown as FlatEntry[];
+
       // When a dirty region is known, clip all draws to it so GPU only processes that region.
       if (useDR) {
         ctx.save();
@@ -385,22 +537,179 @@ export function useCompositing({
         ctx.rect(drX, drY, drW, drH);
         ctx.clip();
       }
-      // Precompute mask canvases
+
+      // Group scope stack — innermost-first.
+      // Each entry tracks the enclosing group's opacity/visibility for cascading.
+      const groupScopeStack: GroupScope[] = [];
+
+      // FIX 3: Validation counters for the debug log at the end of composite().
+      let paintedCount = 0;
+      const totalPaintLayers = ls.filter(isFlatLayer).length;
+
       for (let i = ls.length - 1; i >= 0; i--) {
-        const layer = ls[i];
-        if (!getEffectiveVisibility(_tree, layer.id)) continue;
-        const lc = layerCanvasesRef.current.get(layer.id);
-        if (!lc) continue;
-        // Effective opacity cascades through all ancestor group opacities
-        const effectiveOpacity = getEffectiveOpacity(_tree, layer.id);
-        // If clipping mask, apply clip to layer below
-        if (layer.isClippingMask && i < ls.length - 1) {
-          // Find the layer below (non-clipping, non-background)
-          let belowLayer: Layer | null = null;
-          for (let j = i + 1; j < ls.length; j++) {
-            if (!ls[j].isClippingMask) {
-              belowLayer = ls[j];
+        const entry = ls[i];
+
+        // ── end_group: push a group compositing scope ──────────────────────
+        // We are entering (from below) a group's content range.
+        if (isFlatEndGroup(entry)) {
+          // Find the matching group header to get its properties
+          const groupId = entry.id;
+          let headerOpacity = 1;
+          let headerVisible = true;
+          let headerBlendMode = "source-over";
+          // Scan backwards for the header (it will be before its end_group in the array,
+          // but since we're iterating in reverse we need to scan forward from current position)
+          for (let j = i - 1; j >= 0; j--) {
+            const candidate = ls[j];
+            if (isFlatGroupHeader(candidate) && candidate.id === groupId) {
+              headerOpacity = candidate.opacity;
+              headerVisible = candidate.visible;
+              headerBlendMode =
+                (candidate as unknown as { blendMode?: string }).blendMode ??
+                "source-over";
               break;
+            }
+          }
+
+          // Determine if this group needs an offscreen compositing buffer.
+          // A group needs its own offscreen buffer when it has non-default opacity
+          // or a non-default blend mode — so the group composites as a unit.
+          const needsOffscreen =
+            headerOpacity < 1 ||
+            (headerBlendMode !== "source-over" && headerBlendMode !== "");
+
+          let offscreenCanvas: HTMLCanvasElement | null = null;
+          let offscreenCtx: CanvasRenderingContext2D | null = null;
+
+          if (needsOffscreen) {
+            offscreenCanvas = document.createElement("canvas");
+            offscreenCanvas.width = dW;
+            offscreenCanvas.height = dH;
+            offscreenCtx = offscreenCanvas.getContext("2d");
+          }
+
+          groupScopeStack.push({
+            id: groupId,
+            opacity: headerOpacity,
+            visible: headerVisible,
+            blendMode: headerBlendMode,
+            hasOffscreen: needsOffscreen,
+            offscreenCanvas,
+            offscreenCtx,
+          });
+          continue;
+        }
+
+        // ── group header: pop the group scope and composite its buffer ──────
+        // We are leaving (from below) the group's content range.
+        if (isFlatGroupHeader(entry)) {
+          const scope = groupScopeStack.pop();
+          if (scope?.hasOffscreen && scope.offscreenCanvas) {
+            // Determine the target context — either the parent offscreen or the display
+            const parentScope = groupScopeStack[groupScopeStack.length - 1];
+            const targetCtx =
+              parentScope?.hasOffscreen && parentScope.offscreenCtx
+                ? parentScope.offscreenCtx
+                : ctx;
+
+            // Effective group opacity = group's own opacity × all ancestor group opacities
+            const cascadedOpacity = effectiveOpacityFromStack(
+              scope.opacity,
+              groupScopeStack,
+            );
+            const groupVisible = effectiveVisibleFromStack(
+              scope.visible,
+              groupScopeStack,
+            );
+
+            if (groupVisible) {
+              targetCtx.globalAlpha = cascadedOpacity;
+              targetCtx.globalCompositeOperation = (scope.blendMode ||
+                "source-over") as GlobalCompositeOperation;
+              if (useDR) {
+                targetCtx.drawImage(
+                  scope.offscreenCanvas,
+                  drX,
+                  drY,
+                  drW,
+                  drH,
+                  drX,
+                  drY,
+                  drW,
+                  drH,
+                );
+              } else {
+                targetCtx.drawImage(scope.offscreenCanvas, 0, 0);
+              }
+              targetCtx.globalAlpha = 1;
+              targetCtx.globalCompositeOperation = "source-over";
+            }
+          }
+          // If no offscreen scope was pushed (opacity=1, default blend mode),
+          // there is nothing extra to composite — children were already drawn
+          // directly into the parent context.
+          continue;
+        }
+
+        // ── Regular PaintLayer ─────────────────────────────────────────────
+        if (!isFlatLayer(entry)) continue;
+
+        // Cast to the paint-layer shape (FlatEntry has all the fields we need)
+        const layer = entry as FlatEntry & {
+          visible: boolean;
+          opacity: number;
+          blendMode: string;
+          isClippingMask?: boolean;
+        };
+
+        // Visibility: layer must be visible and all ancestor groups must be visible
+        if (!effectiveVisibleFromStack(layer.visible, groupScopeStack))
+          continue;
+
+        // FIX 2a: Use getOrCreateLayerCanvas for paint layers so missing or
+        // wrongly-sized canvases are self-healed rather than silently skipped.
+        const lc = getOrCreateLayerCanvas(layer.id);
+        paintedCount++;
+
+        // Effective opacity cascades through all ancestor group opacities
+        const effectiveOpacity = effectiveOpacityFromStack(
+          layer.opacity,
+          groupScopeStack,
+        );
+
+        // Determine which context to render into:
+        // If the immediately enclosing group has an offscreen buffer, render there.
+        // Otherwise render directly to the display canvas.
+        const enclosingScope = groupScopeStack[groupScopeStack.length - 1];
+        const renderCtx =
+          enclosingScope?.hasOffscreen && enclosingScope.offscreenCtx
+            ? enclosingScope.offscreenCtx
+            : ctx;
+
+        // If clipping mask, apply clip to layer below
+        if (layer.isClippingMask) {
+          // Find the layer below (non-clipping, non-background) in the flat array
+          let belowLayer:
+            | (FlatEntry & {
+                visible: boolean;
+                opacity: number;
+                blendMode: string;
+              })
+            | null = null;
+          for (let j = i + 1; j < ls.length; j++) {
+            const candidate = ls[j];
+            if (isFlatLayer(candidate)) {
+              const candidateLayer = candidate as FlatEntry & {
+                isClippingMask?: boolean;
+              };
+              if (!candidateLayer.isClippingMask) {
+                belowLayer = candidate as FlatEntry & {
+                  visible: boolean;
+                  opacity: number;
+                  blendMode: string;
+                };
+                break;
+              }
             }
           }
           if (belowLayer) {
@@ -461,11 +770,11 @@ export function useCompositing({
                 );
               }
               tmpCtx.globalCompositeOperation = "source-over";
-              ctx.globalAlpha = 1;
-              ctx.globalCompositeOperation = (layer.blendMode ||
+              renderCtx.globalAlpha = 1;
+              renderCtx.globalCompositeOperation = (layer.blendMode ||
                 "source-over") as GlobalCompositeOperation;
               if (useDR) {
-                ctx.drawImage(
+                renderCtx.drawImage(
                   _clipTmpCanvas,
                   drX,
                   drY,
@@ -477,13 +786,14 @@ export function useCompositing({
                   drH,
                 );
               } else {
-                ctx.drawImage(_clipTmpCanvas, 0, 0);
+                renderCtx.drawImage(_clipTmpCanvas, 0, 0);
               }
-              ctx.globalCompositeOperation = "source-over";
+              renderCtx.globalCompositeOperation = "source-over";
               continue;
             }
           }
         }
+
         // ── Transform float rendering ──────────────────────────────────────
         // Determine which transform mode is active for this layer.
         //
@@ -571,11 +881,11 @@ export function useCompositing({
           } else {
             tmpCtx.drawImage(perLayerFloat, 0, 0);
           }
-          ctx.globalAlpha = effectiveOpacity;
-          ctx.globalCompositeOperation = (layer.blendMode ||
+          renderCtx.globalAlpha = effectiveOpacity;
+          renderCtx.globalCompositeOperation = (layer.blendMode ||
             "source-over") as GlobalCompositeOperation;
-          ctx.drawImage(_clipTmpCanvas, 0, 0);
-          ctx.globalCompositeOperation = "source-over";
+          renderCtx.drawImage(_clipTmpCanvas, 0, 0);
+          renderCtx.globalCompositeOperation = "source-over";
         } else if (isMultiLayerParticipant && !perLayerFloat) {
           // Float not yet available (extraction in progress) — render as empty slot
         } else if (isSingleLayerFloat) {
@@ -624,23 +934,28 @@ export function useCompositing({
           } else if (floatSource) {
             tmpCtx.drawImage(floatSource, 0, 0);
           }
-          ctx.globalAlpha = effectiveOpacity;
-          ctx.globalCompositeOperation = (layer.blendMode ||
+          renderCtx.globalAlpha = effectiveOpacity;
+          renderCtx.globalCompositeOperation = (layer.blendMode ||
             "source-over") as GlobalCompositeOperation;
-          ctx.drawImage(_clipTmpCanvas, 0, 0);
-          ctx.globalCompositeOperation = "source-over";
+          renderCtx.drawImage(_clipTmpCanvas, 0, 0);
+          renderCtx.globalCompositeOperation = "source-over";
         } else if (!isBeingExtracted) {
           // Normal layer — draw from cache
-          ctx.globalAlpha = effectiveOpacity;
-          ctx.globalCompositeOperation = (layer.blendMode ||
+          renderCtx.globalAlpha = effectiveOpacity;
+          renderCtx.globalCompositeOperation = (layer.blendMode ||
             "source-over") as GlobalCompositeOperation;
-          ctx.drawImage(getBitmapOrCanvas(layer.id, lc), 0, 0);
-          ctx.globalCompositeOperation = "source-over";
+          renderCtx.drawImage(getBitmapOrCanvas(layer.id, lc), 0, 0);
+          renderCtx.globalCompositeOperation = "source-over";
         }
       }
 
       ctx.globalAlpha = 1;
       if (useDR) ctx.restore();
+      // FIX 3: Debug log — how many paint layers were actually painted vs total.
+      // Gated behind console.debug so it only shows in dev tools when enabled.
+      console.debug(
+        `[Composite] painted ${paintedCount}/${totalPaintLayers} paint layers`,
+      );
       // Notify subscribers (e.g. navigator) that a full composite just completed.
       _scheduleCompositeDone();
     },
@@ -772,14 +1087,23 @@ export function useCompositing({
 
       // If active layer is a clipping mask, clip preview to base layer
       let previewSource: HTMLCanvasElement = preview;
-      if (activeLayer.isClippingMask) {
-        const ls2 = layersRef.current;
+      const activeLayerAsFlat = activeLayer as unknown as FlatEntry & {
+        isClippingMask?: boolean;
+      };
+      if (activeLayerAsFlat.isClippingMask) {
+        const ls2 = layersRef.current as unknown as FlatEntry[];
         const aIdx2 = ls2.findIndex((l) => l.id === activeLayerId);
-        let baseLayerForClip: Layer | null = null;
+        let baseLayerForClip: (FlatEntry & { id: string }) | null = null;
         for (let j = aIdx2 + 1; j < ls2.length; j++) {
-          if (!ls2[j].isClippingMask) {
-            baseLayerForClip = ls2[j];
-            break;
+          const candidate = ls2[j];
+          if (isFlatLayer(candidate)) {
+            const candidateLayer = candidate as FlatEntry & {
+              isClippingMask?: boolean;
+            };
+            if (!candidateLayer.isClippingMask) {
+              baseLayerForClip = candidate as FlatEntry & { id: string };
+              break;
+            }
           }
         }
         if (baseLayerForClip) {
@@ -809,72 +1133,158 @@ export function useCompositing({
         }
       }
 
-      displayCtx.globalAlpha = activeLayer.opacity;
-      displayCtx.globalCompositeOperation = (activeLayer.blendMode ||
-        "source-over") as GlobalCompositeOperation;
+      // Draw active layer preview to display.
+      // The composite operation MUST always be source-over (or the layer's blend mode)
+      // for normal paint strokes. destination-out is only valid for the eraser tool and
+      // is applied to the PREVIEW canvas above — never to the display canvas draw here.
+      const activeLayerBlend =
+        (activeLayer as Layer).blendMode || "source-over";
+      if (
+        activeLayerBlend === "destination-out" &&
+        !(tool === "eraser" || brushBlendModeRef.current === "clear")
+      ) {
+        // This should never happen for normal strokes. Log and fall back to source-over.
+        console.warn(
+          "[StrokePreview] destination-out reached for non-eraser/non-clear stroke — forcing source-over",
+        );
+      }
+      displayCtx.globalAlpha =
+        strokeActiveLayerOpacityRef.current ?? (activeLayer as Layer).opacity;
+      // For the display canvas composite: always use the layer's blend mode (source-over for normal paint).
+      // The eraser's destination-out was already applied inside previewCtx above — the display
+      // draw just composites the fully-built preview at the layer's blend mode.
+      displayCtx.globalCompositeOperation =
+        activeLayerBlend as GlobalCompositeOperation;
       displayCtx.drawImage(previewSource, cx, cy, cw, ch, cx, cy, cw, ch);
       displayCtx.globalAlpha = 1;
       displayCtx.globalCompositeOperation = "source-over";
 
       // Apply above-active layers individually with their correct blend modes.
-      // These layers cannot be pre-baked into a single canvas because blend modes
-      // require compositing against the already-drawn pixels beneath them.
+      // INVARIANT: This block ALWAYS runs after the active preview draw — it is never
+      // conditional, never skippable. The clear above must always be followed by above-layer draws.
+      // Walk from aIdx2-1 down to 0 (painter's order: low index = visually on top).
       {
-        const ls2 = layersRef.current;
+        const ls2 = layersRef.current as unknown as FlatEntry[];
         const aIdx2 = ls2.findIndex((l) => l.id === activeLayerId);
-        // Resize check + context fetch hoisted outside the per-layer loop so
-        // it runs at most once per frame regardless of how many clipping-mask
-        // layers are above the active layer.
-        if (
-          _aboveClipTmpCanvas.width !== W ||
-          _aboveClipTmpCanvas.height !== H
-        ) {
-          _aboveClipTmpCanvas.width = W;
-          _aboveClipTmpCanvas.height = H;
-          _aboveClipTmpCtxCached = null;
-        }
-        if (!_aboveClipTmpCtxCached)
-          _aboveClipTmpCtxCached = _aboveClipTmpCanvas.getContext("2d", {
-            willReadFrequently: !isIPad,
-          });
-        for (let i = aIdx2 - 1; i >= 0; i--) {
-          const layer = ls2[i];
-          if (!layer.visible) continue;
-          const lc = layerCanvasesRef.current.get(layer.id);
-          if (!lc) continue;
 
-          let layerSource: HTMLCanvasElement = lc;
-
-          // Handle clipping mask: mask layer pixels against its base layer
-          if (layer.isClippingMask && i < ls2.length - 1) {
-            let baseLayer: (typeof ls2)[0] | null = null;
-            for (let j = i + 1; j < ls2.length; j++) {
-              if (!ls2[j].isClippingMask) {
-                baseLayer = ls2[j];
-                break;
-              }
-            }
-            if (baseLayer) {
-              const baseLc = layerCanvasesRef.current.get(baseLayer.id);
-              if (baseLc) {
-                const abClipCtx = _aboveClipTmpCtxCached!;
-                abClipCtx.clearRect(cx, cy, cw, ch);
-                abClipCtx.globalCompositeOperation = "source-over";
-                abClipCtx.drawImage(lc, cx, cy, cw, ch, cx, cy, cw, ch);
-                abClipCtx.globalCompositeOperation = "destination-in";
-                abClipCtx.drawImage(baseLc, cx, cy, cw, ch, cx, cy, cw, ch);
-                abClipCtx.globalCompositeOperation = "source-over";
-                layerSource = _aboveClipTmpCanvas;
-              }
-            }
+        if (aIdx2 < 0) {
+          // Active layer not found in flat array — log and leave the display as-is.
+          // Do NOT clear and do NOT call composite() (which would yield via rAF and produce a flash).
+          console.warn(
+            "[StrokePreview] active layer not found in flat array — above-layer loop skipped, display left as-is",
+            activeLayerId,
+          );
+        } else {
+          // Resize check + context fetch hoisted outside the per-layer loop.
+          if (
+            _aboveClipTmpCanvas.width !== W ||
+            _aboveClipTmpCanvas.height !== H
+          ) {
+            _aboveClipTmpCanvas.width = W;
+            _aboveClipTmpCanvas.height = H;
+            _aboveClipTmpCtxCached = null;
           }
+          if (!_aboveClipTmpCtxCached)
+            _aboveClipTmpCtxCached = _aboveClipTmpCanvas.getContext("2d", {
+              willReadFrequently: !isIPad,
+            });
 
-          displayCtx.globalAlpha = layer.opacity;
-          displayCtx.globalCompositeOperation = (layer.blendMode ||
-            "source-over") as GlobalCompositeOperation;
-          displayCtx.drawImage(layerSource, cx, cy, cw, ch, cx, cy, cw, ch);
-          displayCtx.globalAlpha = 1;
-          displayCtx.globalCompositeOperation = "source-over";
+          // Group scope stack for cascaded opacity/visibility from ancestor groups.
+          // We iterate downward (aIdx2-1 → 0), so:
+          //   group header encountered going downward → push scope
+          //   end_group encountered going downward → pop scope
+          const aboveScopeStack: GroupScope[] = [];
+
+          for (let i = aIdx2 - 1; i >= 0; i--) {
+            const entry = ls2[i];
+
+            // Group header going downward = entering the group from above → push scope
+            if (isFlatGroupHeader(entry)) {
+              aboveScopeStack.push({
+                id: entry.id,
+                opacity: entry.opacity,
+                visible: entry.visible,
+                blendMode:
+                  (entry as unknown as { blendMode?: string }).blendMode ??
+                  "source-over",
+                hasOffscreen: false,
+                offscreenCanvas: null,
+                offscreenCtx: null,
+              });
+              continue;
+            }
+
+            // end_group going downward = leaving the group → pop scope
+            if (isFlatEndGroup(entry)) {
+              aboveScopeStack.pop();
+              continue;
+            }
+
+            // Skip non-paint entries
+            if (!isFlatLayer(entry)) continue;
+
+            const layer = entry as FlatEntry & {
+              visible: boolean;
+              opacity: number;
+              blendMode: string;
+              isClippingMask?: boolean;
+            };
+
+            // Respect group visibility cascade
+            if (!effectiveVisibleFromStack(layer.visible, aboveScopeStack))
+              continue;
+
+            // Read the layer canvas directly — do NOT call getOrCreateLayerCanvas here
+            // because layer canvases are read-only during a stroke (strokeActiveRef invariant).
+            // If the canvas is missing, skip this layer but continue the loop.
+            const lc = layerCanvasesRef.current.get(layer.id);
+            if (!lc) continue;
+
+            // Cascade opacity through ancestor groups
+            const effOpacity = effectiveOpacityFromStack(
+              layer.opacity,
+              aboveScopeStack,
+            );
+
+            let layerSource: HTMLCanvasElement = lc;
+
+            // Handle clipping mask: mask layer pixels against its base layer
+            if (layer.isClippingMask) {
+              let baseLayer: (FlatEntry & { id: string }) | null = null;
+              for (let j = i + 1; j < ls2.length; j++) {
+                const candidate = ls2[j];
+                if (isFlatLayer(candidate)) {
+                  const candidateLayer = candidate as FlatEntry & {
+                    isClippingMask?: boolean;
+                  };
+                  if (!candidateLayer.isClippingMask) {
+                    baseLayer = candidate as FlatEntry & { id: string };
+                    break;
+                  }
+                }
+              }
+              if (baseLayer) {
+                const baseLc = layerCanvasesRef.current.get(baseLayer.id);
+                if (baseLc) {
+                  const abClipCtx = _aboveClipTmpCtxCached!;
+                  abClipCtx.clearRect(cx, cy, cw, ch);
+                  abClipCtx.globalCompositeOperation = "source-over";
+                  abClipCtx.drawImage(lc, cx, cy, cw, ch, cx, cy, cw, ch);
+                  abClipCtx.globalCompositeOperation = "destination-in";
+                  abClipCtx.drawImage(baseLc, cx, cy, cw, ch, cx, cy, cw, ch);
+                  abClipCtx.globalCompositeOperation = "source-over";
+                  layerSource = _aboveClipTmpCanvas;
+                }
+              }
+            }
+
+            displayCtx.globalAlpha = effOpacity;
+            displayCtx.globalCompositeOperation = (layer.blendMode ||
+              "source-over") as GlobalCompositeOperation;
+            displayCtx.drawImage(layerSource, cx, cy, cw, ch, cx, cy, cw, ch);
+            displayCtx.globalAlpha = 1;
+            displayCtx.globalCompositeOperation = "source-over";
+          }
         }
       }
     },
@@ -890,8 +1300,10 @@ export function useCompositing({
     const below = belowActiveCanvasRef.current;
     const above = aboveActiveCanvasRef.current;
     const snap = snapshotCanvasRef.current;
-    const activeLayerCanvas = layerCanvasesRef.current.get(activeLayerId);
-    if (!display || !below || !above || !snap || !activeLayerCanvas) return;
+    // FIX 2b: Use getOrCreateLayerCanvas so the active layer's canvas always
+    // exists and is correctly sized before a stroke begins.
+    const activeLayerCanvas = getOrCreateLayerCanvas(activeLayerId);
+    if (!display || !below || !above || !snap) return;
 
     const W = display.width;
     const H = display.height;
@@ -907,7 +1319,7 @@ export function useCompositing({
           ?.clearRect(0, 0, sbuf.width, sbuf.height);
     }
 
-    const ls = layersRef.current;
+    const ls = layersRef.current as unknown as FlatEntry[];
     const activeIdx = ls.findIndex((l) => l.id === activeLayerId);
 
     // --- Cache check: skip expensive below/above rebuild if nothing changed ---
@@ -943,21 +1355,79 @@ export function useCompositing({
     if (!cacheValid) {
       belowCtx.clearRect(0, 0, W, H);
       belowCtx.globalAlpha = 1;
+      // Build a group scope stack for cascaded opacity/visibility while
+      // iterating below layers (same bottom-to-top direction as composite()).
+      const belowScopeStack: GroupScope[] = [];
       for (let i = ls.length - 1; i > activeIdx; i--) {
-        const layer = ls[i];
-        if (!layer.visible) continue;
+        const entry = ls[i];
+
+        // end_group → push scope (entering a group's range going upward)
+        if (isFlatEndGroup(entry)) {
+          const groupId = entry.id;
+          let hOpacity = 1;
+          let hVisible = true;
+          let hBlendMode = "source-over";
+          for (let j = i - 1; j >= 0; j--) {
+            const candidate = ls[j];
+            if (isFlatGroupHeader(candidate) && candidate.id === groupId) {
+              hOpacity = candidate.opacity;
+              hVisible = candidate.visible;
+              hBlendMode =
+                (candidate as unknown as { blendMode?: string }).blendMode ??
+                "source-over";
+              break;
+            }
+          }
+          belowScopeStack.push({
+            id: groupId,
+            opacity: hOpacity,
+            visible: hVisible,
+            blendMode: hBlendMode,
+            hasOffscreen: false,
+            offscreenCanvas: null,
+            offscreenCtx: null,
+          });
+          continue;
+        }
+
+        // group header → pop scope (leaving a group's range going upward)
+        if (isFlatGroupHeader(entry)) {
+          belowScopeStack.pop();
+          continue;
+        }
+
+        // Regular layer — skip non-visible ones
+        if (!isFlatLayer(entry)) continue;
+        const layer = entry as FlatEntry & {
+          visible: boolean;
+          opacity: number;
+          blendMode: string;
+          isClippingMask?: boolean;
+        };
+        if (!effectiveVisibleFromStack(layer.visible, belowScopeStack))
+          continue;
         const lc = layerCanvasesRef.current.get(layer.id);
         if (!lc) continue;
-        belowCtx.globalAlpha = layer.opacity;
+        const effOpacity = effectiveOpacityFromStack(
+          layer.opacity,
+          belowScopeStack,
+        );
+        belowCtx.globalAlpha = effOpacity;
         belowCtx.globalCompositeOperation = (layer.blendMode ||
           "source-over") as GlobalCompositeOperation;
-        if (layer.isClippingMask && i < ls.length - 1) {
+        if (layer.isClippingMask) {
           // Find the base layer this clips to
-          let baseLayer: Layer | null = null;
+          let baseLayer: (FlatEntry & { id: string }) | null = null;
           for (let j = i + 1; j < ls.length; j++) {
-            if (!ls[j].isClippingMask) {
-              baseLayer = ls[j];
-              break;
+            const candidate = ls[j];
+            if (isFlatLayer(candidate)) {
+              const candidateLayer = candidate as FlatEntry & {
+                isClippingMask?: boolean;
+              };
+              if (!candidateLayer.isClippingMask) {
+                baseLayer = candidate as FlatEntry & { id: string };
+                break;
+              }
             }
           }
           if (baseLayer) {
@@ -1003,13 +1473,34 @@ export function useCompositing({
     if (!snapCtx) return;
     snapCtx.clearRect(0, 0, W, H);
     snapCtx.drawImage(activeLayerCanvas, 0, 0);
+
+    // Capture the active layer's opacity atomically at stroke start.
+    // compositeWithStrokePreview and flushStrokeBuffer both read from this ref
+    // so they always agree even if layer.opacity is mutated mid-stroke by a
+    // concurrent move/transform commit (Symptom 3 fix).
+    const activeLayerData = layersRef.current.find(
+      (l) => l.id === activeLayerId,
+    );
+    strokeActiveLayerOpacityRef.current =
+      (activeLayerData as Layer | undefined)?.opacity ?? 1;
   }, []);
 
   // ── flushStrokeBuffer ─────────────────────────────────────────────────────
   // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable (useRef)
   const flushStrokeBuffer = useCallback(
     (lc: HTMLCanvasElement, _opacity: number, tool: Tool) => {
-      const layerCtx = lc.getContext("2d", { willReadFrequently: !isIPad });
+      // FIX 2a: Validate/repair the active layer canvas before any pixel write.
+      // If lc is wrongly sized or has been replaced (e.g. after an undo), the
+      // authoritative canvas is the one returned by getOrCreateLayerCanvas().
+      const activeLayerId = activeLayerIdRef.current;
+      const validatedLc = getOrCreateLayerCanvas(activeLayerId);
+      // Use validatedLc unless the caller passed a different canvas (e.g. during
+      // tail RAF where _tailLc is explicitly set). Match by identity and fall
+      // back to validatedLc only when they agree on the same layer.
+      const effectiveLc = validatedLc.width > 0 ? validatedLc : lc;
+      const layerCtx = effectiveLc.getContext("2d", {
+        willReadFrequently: !isIPad,
+      });
       const snap = strokeStartSnapshotRef.current;
       const sbuf = strokeBufferRef.current;
       if (!layerCtx || !snap || !sbuf) return;
@@ -1021,11 +1512,11 @@ export function useCompositing({
       const _drx = _dr ? Math.max(0, Math.floor(_dr.minX) - _pad) : 0;
       const _dry = _dr ? Math.max(0, Math.floor(_dr.minY) - _pad) : 0;
       const _drx2 = _dr
-        ? Math.min(lc.width, Math.ceil(_dr.maxX) + _pad)
-        : lc.width;
+        ? Math.min(effectiveLc.width, Math.ceil(_dr.maxX) + _pad)
+        : effectiveLc.width;
       const _dry2 = _dr
-        ? Math.min(lc.height, Math.ceil(_dr.maxY) + _pad)
-        : lc.height;
+        ? Math.min(effectiveLc.height, Math.ceil(_dr.maxY) + _pad)
+        : effectiveLc.height;
       const _drw = _drx2 - _drx;
       const _drh = _dry2 - _dry;
       const _useDirtyRestore = _dr != null && _drw > 0 && _drh > 0;
@@ -1035,11 +1526,11 @@ export function useCompositing({
         // Clip stroke to selection: draw stroke into a temp canvas, mask with selection, then composite
         // Reuse pre-allocated canvas to avoid per-stroke-commit allocation
         if (
-          _tempStrokeCanvas.width !== lc.width ||
-          _tempStrokeCanvas.height !== lc.height
+          _tempStrokeCanvas.width !== effectiveLc.width ||
+          _tempStrokeCanvas.height !== effectiveLc.height
         ) {
-          _tempStrokeCanvas.width = lc.width;
-          _tempStrokeCanvas.height = lc.height;
+          _tempStrokeCanvas.width = effectiveLc.width;
+          _tempStrokeCanvas.height = effectiveLc.height;
           _tempStrokeCtxCached = null;
         }
         if (!_tempStrokeCtxCached)
@@ -1087,7 +1578,6 @@ export function useCompositing({
       } else {
         // Restore snapshot: 3-arg form places the cropped data at its origin (snap.x, snap.y)
         layerCtx.putImageData(snap.pixels, snap.x, snap.y);
-        // Apply opacity slider ceiling here via globalAlpha — flushDisplay outputs at 1.0.
         layerCtx.globalAlpha = _opacity;
         if (tool === "eraser" || brushBlendModeRef.current === "clear") {
           layerCtx.globalCompositeOperation = "destination-out";
@@ -1117,17 +1607,31 @@ export function useCompositing({
       }
       // Mark this layer's bitmap dirty — pixels have changed, GPU must re-upload next frame
       markLayerBitmapDirty(activeLayerIdRef.current);
+      // Clear the stroke-active guard — the commit write to the layer canvas is complete.
+      // From this point on, layer canvases are writable again (e.g. by getOrCreateLayerCanvas).
+      strokeActiveRef.current = false;
+      // Release the locked stroke opacity — stroke is complete.
+      strokeActiveLayerOpacityRef.current = null;
     },
     [],
   );
 
   // ── scheduleComposite ────────────────────────────────────────────────────
+  // Gated by getLiquifyStrokeActive(): while a liquify stroke is in progress,
+  // any trailing RAF from the previous stroke's pointer-move is suppressed here
+  // so pre-warp layer state is never drawn to the canvas at stroke start.
+  // This is the single authoritative gate (A4 fix — collapsed from three stacked fixes).
   const compositeScheduledRef = useRef(false);
   const scheduleComposite = useCallback(() => {
+    // Gate: skip if a liquify stroke is active so no pre-warp render can sneak through.
+    if (getLiquifyStrokeActive()) return;
     if (compositeScheduledRef.current) return;
     compositeScheduledRef.current = true;
     requestAnimationFrame(() => {
       compositeScheduledRef.current = false;
+      // Re-check inside the RAF — pointer-down may have set the flag while
+      // this frame was already pending.
+      if (getLiquifyStrokeActive()) return;
       composite();
     });
   }, [composite]);

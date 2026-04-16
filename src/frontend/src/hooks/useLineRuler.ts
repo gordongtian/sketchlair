@@ -486,11 +486,37 @@ export function useLineRuler({
         return false;
       }
 
+      // Fix 2: Clamp all non-VP handles to canvas bounds on pointer-up.
+      const W = canvasWidthRef.current;
+      const H = canvasHeightRef.current;
+      const clampX = (v: number | undefined) =>
+        v !== undefined ? Math.max(0, Math.min(W, v)) : v;
+      const clampY = (v: number | undefined) =>
+        v !== undefined ? Math.max(0, Math.min(H, v)) : v;
+
+      const x1 = clampX(layer.lineX1);
+      const y1 = clampY(layer.lineY1);
+      const x2 = clampX(layer.lineX2);
+      const y2 = clampY(layer.lineY2);
+
+      const needsClamp =
+        x1 !== layer.lineX1 ||
+        y1 !== layer.lineY1 ||
+        x2 !== layer.lineX2 ||
+        y2 !== layer.lineY2;
+
+      if (needsClamp) {
+        const patch = { lineX1: x1, lineY1: y1, lineX2: x2, lineY2: y2 };
+        const fn = (l: Layer) => (l.id === layer.id ? { ...l, ...patch } : l);
+        setLayers((prev) => prev.map(fn));
+        layersRef.current = layersRef.current.map(fn);
+      }
+
       const afterState: Record<string, unknown> = {
-        lineX1: layer.lineX1,
-        lineY1: layer.lineY1,
-        lineX2: layer.lineX2,
-        lineY2: layer.lineY2,
+        lineX1: needsClamp ? x1 : layer.lineX1,
+        lineY1: needsClamp ? y1 : layer.lineY1,
+        lineX2: needsClamp ? x2 : layer.lineX2,
+        lineY2: needsClamp ? y2 : layer.lineY2,
       };
 
       const preState = rulerLineDragPreStateRef.current;
@@ -513,7 +539,15 @@ export function useLineRuler({
       scheduleRulerOverlay();
       return true;
     },
-    [pushHistory, rulerEditHistoryDepthRef, scheduleRulerOverlay],
+    [
+      canvasWidthRef,
+      canvasHeightRef,
+      layersRef,
+      setLayers,
+      pushHistory,
+      rulerEditHistoryDepthRef,
+      scheduleRulerOverlay,
+    ],
   );
 
   // ── isLineRulerDragging ──────────────────────────────────────────────────

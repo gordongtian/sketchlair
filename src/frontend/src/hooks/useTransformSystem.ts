@@ -2,8 +2,7 @@ import { useCallback, useEffect, useRef } from "react";
 import type React from "react";
 import type { LassoMode, Tool } from "../components/Toolbar";
 import type { SelectionGeom } from "../selectionTypes";
-import type { LayerNode } from "../types";
-import { getEffectivelySelectedLayers } from "../utils/layerTree";
+import type { ViewTransform } from "../types";
 import { computeMaskBounds } from "../utils/selectionUtils";
 import { markCanvasDirty } from "./useCompositing";
 import type { UndoEntry } from "./useLayerSystem";
@@ -29,10 +28,14 @@ interface UseTransformSystemParams {
   // Refs passed directly from PaintingApp (cannot use context — hook is called before provider)
   layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   activeLayerIdRef: React.MutableRefObject<string>;
-  /** Ref to the full layer tree — used to resolve multi-select groups to their leaf layers */
-  layerTreeRef?: React.MutableRefObject<LayerNode[]>;
   /** Ref to the selected layer ids set — used for multi-layer transform */
   selectedLayerIdsRef?: React.MutableRefObject<Set<string>>;
+  /** Ref to the flat layers array — used to expand group selections to leaf layers */
+  layersRef?: React.MutableRefObject<
+    import("../components/LayersPanel").Layer[]
+  >;
+  /** Ref to view transform — used to scale hit-test radius with zoom */
+  viewTransformRef?: React.MutableRefObject<ViewTransform>;
   undoStackRef: React.MutableRefObject<UndoEntry[]>;
   redoStackRef: React.MutableRefObject<UndoEntry[]>;
   selectionActiveRef: React.MutableRefObject<boolean>;
@@ -50,6 +53,9 @@ interface UseTransformSystemParams {
   rebuildChainsNowRef: React.MutableRefObject<
     (mask: HTMLCanvasElement) => void
   >;
+  /** Stroke canvas cache key — incremented after commit so the next stroke
+   *  rebuilds its below/above canvases instead of reusing the pre-move snapshot. */
+  strokeCanvasCacheKeyRef?: React.MutableRefObject<number>;
   /** Called after multi-layer commit to invalidate stale ImageBitmap caches */
   markLayerBitmapDirtyRef?: React.MutableRefObject<(id: string) => void>;
   /** Set populated before any layer canvas pixels are cleared during extractFloat.
@@ -71,7 +77,8 @@ export function useTransformSystem({
   setRedoCount,
   layerCanvasesRef,
   activeLayerIdRef,
-  layerTreeRef,
+  layersRef,
+  viewTransformRef,
   selectedLayerIdsRef,
   undoStackRef,
   redoStackRef,
@@ -84,6 +91,7 @@ export function useTransformSystem({
   rebuildChainsNowRef,
   markLayerBitmapDirtyRef,
   layersBeingExtractedRef,
+  strokeCanvasCacheKeyRef,
 }: UseTransformSystemParams) {
   // ---- Transform refs ----
   const moveFloatCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -101,6 +109,9 @@ export function useTransformSystem({
     fy: number;
     origBounds?: { x: number; y: number; w: number; h: number };
     initRotation?: number;
+    /** For scale handle drags: the canvas-space pivot point (opposite handle's position at drag start) */
+    pivotX?: number;
+    pivotY?: number;
   } | null>(null);
   const xfStateRef = useRef<{
     x: number;
@@ -165,38 +176,21 @@ export function useTransformSystem({
 
   /**
    * Resolve selectedLayerIds to a flat list of paintable layer IDs with their canvases.
-   * Uses the live layerCanvasesRef as the authoritative source — never relies solely on
-   * layerTreeRef which can be one render cycle stale.
+   *
+   * Uses the flat layers array (layersRef) to expand group selections to their
+   * constituent paintable layers. Falls back to direct canvas lookup for any IDs
+   * not resolved through group expansion.
    *
    * Returns layers in BOTTOM-TO-TOP visual order (index 0 = bottommost in the layer panel,
-   * last entry = topmost). This matches the compositing order used by flattenTree().
+   * last entry = topmost). This matches the compositing order used by the flat array.
    */
   function _resolveSelectedLayers(): Array<{
     id: string;
     lc: HTMLCanvasElement;
     ctx: CanvasRenderingContext2D;
   }> {
-    const tree = layerTreeRef?.current ?? [];
     const selectedIds = selectedLayerIdsRef?.current ?? new Set<string>();
-
-    // Determine whether any selected IDs are group nodes (not in layerCanvasesRef)
-    const hasGroupInSelection = [...selectedIds].some(
-      (id) => !layerCanvasesRef.current.has(id),
-    );
-
-    let effectivelySelected: ReturnType<typeof getEffectivelySelectedLayers>;
-    if (hasGroupInSelection) {
-      effectivelySelected = getEffectivelySelectedLayers(tree, selectedIds);
-    } else {
-      // All selected IDs are paintable layers — bypass stale tree ref
-      effectivelySelected = [...selectedIds]
-        .filter((id) => layerCanvasesRef.current.has(id))
-        .map((id) => ({
-          kind: "layer" as const,
-          id,
-          layer: { id } as import("../components/LayersPanel").Layer,
-        }));
-    }
+    const flatLayers = layersRef?.current ?? [];
 
     const resolvedLayers: Array<{
       id: string;
@@ -205,35 +199,84 @@ export function useTransformSystem({
     }> = [];
     const resolvedSet = new Set<string>();
 
-    for (const layerItem of effectivelySelected) {
-      const lid = layerItem.id;
-      const lc = layerCanvasesRef.current.get(lid);
-      if (!lc) continue;
-      const ctx = lc.getContext("2d", { willReadFrequently: true });
-      if (!ctx) continue;
-      if (!resolvedSet.has(lid)) {
-        resolvedSet.add(lid);
-        resolvedLayers.push({ id: lid, lc, ctx });
+    // Determine whether any selected IDs are group headers (not in layerCanvasesRef)
+    const hasGroupInSelection = [...selectedIds].some(
+      (id) => !layerCanvasesRef.current.has(id),
+    );
+
+    if (hasGroupInSelection && flatLayers.length > 0) {
+      // Expand group selections using the flat array: for each group header ID in
+      // selectedIds, collect all paintable layers that fall between the group header
+      // and its matching end_group marker.
+      for (const entry of flatLayers) {
+        const entryId = (entry as { id?: string }).id ?? "";
+        if (!entryId) continue;
+        // Only add paintable layers (not group headers or end_group markers)
+        const entryType = (entry as { type?: string }).type;
+        if (entryType === "group" || entryType === "end_group") continue;
+
+        // Check if this layer belongs to a selected group or is directly selected
+        const isDirectlySelected = selectedIds.has(entryId);
+        const isInSelectedGroup = (() => {
+          // Walk backwards through flatLayers to find the nearest enclosing group header
+          const idx = flatLayers.indexOf(entry);
+          let skipDepth = 0;
+          for (let i = idx - 1; i >= 0; i--) {
+            const e = flatLayers[i] as { type?: string; id?: string };
+            if (e.type === "end_group") {
+              skipDepth++;
+            } else if (e.type === "group") {
+              if (skipDepth > 0) {
+                skipDepth--;
+              } else {
+                // This is the nearest enclosing group
+                return selectedIds.has(e.id ?? "");
+              }
+            }
+          }
+          return false;
+        })();
+
+        if (isDirectlySelected || isInSelectedGroup) {
+          const lc = layerCanvasesRef.current.get(entryId);
+          if (!lc) continue;
+          const ctx = lc.getContext("2d", { willReadFrequently: true });
+          if (!ctx) continue;
+          // Ruler layer guard — silently exclude ruler layers from transform
+          if ((entry as { isRuler?: boolean }).isRuler) continue;
+          if (!resolvedSet.has(entryId)) {
+            resolvedSet.add(entryId);
+            resolvedLayers.push({ id: entryId, lc, ctx });
+          }
+        }
       }
     }
 
     // Unconditionally cross-check every directly-selected paintable ID — ensures
-    // no layer is silently dropped due to a stale tree or partial expansion.
+    // no layer is silently dropped due to a stale layers ref or partial expansion.
     for (const id of selectedIds) {
       if (resolvedSet.has(id)) continue;
       const lc = layerCanvasesRef.current.get(id);
       if (!lc) continue;
       const ctx = lc.getContext("2d", { willReadFrequently: true });
       if (!ctx) continue;
+      // Ruler layer guard — silently exclude ruler layers from transform
+      const layerEntry = flatLayers.find(
+        (l) => (l as { id?: string }).id === id,
+      );
+      if ((layerEntry as { isRuler?: boolean } | undefined)?.isRuler) continue;
       resolvedSet.add(id);
       resolvedLayers.push({ id, lc, ctx });
     }
 
     // Final safety net: force-add any directly-selected paintable ID still missing
     {
-      const expectedCount = [...selectedIds].filter((id) =>
-        layerCanvasesRef.current.has(id),
-      ).length;
+      const expectedCount = [...selectedIds].filter((id) => {
+        if (!layerCanvasesRef.current.has(id)) return false;
+        // Exclude ruler layers from the expected count
+        const entry = flatLayers.find((l) => (l as { id?: string }).id === id);
+        return !(entry as { isRuler?: boolean } | undefined)?.isRuler;
+      }).length;
       if (resolvedLayers.length < expectedCount) {
         for (const id of selectedIds) {
           if (resolvedSet.has(id)) continue;
@@ -241,6 +284,11 @@ export function useTransformSystem({
           if (!lc) continue;
           const ctx = lc.getContext("2d", { willReadFrequently: true });
           if (!ctx) continue;
+          // Ruler layer guard
+          const entry2 = flatLayers.find(
+            (l) => (l as { id?: string }).id === id,
+          );
+          if ((entry2 as { isRuler?: boolean } | undefined)?.isRuler) continue;
           resolvedSet.add(id);
           resolvedLayers.push({ id, lc, ctx });
         }
@@ -493,7 +541,7 @@ export function useTransformSystem({
       canvasHeightRef,
       activeLayerIdRef,
       layerCanvasesRef,
-      layerTreeRef,
+      layersRef,
       selectedLayerIdsRef,
       selectionActiveRef,
       selectionMaskRef,
@@ -518,6 +566,13 @@ export function useTransformSystem({
     if (!lc) return;
     const ctx = lc.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
+
+    // Ruler layer guard — silently abort; the transform has no effect on ruler layers
+    const activeLayerEntry = layersRef?.current.find(
+      (l) => (l as { id?: string }).id === layerId,
+    );
+    if ((activeLayerEntry as { isRuler?: boolean } | undefined)?.isRuler)
+      return;
 
     const currentW = canvasWidthRef?.current ?? canvasWidth;
     const currentH = canvasHeightRef?.current ?? canvasHeight;
@@ -673,6 +728,14 @@ export function useTransformSystem({
           // Write this layer's float canvas back to its own source canvas.
           // Since the float contains ONLY this layer's pixels, no masking is needed —
           // simply apply the same transform that was applied during preview.
+          //
+          // LASSO COMMIT FIX: Explicitly reset composite operation and alpha before
+          // every write-back. The layer canvas context is persistent and may retain
+          // "destination-out" or "destination-in" from the extraction-phase clearing
+          // step (which uses save/restore, but the base state could be dirty from a
+          // prior operation). Without this reset, drawImage would erase instead of draw.
+          ctx.globalCompositeOperation = "source-over";
+          ctx.globalAlpha = 1;
           if (xfCommit && obCommit) {
             const cx = xfCommit.x + xfCommit.w / 2;
             const cy = xfCommit.y + xfCommit.h / 2;
@@ -702,6 +765,10 @@ export function useTransformSystem({
             // Identity transform — write float back at its original position
             ctx.drawImage(floatCanvas, 0, 0);
           }
+          // Ensure context is clean after the write-back — leave no composite state
+          // that could affect subsequent operations (e.g. thumbnail generation).
+          ctx.globalCompositeOperation = "source-over";
+          ctx.globalAlpha = 1;
 
           // Capture after-state for history
           const after = ctx.getImageData(0, 0, lc.width, lc.height);
@@ -726,7 +793,12 @@ export function useTransformSystem({
           layerCanvasesRef.current.get(activeLayerIdRef.current) ?? null,
         );
 
+        // Clear stale transform state BEFORE composite so no RAF or async path
+        // can read the old pre-move bounds from xfStateRef (Symptom 2 fix).
         _cleanupTransformState();
+        // Invalidate stroke canvas cache so the next stroke rebuilds its
+        // below/above canvases instead of reusing the pre-move snapshot (Fix 4).
+        if (strokeCanvasCacheKeyRef) strokeCanvasCacheKeyRef.current++;
         compositeRef.current();
         markCanvasDirty();
         return;
@@ -750,6 +822,13 @@ export function useTransformSystem({
         transformPreCommitSnapshotRef.current ??
         ctx.getImageData(0, 0, lc.width, lc.height);
 
+      // LASSO COMMIT FIX: Explicitly reset composite operation and alpha before
+      // the write-back. The layer canvas context is persistent and may retain
+      // "destination-out" or "destination-in" from the extraction-phase clearing
+      // step (which uses save/restore, but the base state could be dirty from a
+      // prior operation). Without this reset, drawImage would erase instead of draw.
+      ctx.globalCompositeOperation = "source-over";
+      ctx.globalAlpha = 1;
       if (xfCommit && obCommit) {
         const cx = xfCommit.x + xfCommit.w / 2;
         const cy = xfCommit.y + xfCommit.h / 2;
@@ -773,12 +852,21 @@ export function useTransformSystem({
       } else {
         ctx.drawImage(fc, 0, 0);
       }
+      // Ensure context is clean after the write-back — leave no composite state
+      // that could affect subsequent operations (e.g. thumbnail generation).
+      ctx.globalCompositeOperation = "source-over";
+      ctx.globalAlpha = 1;
       const after = ctx.getImageData(0, 0, lc.width, lc.height);
       pushHistory({ type: "pixels", layerId, before, after });
       markLayerBitmapDirtyRef?.current(layerId);
 
       _updateSelectionAfterCommit(xfCommit, obCommit, opts, lc);
+      // Clear stale transform state BEFORE composite so no RAF or async path
+      // can read the old pre-move bounds from xfStateRef (Symptom 2 fix).
       _cleanupTransformState();
+      // Invalidate stroke canvas cache so the next stroke rebuilds its
+      // below/above canvases instead of reusing the pre-move snapshot (Fix 4).
+      if (strokeCanvasCacheKeyRef) strokeCanvasCacheKeyRef.current++;
       compositeRef.current();
       markCanvasDirty();
     },
@@ -1087,7 +1175,11 @@ export function useTransformSystem({
         testX = cx + dx * cos - dy * sin;
         testY = cy + dx * sin + dy * cos;
       }
-      const R = 8;
+      // Scale hit radius inversely with zoom so handles stay grabbable when zoomed out.
+      // At zoom >= 1 the radius is the baseline 8 canvas-px.
+      // At zoom < 1 (zoomed out) the radius grows so the screen-pixel hit area stays constant.
+      const zoom = viewTransformRef?.current?.zoom ?? 1;
+      const R = Math.max(8, 8 / zoom);
       for (const [key, pt] of Object.entries(handles)) {
         if (key === "bounds") continue;
         const dx = testX - (pt as { x: number; y: number }).x;
@@ -1098,8 +1190,8 @@ export function useTransformSystem({
       const { x, y, w, h } = handles.bounds;
       if (testX >= x && testX <= x + w && testY >= y && testY <= y + h)
         return "move";
-      // Outside-bbox: check if within 30px of any edge = rotation
-      const ROT_ZONE = 30;
+      // Outside-bbox: check if within ROT_ZONE of any edge = rotation
+      const ROT_ZONE = Math.max(30, 30 / zoom);
       if (
         testX >= x - ROT_ZONE &&
         testX <= x + w + ROT_ZONE &&
@@ -1110,7 +1202,7 @@ export function useTransformSystem({
       }
       return null;
     },
-    [getTransformHandles],
+    [getTransformHandles, viewTransformRef],
   );
 
   // Wire functions into actions ref

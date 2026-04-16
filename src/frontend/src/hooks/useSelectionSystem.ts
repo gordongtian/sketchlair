@@ -4,6 +4,7 @@ import type { Layer } from "../components/LayersPanel";
 import type { LassoMode, Tool } from "../components/Toolbar";
 import type { SelectionGeom, SelectionSnapshot } from "../selectionTypes";
 import { computeMaskBounds } from "../utils/selectionUtils";
+import { markCanvasDirty } from "./useCompositing";
 
 const CANVAS_WIDTH_DEFAULT = 2560;
 const CANVAS_HEIGHT_DEFAULT = 1440;
@@ -33,6 +34,12 @@ interface UseSelectionSystemParams {
   rebuildChainsNowRef: React.MutableRefObject<
     (mask: HTMLCanvasElement) => void
   >;
+  /** Stable ref to setLayerTree — used to synchronize the tree after cut/copy-to-layer
+   *  inserts a new layer into the flat array. Without this the tree is stale and the new
+   *  layer cannot be found during a subsequent move operation (causes ghost layers). */
+  setLayerTreeRef?: React.MutableRefObject<
+    React.Dispatch<React.SetStateAction<import("../types").LayerNode[]>>
+  >;
 }
 
 export function useSelectionSystem({
@@ -53,6 +60,7 @@ export function useSelectionSystem({
   compositeRef,
   markLayerBitmapDirty,
   rebuildChainsNowRef,
+  setLayerTreeRef,
 }: UseSelectionSystemParams) {
   // ---- Selection state & refs ----
   const [selectionActive, setSelectionActive] = useState(false);
@@ -360,6 +368,7 @@ export function useSelectionSystem({
     selectionActionsRef.current.deleteSelection = deleteSelection;
   }, [deleteSelection]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: setLayerTreeRef is a stable ref
   const cutOrCopyToLayer = useCallback(
     (cut: boolean) => {
       const layerId = activeLayerIdRef.current;
@@ -389,6 +398,23 @@ export function useSelectionSystem({
         const pixels = dupCtx.getImageData(0, 0, canvasWidth, canvasHeight);
         pendingLayerPixelsRef.current.set(dupLayerData.id, pixels);
         setLayers(newLayers);
+        // Synchronize layerTree so the new layer is immediately visible to the
+        // move/transform system — without this the tree is stale and the layer
+        // appears as an undeletable ghost after a subsequent move.
+        setLayerTreeRef?.current((prev) => {
+          const newNode = {
+            kind: "layer" as const,
+            id: dupLayerData.id,
+            layer: dupLayerData as unknown as import("../types").Layer,
+          };
+          const treeIdx = prev.findIndex(
+            (n) => n.kind === "layer" && n.layer.id === layerId,
+          );
+          const ii = treeIdx >= 0 ? treeIdx : 0;
+          const next = [...prev];
+          next.splice(ii, 0, newNode);
+          return next;
+        });
         setActiveLayerId(dupLayerData.id);
 
         pushHistory({
@@ -434,7 +460,15 @@ export function useSelectionSystem({
         srcCtx.drawImage(selectionMaskRef.current!, 0, 0);
         srcCtx.restore();
         srcAfter = srcCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+        // Invalidate the source layer's bitmap cache AFTER the pixel write so that
+        // composite() and thumbnail generation both see the post-cut canvas content,
+        // not the stale cached ImageBitmap from before the cut.
         markLayerBitmapDirty?.(layerId!);
+        // Schedule a thumbnail refresh for the source layer so its panel thumb
+        // reflects the cut region being cleared. markCanvasDirty is debounced 80 ms —
+        // it fires after the useHistory useEffect has called composite(), so the thumb
+        // is generated from correct data.
+        markCanvasDirty(layerId!);
       }
 
       // Insert new layer above active (sync ref before composite)
@@ -445,6 +479,23 @@ export function useSelectionSystem({
       layersRef.current = newLayers;
       pendingLayerPixelsRef.current.set(newLayerData.id, newLayerPixels);
       setLayers(newLayers);
+      // Synchronize layerTree so the new layer is immediately visible to the
+      // move/transform system — without this the tree is stale and the layer
+      // appears as an undeletable ghost after a subsequent move.
+      setLayerTreeRef?.current((prev) => {
+        const newNode = {
+          kind: "layer" as const,
+          id: newLayerData.id,
+          layer: newLayerData as unknown as import("../types").Layer,
+        };
+        const treeIdx = prev.findIndex(
+          (n) => n.kind === "layer" && n.layer.id === layerId,
+        );
+        const ii = treeIdx >= 0 ? treeIdx : 0;
+        const next = [...prev];
+        next.splice(ii, 0, newNode);
+        return next;
+      });
       setActiveLayerId(newLayerData.id);
 
       // Push single atomic history entry
@@ -455,6 +506,13 @@ export function useSelectionSystem({
         pixels: newLayerPixels,
         ...(cut ? { srcLayerId: layerId, srcBefore, srcAfter } : {}),
       });
+
+      // Defer composite by one macrotask so React has time to flush
+      // setLayers/setLayerTree before composite() runs — replicates the
+      // exact pattern used by handleSetOpacity and handleToggleVisible.
+      // A synchronous call fires before React state is applied, causing
+      // the new layer to be absent from the layer list during composite.
+      setTimeout(() => compositeRef.current(), 0);
     },
     [
       activeLayerIdRef,
@@ -468,6 +526,7 @@ export function useSelectionSystem({
       canvasHeight,
       newLayerFn,
       markLayerBitmapDirty,
+      compositeRef,
     ],
   );
 

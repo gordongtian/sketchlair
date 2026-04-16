@@ -1,4 +1,9 @@
-// TODO: Wire into PaintingApp.tsx in the next step (step 4 of 4 ruler extraction).
+// ============================================================
+// RESERVED FOR FUTURE USE
+// This ruler hook is not yet wired into PaintingApp event handlers.
+// It is intentionally preserved for the upcoming perspective/ellipse
+// ruler feature implementation. Do not delete.
+// ============================================================
 
 /**
  * use3pt5ptPerspectiveRuler — 3-point and 5-point perspective ruler sub-system hook
@@ -1600,7 +1605,9 @@ export function use3pt5ptPerspectiveRuler({
   /**
    * Handles the 3pt-exclusive D and E drag handles.
    * VP1/VP2/center/rotation/A/B/C are handled by the existing 2pt pointer-move
-   * logic inside PaintingApp (they share the same drag refs).
+   * logic inside PaintingApp (they share the same drag refs).  This function only
+   * handles the 3pt-exclusive D and E drag refs.
+   * D and E are non-VP handles — their positions are clamped to canvas bounds.
    */
   const handle3ptExclusivePointerMove = useCallback(
     (pos: Point, layer: Layer): boolean => {
@@ -1608,6 +1615,12 @@ export function use3pt5ptPerspectiveRuler({
         return false;
       }
       const upd = makeUpdater(layer.id);
+
+      // Clamp a point to canvas bounds (used for all non-VP handles)
+      const cW = canvasWidthRef.current;
+      const cH = canvasHeightRef.current;
+      const clampX = (x: number) => Math.max(0, Math.min(cW, x));
+      const clampY = (y: number) => Math.max(0, Math.min(cH, y));
 
       if (rulerGridDDragRef.current) {
         // D handle: VP3 = lineIntersect(A, D_new, P.x); constrain D.x <= P.x
@@ -1619,8 +1632,9 @@ export function use3pt5ptPerspectiveRuler({
         const bYd = layer.rulerGridBY ?? pcYd + 120;
         const aXd = vp1Xd + 0.5 * (bXd - vp1Xd);
         const aYd = vp1Yd + 0.5 * (bYd - vp1Yd);
-        const newDx = Math.min(pos.x, pcXd - 1);
-        const newDy = pos.y;
+        // Clamp to canvas then also enforce D.x <= P.x - 1
+        const newDx = Math.min(clampX(pos.x), pcXd - 1);
+        const newDy = clampY(pos.y);
         const dxDd = newDx - aXd;
         const dyDd = newDy - aYd;
         let newVP3Yd = pcYd - 200;
@@ -1650,8 +1664,9 @@ export function use3pt5ptPerspectiveRuler({
       const aYe = vp1Ye + 0.5 * (bYe - vp1Ye);
       const cXe = vp2Xe + 0.5 * (bXe - vp2Xe);
       const cYe = vp2Ye + 0.5 * (bYe - vp2Ye);
-      const newEx = Math.max(pos.x, pcXe + 1);
-      const newEy = pos.y;
+      // Clamp to canvas then also enforce E.x >= P.x + 1
+      const newEx = Math.max(clampX(pos.x), pcXe + 1);
+      const newEy = clampY(pos.y);
       const dxEe = newEx - cXe;
       const dyEe = newEy - cYe;
       let newVP3Ye = pcYe - 200;
@@ -1691,7 +1706,7 @@ export function use3pt5ptPerspectiveRuler({
       scheduleRulerOverlay();
       return true;
     },
-    [makeUpdater, scheduleRulerOverlay],
+    [makeUpdater, scheduleRulerOverlay, canvasWidthRef, canvasHeightRef],
   );
 
   // ── handle5ptRulerPointerMove ─────────────────────────────────────────────
@@ -1710,11 +1725,18 @@ export function use3pt5ptPerspectiveRuler({
 
       const upd = makeUpdater(layer.id);
 
+      // All 5pt handles are non-VP — clamp to canvas bounds
+      const cW = canvasWidthRef.current;
+      const cH = canvasHeightRef.current;
+      const cx = Math.max(0, Math.min(cW, pos.x));
+      const cy = Math.max(0, Math.min(cH, pos.y));
+      const clampedPos: Point = { x: cx, y: cy };
+
       if (ruler5ptCenterDragRef.current) {
         const off5c = ruler5ptCenterOffsetRef.current;
         upd({
-          fivePtCenterX: pos.x - off5c.dx,
-          fivePtCenterY: pos.y - off5c.dy,
+          fivePtCenterX: Math.max(0, Math.min(cW, clampedPos.x - off5c.dx)),
+          fivePtCenterY: Math.max(0, Math.min(cH, clampedPos.y - off5c.dy)),
         });
         scheduleRulerOverlay();
         return true;
@@ -1728,7 +1750,7 @@ export function use3pt5ptPerspectiveRuler({
         const downDY5 = Math.cos(rot5m);
         const aDistNew5 = Math.max(
           10,
-          (pos.x - cx5m) * downDX5 + (pos.y - cy5m) * downDY5,
+          (clampedPos.x - cx5m) * downDX5 + (clampedPos.y - cy5m) * downDY5,
         );
         upd({ fivePtHandleADist: aDistNew5 });
         scheduleRulerOverlay();
@@ -1742,8 +1764,8 @@ export function use3pt5ptPerspectiveRuler({
         const bDistNew5 = Math.max(
           10,
           -(
-            (pos.x - cx5m) * Math.cos(rot5m) +
-            (pos.y - cy5m) * Math.sin(rot5m)
+            (clampedPos.x - cx5m) * Math.cos(rot5m) +
+            (clampedPos.y - cy5m) * Math.sin(rot5m)
           ),
         );
         upd({ fivePtHandleBDist: bDistNew5 });
@@ -1756,9 +1778,11 @@ export function use3pt5ptPerspectiveRuler({
         const cy5m = layer.fivePtCenterY ?? 0;
         const rot5m = layer.fivePtRotation ?? 0;
         const localX5c =
-          Math.cos(rot5m) * (pos.x - cx5m) + Math.sin(rot5m) * (pos.y - cy5m);
+          Math.cos(rot5m) * (clampedPos.x - cx5m) +
+          Math.sin(rot5m) * (clampedPos.y - cy5m);
         const localY5c =
-          -Math.sin(rot5m) * (pos.x - cx5m) + Math.cos(rot5m) * (pos.y - cy5m);
+          -Math.sin(rot5m) * (clampedPos.x - cx5m) +
+          Math.cos(rot5m) * (clampedPos.y - cy5m);
         const aNew5c = Math.max(10, -localY5c);
         const bNew5c = Math.max(10, localX5c);
         upd({ fivePtHandleADist: aNew5c, fivePtHandleBDist: bNew5c });
@@ -1772,7 +1796,9 @@ export function use3pt5ptPerspectiveRuler({
         const aD5m = layer.fivePtHandleADist ?? 40;
         const bD5m = layer.fivePtHandleBDist ?? 40;
         const rot5m = layer.fivePtRotation ?? 0;
-        const newDist5c = Math.sqrt((pos.x - cx5m) ** 2 + (pos.y - cy5m) ** 2);
+        const newDist5c = Math.sqrt(
+          (clampedPos.x - cx5m) ** 2 + (clampedPos.y - cy5m) ** 2,
+        );
         const initDist5c = ruler5ptCInitDistRef.current;
         const scale5c = newDist5c / initDist5c;
         upd({
@@ -1787,7 +1813,7 @@ export function use3pt5ptPerspectiveRuler({
       if (ruler5ptHandleDDragRef.current) {
         const cx5m = layer.fivePtCenterX ?? 0;
         const cy5m = layer.fivePtCenterY ?? 0;
-        const newRot5 = Math.atan2(pos.y - cy5m, pos.x - cx5m);
+        const newRot5 = Math.atan2(clampedPos.y - cy5m, clampedPos.x - cx5m);
         upd({ fivePtRotation: newRot5 });
         scheduleRulerOverlay();
         return true;
@@ -1795,7 +1821,7 @@ export function use3pt5ptPerspectiveRuler({
 
       return false;
     },
-    [makeUpdater, scheduleRulerOverlay],
+    [makeUpdater, scheduleRulerOverlay, canvasWidthRef, canvasHeightRef],
   );
 
   // ── handle3pt5ptRulerPointerUp ────────────────────────────────────────────
@@ -1813,33 +1839,75 @@ export function use3pt5ptPerspectiveRuler({
 
       if (!any3ptExclusive && !any5pt) return false;
 
+      // Fix 2: Clamp non-VP position handles to canvas bounds on pointer-up.
+      const W = canvasWidthRef.current;
+      const H = canvasHeightRef.current;
+      const cx = (v: number | undefined) =>
+        v !== undefined ? Math.max(0, Math.min(W, v)) : v;
+      const cy = (v: number | undefined) =>
+        v !== undefined ? Math.max(0, Math.min(H, v)) : v;
+
       let afterState: Record<string, unknown>;
       let preState: Record<string, unknown> | null = null;
 
       if (any3ptExclusive) {
+        // rulerHandleDX/DY are non-VP position handles — clamp them.
+        const clampedDX = cx(layer.rulerHandleDX);
+        const clampedDY = cy(layer.rulerHandleDY);
+        const needsClamp3pt =
+          clampedDX !== layer.rulerHandleDX ||
+          clampedDY !== layer.rulerHandleDY;
+        if (needsClamp3pt) {
+          const patch3pt: Partial<Layer> = {};
+          if (clampedDX !== undefined) patch3pt.rulerHandleDX = clampedDX;
+          if (clampedDY !== undefined) patch3pt.rulerHandleDY = clampedDY;
+          const fn3pt = (l: Layer) =>
+            l.id === layer.id ? { ...l, ...patch3pt } : l;
+          setLayers((prev) => prev.map(fn3pt));
+          layersRef.current = layersRef.current.map(fn3pt);
+        }
+        const refreshed3pt =
+          layersRef.current.find((l) => l.id === layer.id) ?? layer;
         afterState = {
-          horizonCenterX: layer.horizonCenterX,
-          horizonCenterY: layer.horizonCenterY,
-          horizonAngle: layer.horizonAngle ?? 0,
-          vp1X: layer.vp1X,
-          vp1Y: layer.vp1Y,
-          vp2X: layer.vp2X,
-          vp2Y: layer.vp2Y,
-          rulerGridBX: layer.rulerGridBX,
-          rulerGridBY: layer.rulerGridBY,
-          rulerVP3Y: layer.rulerVP3Y,
-          rulerHandleDX: layer.rulerHandleDX,
-          rulerHandleDY: layer.rulerHandleDY,
+          horizonCenterX: refreshed3pt.horizonCenterX,
+          horizonCenterY: refreshed3pt.horizonCenterY,
+          horizonAngle: refreshed3pt.horizonAngle ?? 0,
+          vp1X: refreshed3pt.vp1X,
+          vp1Y: refreshed3pt.vp1Y,
+          vp2X: refreshed3pt.vp2X,
+          vp2Y: refreshed3pt.vp2Y,
+          rulerGridBX: refreshed3pt.rulerGridBX,
+          rulerGridBY: refreshed3pt.rulerGridBY,
+          rulerVP3Y: refreshed3pt.rulerVP3Y,
+          rulerHandleDX: refreshed3pt.rulerHandleDX,
+          rulerHandleDY: refreshed3pt.rulerHandleDY,
         };
         preState =
           shared2ptDragRefs.ruler2ptDragPreStateRef.current ?? preState;
       } else {
+        // 5pt: fivePtCenterX/Y is a position handle — clamp it.
+        const clampedCX5 = cx(layer.fivePtCenterX);
+        const clampedCY5 = cy(layer.fivePtCenterY);
+        const needsClamp5pt =
+          clampedCX5 !== layer.fivePtCenterX ||
+          clampedCY5 !== layer.fivePtCenterY;
+        if (needsClamp5pt) {
+          const patch5pt: Partial<Layer> = {};
+          if (clampedCX5 !== undefined) patch5pt.fivePtCenterX = clampedCX5;
+          if (clampedCY5 !== undefined) patch5pt.fivePtCenterY = clampedCY5;
+          const fn5pt = (l: Layer) =>
+            l.id === layer.id ? { ...l, ...patch5pt } : l;
+          setLayers((prev) => prev.map(fn5pt));
+          layersRef.current = layersRef.current.map(fn5pt);
+        }
+        const refreshed5pt =
+          layersRef.current.find((l) => l.id === layer.id) ?? layer;
         afterState = {
-          fivePtCenterX: layer.fivePtCenterX,
-          fivePtCenterY: layer.fivePtCenterY,
-          fivePtHandleADist: layer.fivePtHandleADist,
-          fivePtHandleBDist: layer.fivePtHandleBDist,
-          fivePtRotation: layer.fivePtRotation,
+          fivePtCenterX: refreshed5pt.fivePtCenterX,
+          fivePtCenterY: refreshed5pt.fivePtCenterY,
+          fivePtHandleADist: refreshed5pt.fivePtHandleADist,
+          fivePtHandleBDist: refreshed5pt.fivePtHandleBDist,
+          fivePtRotation: refreshed5pt.fivePtRotation,
         };
         preState =
           Object.keys(ruler5ptPreStateRef.current).length > 0
@@ -1874,6 +1942,10 @@ export function use3pt5ptPerspectiveRuler({
       return true;
     },
     [
+      canvasWidthRef,
+      canvasHeightRef,
+      layersRef,
+      setLayers,
       pushHistory,
       rulerEditHistoryDepthRef,
       scheduleRulerOverlay,

@@ -46,6 +46,7 @@ actor {
   type SettingsSave = Text;
   let canvasSaveMap = Map.empty<Principal, CanvasSave>();
   let settingsMap = Map.empty<Principal, SettingsSave>();
+  let brushPresetsMap = Map.empty<Principal, Text>();
 
   // Canvas hash functions - require authenticated user
   public shared ({ caller }) func saveCanvasHash(canvasHash : CanvasSave) : async () {
@@ -75,6 +76,21 @@ actor {
       Runtime.trap("Unauthorized: Only users can retrieve settings");
     };
     settingsMap.get(caller);
+  };
+
+  // Brush presets storage — dedicated map for potentially large base64 tip image payloads
+  public shared ({ caller }) func saveBrushPresets(data : Text) : async () {
+    if (not (AccessControl.hasPermission(accessControlState, caller, #user))) {
+      Runtime.trap("Unauthorized: Only users can save brush presets");
+    };
+    brushPresetsMap.add(caller, data);
+  };
+
+  public query ({ caller }) func getBrushPresets() : async ?Text {
+    if (not (AccessControl.hasPermission(accessControlState, caller, #user))) {
+      Runtime.trap("Unauthorized: Only users can retrieve brush presets");
+    };
+    brushPresetsMap.get(caller);
   };
 
   // INSTANT COMPONENT BLOB STORAGE

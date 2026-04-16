@@ -102,6 +102,12 @@ export interface CanvasAreaProps {
   onBrushOpacityChange: (v: number) => void;
   onBrushFlowChange: (v: number) => void;
 
+  // Liquify slider props — passed through to MobileCanvasSliders when activeTool === 'liquify'
+  liquifySize?: number;
+  liquifyStrength?: number;
+  onLiquifySizeChange?: (v: number) => void;
+  onLiquifyStrengthChange?: (v: number) => void;
+
   // Preset callbacks
   onSelectPreset: (preset: Preset) => void;
   onUpdatePreset: (preset: Preset) => void;
@@ -200,6 +206,10 @@ export function CanvasArea({
   onBrushSizeChange,
   onBrushOpacityChange,
   onBrushFlowChange,
+  liquifySize,
+  liquifyStrength,
+  onLiquifySizeChange,
+  onLiquifyStrengthChange,
   onSelectPreset,
   onUpdatePreset,
   onAddPreset,
@@ -240,27 +250,40 @@ export function CanvasArea({
     <div
       ref={containerRef}
       className="flex-1 relative overflow-hidden canvas-workspace-bg"
-      style={{ cursor }}
+      style={{ cursor, touchAction: "none" }}
     >
-      {/* Mobile: vertical canvas edge sliders (Flow, Opacity, Size) */}
-      {isMobile && (
-        <MobileCanvasSliders
-          brushSize={currentBrushSize}
-          brushOpacity={color.a}
-          brushFlow={brushSettings.flow ?? 1}
-          leftHanded={leftHanded}
-          onBrushSizeChange={onBrushSizeChange}
-          onBrushOpacityChange={onBrushOpacityChange}
-          onBrushFlowChange={onBrushFlowChange}
-        />
-      )}
-      {/* Mobile: canvas corner buttons — Color + Presets (upper-left, offset past slider) */}
+      {/* Mobile: vertical canvas edge sliders (Flow, Opacity, Size) — only for tools that use them */}
+      {isMobile &&
+        (activeTool === "brush" ||
+          activeTool === "eraser" ||
+          activeTool === "smudge" ||
+          activeTool === "liquify") && (
+          <MobileCanvasSliders
+            brushSize={currentBrushSize}
+            brushOpacity={color.a}
+            brushFlow={brushSettings.flow ?? 1}
+            leftHanded={leftHanded}
+            activeTool={activeTool}
+            liquifySize={liquifySize}
+            liquifyStrength={liquifyStrength}
+            onBrushSizeChange={onBrushSizeChange}
+            onBrushOpacityChange={onBrushOpacityChange}
+            onBrushFlowChange={onBrushFlowChange}
+            onLiquifySizeChange={onLiquifySizeChange}
+            onLiquifyStrengthChange={onLiquifyStrengthChange}
+          />
+        )}
+      {/* Mobile: all canvas corner buttons in one row — offset past the slider on the non-slider side */}
+      {/* Slider is 44px wide at offset 6px from edge, so buttons start at 56px from that edge */}
       {isMobile && (
         <div
           style={{
             position: "absolute",
-            top: 8,
-            ...(leftHanded ? { right: 62 } : { left: 62 }),
+            // paddingTop accounts for safe area on iPad notch/rounded corners
+            top: "max(8px, env(safe-area-inset-top, 8px))",
+            // On right-handed: slider on left → buttons also on left (offset past slider), layers on right
+            // On left-handed: slider on right → buttons on right (offset past slider), layers on left
+            ...(leftHanded ? { right: 56 } : { left: 56 }),
             zIndex: 25,
             display: "flex",
             flexDirection: "row",
@@ -279,6 +302,7 @@ export function CanvasArea({
             style={{
               width: 40,
               height: 40,
+              flexShrink: 0,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
@@ -310,6 +334,7 @@ export function CanvasArea({
             style={{
               width: 40,
               height: 40,
+              flexShrink: 0,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
@@ -332,12 +357,13 @@ export function CanvasArea({
           </button>
         </div>
       )}
-      {/* Mobile: canvas corner button — Layers (upper-right) */}
+      {/* Mobile: canvas corner button — Layers (opposite side from slider) */}
       {isMobile && (
         <div
           style={{
             position: "absolute",
-            top: 8,
+            top: "max(8px, env(safe-area-inset-top, 8px))",
+            // Layers button on the opposite side from slider/color/presets buttons
             ...(leftHanded ? { left: 8 } : { right: 8 }),
             zIndex: 25,
             display: "flex",
@@ -354,6 +380,7 @@ export function CanvasArea({
             style={{
               width: 40,
               height: 40,
+              flexShrink: 0,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
@@ -391,13 +418,13 @@ export function CanvasArea({
               onSetShowMobileColorPanel(false);
             }}
           />
-          {/* Floating panel — anchored below the corner buttons, aligned left (offset past slider) */}
+          {/* Floating panel — anchored below the corner buttons, aligned with slider offset */}
           <div
             data-ocid="mobile.color_panel"
             style={{
               position: "absolute",
-              top: 56,
-              ...(leftHanded ? { right: 62 } : { left: 62 }),
+              top: "calc(max(8px, env(safe-area-inset-top, 8px)) + 48px)",
+              ...(leftHanded ? { right: 56 } : { left: 56 }),
               zIndex: 50,
               background: "oklch(var(--sidebar-left))",
               border: "1px solid oklch(var(--border))",
@@ -439,13 +466,13 @@ export function CanvasArea({
               onSetShowMobilePresetsPanel(false);
             }}
           />
-          {/* Floating panel — anchored below the corner buttons, aligned left (offset past slider) */}
+          {/* Floating panel — anchored below the corner buttons, aligned with slider offset */}
           <div
             data-ocid="mobile.presets_panel"
             style={{
               position: "absolute",
-              top: 56,
-              ...(leftHanded ? { right: 62 } : { left: 62 }),
+              top: "calc(max(8px, env(safe-area-inset-top, 8px)) + 48px)",
+              ...(leftHanded ? { right: 56 } : { left: 56 }),
               zIndex: 50,
               background: "oklch(var(--sidebar-left))",
               border: "1px solid oklch(var(--border))",
@@ -618,31 +645,37 @@ export function CanvasArea({
             pointerEvents: "none",
           }}
         />
-
-        {/* Ruler overlay canvas */}
-        <canvas
-          ref={(el) => {
-            onRulerCanvasRef(el);
-            if (
-              el &&
-              (el.width !== canvasWidthRef.current ||
-                el.height !== canvasHeightRef.current)
-            ) {
-              el.width = canvasWidthRef.current;
-              el.height = canvasHeightRef.current;
+      </div>
+      {/*
+        Ruler overlay canvas — lives OUTSIDE the canvas wrapper so it is not clipped
+        to the canvas rect. Positioned to fill the container so ruler lines can extend
+        past canvas boundaries into the surrounding background area.
+        drawRulerOverlay in PaintingApp applies the canvas-space → container-space
+        transform so canvas-space coordinates still map correctly.
+      */}
+      <canvas
+        ref={(el) => {
+          onRulerCanvasRef(el);
+          // Initialise pixel dimensions to the container size; drawRulerOverlay
+          // keeps these in sync on every frame via the container's clientWidth/Height.
+          const container = containerRef.current;
+          if (el && container) {
+            const cw = container.clientWidth || canvasWidthRef.current;
+            const ch = container.clientHeight || canvasHeightRef.current;
+            if (el.width !== cw || el.height !== ch) {
+              el.width = cw;
+              el.height = ch;
               scheduleRulerOverlay();
             }
-          }}
-          style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            width: "100%",
-            height: "100%",
-            pointerEvents: "none",
-          }}
-        />
-      </div>
+          }
+        }}
+        style={{
+          position: "absolute",
+          inset: 0,
+          pointerEvents: "none",
+          zIndex: 10,
+        }}
+      />
       {/* Crop Tool Overlay */}
       {isCropActive &&
         activeTool === "crop" &&
@@ -765,7 +798,7 @@ export function CanvasArea({
         data-ocid="canvas.panel"
         style={{
           position: "absolute",
-          bottom: 12,
+          bottom: 48,
           left: 12,
           display: "flex",
           alignItems: "center",

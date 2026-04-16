@@ -2,6 +2,7 @@ import type { Layer } from "@/components/LayersPanel";
 import { invalidateAllLayerBitmaps } from "@/hooks/useCompositing";
 import type { UndoEntry } from "@/hooks/useLayerSystem";
 import type { LayerNode } from "@/types";
+import { resetGroupIdCounterFromFlat } from "@/utils/groupUtils";
 import { deserializeSktch, serializeSktch } from "@/utils/sktchFile";
 import type { WebGLBrushContext } from "@/utils/webglBrush";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -26,9 +27,9 @@ export interface UseFileIOSystemProps {
   aboveActiveCanvasRef: React.MutableRefObject<HTMLCanvasElement | null>;
   snapshotCanvasRef: React.MutableRefObject<HTMLCanvasElement | null>;
   activePreviewCanvasRef: React.MutableRefObject<HTMLCanvasElement | null>;
-  /** Ref holding the current layer tree — read on save to include group structure */
+  /** @deprecated Flat architecture — no longer used for saves; retained for interface compatibility */
   layerTreeRef: React.MutableRefObject<LayerNode[]>;
-  /** Ref holding the setLayerTree dispatch — called on load to restore group structure */
+  /** @deprecated Flat architecture — no longer used for saves; called on load with empty array */
   setLayerTreeRef: React.MutableRefObject<
     React.Dispatch<React.SetStateAction<LayerNode[]>>
   >;
@@ -269,11 +270,48 @@ export function useFileIOSystem({
         // Release all cached bitmaps — pixel data is about to be replaced
         invalidateAllLayerBitmaps();
 
-        // Stage pixels for post-render flush via pendingLayerPixelsRef (same mechanism as undo/redo)
+        // Option B: create HTMLCanvasElements for every loaded paint layer
+        // and write pixel data directly into them, then store in layerCanvasesRef.
+        // This populates the active document's canvas map so tab switches work correctly.
+        layerCanvasesRef.current.clear();
         pendingLayerPixelsRef.current.clear();
-        for (const [id, pixels] of result.layerPixels) {
-          pendingLayerPixelsRef.current.set(id, pixels);
+
+        for (const layer of result.layers) {
+          const isGroup =
+            (layer as { type?: string }).type === "group" ||
+            (layer as { type?: string }).type === "end_group";
+          if (isGroup) continue;
+          if ((layer as { isRuler?: boolean }).isRuler) continue;
+
+          const layerCanvas = document.createElement("canvas");
+          layerCanvas.width = result.canvasWidth;
+          layerCanvas.height = result.canvasHeight;
+          layerCanvasesRef.current.set(
+            (layer as { id: string }).id,
+            layerCanvas,
+          );
+
+          const pixels = result.layerPixels.get((layer as { id: string }).id);
+          if (pixels) {
+            const ctx = layerCanvas.getContext("2d", {
+              willReadFrequently: true,
+            });
+            if (ctx) {
+              ctx.putImageData(pixels, 0, 0);
+            }
+          } else if ((layer as { name?: string }).name === "Background") {
+            // Legacy save: Background layer has no pixel data. Fill with opaque white
+            // so the display canvas never shows the HTML page background through it.
+            const ctx = layerCanvas.getContext("2d", {
+              willReadFrequently: true,
+            });
+            if (ctx) {
+              ctx.fillStyle = "#ffffff";
+              ctx.fillRect(0, 0, result.canvasWidth, result.canvasHeight);
+            }
+          }
         }
+
         setCanvasWidth(result.canvasWidth);
         setCanvasHeight(result.canvasHeight);
         canvasWidthRef.current = result.canvasWidth;
@@ -310,8 +348,17 @@ export function useFileIOSystem({
         setRedoCount(result.redoStack.length);
         setLayers(result.layers);
         setActiveLayerId(result.activeLayerId);
-        // Restore the full layer tree (with groups) — this is the critical fix
-        setLayerTreeRef.current(result.layerTree);
+        // Restore the full layer tree (with groups) — no-op in flat architecture
+        // (result.layerTree is always empty; the actual layer data is in result.layers)
+        setLayerTreeRef.current(result.layerTree as unknown as LayerNode[]);
+        // BUG-006: Seed the group ID counter from the loaded flat array so new groups
+        // never collide with or skip past existing group IDs from the file.
+        // Covers both new flat-array format and legacy tree-to-flat migration — the
+        // flat array is always populated by the time we reach this point.
+        // Note: deserializeSktch also calls this as a belt-and-suspenders guard.
+        resetGroupIdCounterFromFlat(
+          result.layers as import("@/utils/groupUtils").FlatEntry[],
+        );
         setHasUnsavedChanges(false);
         isDirtyRef.current = false;
         // Remember the filename so Save reuses it instead of "untitled.sktch"
@@ -323,7 +370,10 @@ export function useFileIOSystem({
         document.title = baseName ? `${baseName} | SketchLair` : "SketchLair";
         // Mark session as existing so Resume works on next launch
         localStorage.setItem("sl_has_session", "1");
-        // composite() and updateNavigatorCanvas() are called by useHistory's useEffect after pixels are flushed
+        // Composite and update navigator after layers have been set
+        // (the useHistory effect handles composite after pendingLayerPixels flush,
+        // but since we wrote pixels directly, trigger composite here)
+        invalidateAllLayerBitmaps();
         toast.success("File loaded");
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Failed to load file";

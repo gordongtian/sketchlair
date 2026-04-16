@@ -39,6 +39,8 @@ export interface RightSidebarAreaProps {
   onSetActive: (id: string) => void;
   onToggleVisible: (id: string) => void;
   onSetOpacity: (id: string, opacity: number) => void;
+  onSetOpacityLive: (id: string, opacity: number) => void;
+  onSetOpacityCommit: (id: string, before: number, after: number) => void;
   onSetBlendMode: (id: string, blendMode: string) => void;
   onAddLayer: () => void;
   onDeleteLayer: (id: string) => void;
@@ -53,11 +55,27 @@ export interface RightSidebarAreaProps {
   onToggleGroupCollapse: (groupId: string) => void;
   onRenameGroup: (groupId: string, name: string) => void;
   onSetGroupOpacity: (groupId: string, opacity: number) => void;
+  onSetGroupOpacityLive: (groupId: string, opacity: number) => void;
+  onSetGroupOpacityCommit: (
+    groupId: string,
+    before: number,
+    after: number,
+  ) => void;
   onToggleGroupVisible: (groupId: string) => void;
   onOpenDeleteGroup: (groupId: string) => void;
-  onReorderTree: (newTree: LayerNode[]) => void;
+  onReorderTree: (newTree: LayerNode[] | Layer[]) => void;
+  onReorderTreeSilent: (newTree: LayerNode[] | Layer[]) => void;
+  onReorderLayersSilent: (ids: string[]) => void;
+  onCommitReorderHistory: (
+    treeBefore: LayerNode[],
+    treeAfter: LayerNode[],
+    layersBefore: Layer[],
+    layersAfter: Layer[],
+  ) => void;
   onToggleLayerSelection: (id: string, shiftHeld: boolean) => void;
   onCreateGroup: () => void;
+  /** Whether the Shift key is currently held — drives ruler On/Off indicator XOR display */
+  shiftHeld: boolean;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -83,6 +101,8 @@ export function RightSidebarArea({
   onSetActive,
   onToggleVisible,
   onSetOpacity,
+  onSetOpacityLive,
+  onSetOpacityCommit,
   onSetBlendMode,
   onAddLayer,
   onDeleteLayer,
@@ -97,11 +117,17 @@ export function RightSidebarArea({
   onToggleGroupCollapse,
   onRenameGroup,
   onSetGroupOpacity,
+  onSetGroupOpacityLive,
+  onSetGroupOpacityCommit,
   onToggleGroupVisible,
   onOpenDeleteGroup,
   onReorderTree,
+  onReorderTreeSilent,
+  onReorderLayersSilent,
+  onCommitReorderHistory,
   onToggleLayerSelection,
   onCreateGroup,
+  shiftHeld,
 }: RightSidebarAreaProps) {
   return (
     <div
@@ -121,6 +147,8 @@ export function RightSidebarArea({
               overflowX: "hidden",
               background: "oklch(var(--sidebar-right))",
               boxShadow: "-4px 0 24px rgba(0,0,0,0.4)",
+              // Explicitly enable pointer events on the panel itself
+              pointerEvents: "auto",
             }
           : {
               width: rightSidebarCollapsed ? 16 : rightPanelWidth,
@@ -133,17 +161,70 @@ export function RightSidebarArea({
               background: "oklch(var(--sidebar-right))",
             }
       }
+      // Bug fix: on mobile, capture ALL pointer/touch events at the panel container
+      // so taps never fall through to canvas or UI elements behind it.
+      // stopPropagation alone is not sufficient — we also need preventDefault on
+      // touch events to stop browser gesture recognition from consuming the events.
+      onClick={isMobile ? (e) => e.stopPropagation() : undefined}
+      onKeyDown={isMobile ? (e) => e.stopPropagation() : undefined}
+      onPointerDown={
+        isMobile
+          ? (e) => {
+              e.stopPropagation();
+            }
+          : undefined
+      }
+      onPointerUp={isMobile ? (e) => e.stopPropagation() : undefined}
+      onPointerMove={isMobile ? (e) => e.stopPropagation() : undefined}
+      onTouchStart={
+        isMobile
+          ? (e) => {
+              e.stopPropagation();
+              // Don't call preventDefault here — it would break scrolling inside the panel
+            }
+          : undefined
+      }
+      onTouchEnd={
+        isMobile
+          ? (e) => {
+              e.stopPropagation();
+            }
+          : undefined
+      }
+      onTouchMove={
+        isMobile
+          ? (e) => {
+              e.stopPropagation();
+            }
+          : undefined
+      }
     >
-      {/* Mobile: backdrop to close layers panel */}
+      {/* Mobile: backdrop to close layers panel — covers the area to the LEFT of the panel */}
       {isMobile && (
         <div
-          style={{ position: "fixed", inset: 0, zIndex: 55 }}
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 280, // only cover the area to the left of the panel (panel is 280px wide)
+            bottom: 0,
+            zIndex: -1, // behind sibling panel content within this stacking context
+          }}
           onPointerDown={(e) => {
             e.stopPropagation();
             e.preventDefault();
             e.currentTarget.setPointerCapture(e.pointerId);
           }}
           onPointerUp={(e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            setRightSidebarCollapsed(true);
+          }}
+          onTouchStart={(e) => {
+            e.stopPropagation();
+            e.preventDefault();
+          }}
+          onTouchEnd={(e) => {
             e.stopPropagation();
             e.preventDefault();
             setRightSidebarCollapsed(true);
@@ -227,6 +308,8 @@ export function RightSidebarArea({
               onSetActive={onSetActive}
               onToggleVisible={onToggleVisible}
               onSetOpacity={onSetOpacity}
+              onSetOpacityLive={onSetOpacityLive}
+              onSetOpacityCommit={onSetOpacityCommit}
               onSetBlendMode={onSetBlendMode}
               onAddLayer={onAddLayer}
               onDeleteLayer={onDeleteLayer}
@@ -242,11 +325,17 @@ export function RightSidebarArea({
               onToggleGroupCollapse={onToggleGroupCollapse}
               onRenameGroup={onRenameGroup}
               onSetGroupOpacity={onSetGroupOpacity}
+              onSetGroupOpacityLive={onSetGroupOpacityLive}
+              onSetGroupOpacityCommit={onSetGroupOpacityCommit}
               onToggleGroupVisible={onToggleGroupVisible}
               onDeleteGroup={onOpenDeleteGroup}
               onReorderTree={onReorderTree}
+              onReorderTreeSilent={onReorderTreeSilent}
+              onReorderLayersSilent={onReorderLayersSilent}
+              onCommitReorderHistory={onCommitReorderHistory}
               onToggleLayerSelection={onToggleLayerSelection}
               onCreateGroup={onCreateGroup}
+              shiftHeld={shiftHeld}
               onClose={
                 isMobile ? () => setRightSidebarCollapsed(true) : undefined
               }

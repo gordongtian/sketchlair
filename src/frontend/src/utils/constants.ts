@@ -1,3 +1,6 @@
+export const isIPad =
+  /iPad|Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1;
+
 export const BLEND_MODES = [
   { value: "source-over", label: "Normal" },
   { value: "multiply", label: "Multiply" },

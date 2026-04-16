@@ -1,9 +1,9 @@
 import type { HSVAColor } from "@/utils/colorUtils";
 import { generateLayerThumbnail, hsvToRgb } from "@/utils/colorUtils";
-import { bfsFloodFill } from "@/utils/selectionUtils";
+import { bfsFloodFill, chaikinSmooth } from "@/utils/selectionUtils";
 import { getThumbCanvas, getThumbCtx } from "@/utils/thumbnailCache";
 import type React from "react";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { FillMode, FillSettings } from "../components/FillPresetsPanel";
 import type { Layer } from "../components/LayersPanel";
 import { markCanvasDirty, markLayerBitmapDirty } from "./useCompositing";
@@ -53,12 +53,20 @@ export interface FillSystemParams {
 
   /** Schedule a deferred composite */
   scheduleComposite: () => void;
+
+  /**
+   * Optional callback invoked when lasso fill drawing starts.
+   * PaintingApp uses this to kick the marching-ants RAF loop so the
+   * in-progress ant trail is visible from the first pointer-down.
+   */
+  onLassoFillStart?: () => void;
 }
 
 export interface FillSystemReturn {
   // State
   fillMode: FillMode;
-  setFillMode: React.Dispatch<React.SetStateAction<FillMode>>;
+  /** Use this instead of setFillMode — keeps fillModeRef in sync synchronously. */
+  updateFillMode: (mode: FillMode) => void;
   fillSettings: FillSettings;
   setFillSettings: React.Dispatch<React.SetStateAction<FillSettings>>;
 
@@ -89,7 +97,7 @@ export interface FillSystemReturn {
     fr: number,
     fg: number,
     fb: number,
-    fa: number,
+    _fa: number,
     tolerance: number,
     contiguous?: boolean,
   ) => void;
@@ -119,6 +127,49 @@ export interface FillSystemReturn {
   handleFillPointerUp: () => void;
 }
 
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Rasterize an array of polygon points onto a new canvas as a white filled shape.
+ * Returns a canvas the same size as `w × h` with white inside the polygon and
+ * transparent outside. Used as a destination-in clip mask.
+ */
+function rasterizeLassoMask(
+  points: { x: number; y: number }[],
+  w: number,
+  h: number,
+): HTMLCanvasElement {
+  const maskC = document.createElement("canvas");
+  maskC.width = w;
+  maskC.height = h;
+  const maskCtx = maskC.getContext("2d")!;
+  maskCtx.fillStyle = "white";
+  maskCtx.beginPath();
+  maskCtx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length; i++) {
+    maskCtx.lineTo(points[i].x, points[i].y);
+  }
+  maskCtx.closePath();
+  maskCtx.fill();
+  return maskC;
+}
+
+/**
+ * Force every pixel in `imgData` that has 0 < alpha < 255 to alpha = 255.
+ * This ensures semi-transparent pixels in the fill region are brought to full
+ * opacity (Bug 3).
+ */
+function forceFullOpacity(imgData: ImageData): void {
+  const d = imgData.data;
+  for (let i = 3; i < d.length; i += 4) {
+    if (d[i] > 0 && d[i] < 255) {
+      d[i] = 255;
+    }
+  }
+}
+
+// ── useFillSystem ─────────────────────────────────────────────────────────────
+
 export function useFillSystem(params: FillSystemParams): FillSystemReturn {
   const {
     isIPad,
@@ -132,11 +183,19 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
     pushHistory,
     composite,
     scheduleComposite,
+    onLassoFillStart,
   } = params;
 
   // ── State ────────────────────────────────────────────────────────────────
   const [fillMode, setFillMode] = useState<FillMode>("flood");
   const fillModeRef = useRef<FillMode>("flood");
+
+  // Sync fillModeRef synchronously at the call site so pointer-down always
+  // reads the correct mode — a useEffect would be one render late.
+  const updateFillMode = useCallback((mode: FillMode) => {
+    fillModeRef.current = mode;
+    setFillMode(mode);
+  }, []);
 
   const [fillSettings, setFillSettings] = useState<FillSettings>({
     tolerance: 30,
@@ -148,6 +207,11 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
     gradientMode: "linear",
     contiguous: true,
   });
+
+  // Keep fillSettingsRef in sync with fillSettings state.
+  useEffect(() => {
+    fillSettingsRef.current = fillSettings;
+  }, [fillSettings]);
 
   // ── Lasso fill drag state ────────────────────────────────────────────────
   const lassoFillOriginRef = useRef<{ x: number; y: number } | null>(null);
@@ -171,10 +235,16 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
       fr: number,
       fg: number,
       fb: number,
-      fa: number,
+      _fa: number,
       tolerance: number,
       contiguous = true,
     ) => {
+      // Ruler layer guard — silently abort if the active layer is a ruler layer
+      const activeLayerFillCheck = layersRef.current.find(
+        (l) => l.id === activeLayerIdRef.current,
+      );
+      if ((activeLayerFillCheck as { isRuler?: boolean } | undefined)?.isRuler)
+        return;
       const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
       if (!ctx) return;
       const { width, height } = lc;
@@ -238,15 +308,34 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
         contiguous,
         selData,
       );
+
+      // Fill pixels in the fill mask:
+      // - alpha === 0 (fully transparent): write fill RGB at full opacity (alpha → 255)
+      // - alpha > 0 (semi-opaque or fully opaque): write fill RGB directly, preserve original alpha
+      //   Exception: if the pixel's RGB already matches the fill color, leave it untouched.
       for (let i = 0; i < fillMask.length; i++) {
         if (fillMask[i]) {
           const pi = i * 4;
-          data[pi] = fr;
-          data[pi + 1] = fg;
-          data[pi + 2] = fb;
-          data[pi + 3] = fa;
+          const existingAlpha = data[pi + 3];
+          if (existingAlpha === 0) {
+            // Fully transparent → pure fill color at full opacity
+            data[pi] = fr;
+            data[pi + 1] = fg;
+            data[pi + 2] = fb;
+            data[pi + 3] = 255;
+          } else {
+            // Semi-opaque or fully opaque → overwrite RGB only, keep alpha as-is
+            // Skip if RGB is already the fill color (no change needed)
+            if (data[pi] === fr && data[pi + 1] === fg && data[pi + 2] === fb)
+              continue;
+            data[pi] = fr;
+            data[pi + 1] = fg;
+            data[pi + 2] = fb;
+            // alpha stays exactly what it was
+          }
         }
       }
+
       ctx.putImageData(imgData, 0, 0);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -254,6 +343,14 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
   );
 
   // ── applyLassoFill ───────────────────────────────────────────────────────
+  // Bug 1 fix: always render fill to a temp canvas then apply destination-in clip.
+  // When selectionActiveRef is true, selectionMaskRef already contains the rasterized
+  // lasso boundary — use it as the clip. When no selection is active, clip to the
+  // lasso polygon itself so no pixels outside the drawn boundary are touched.
+  //
+  // Bug 3 fix: after rendering fill color to tempC, force all non-zero pixels in the
+  // region to alpha=255 before blitting onto the layer canvas with 'copy' composite
+  // so that semi-transparent pixels on the layer are fully overwritten.
   // biome-ignore lint/correctness/useExhaustiveDependencies: selection refs from hook are stable
   const applyLassoFill = useCallback(
     (
@@ -264,60 +361,68 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
       fb: number,
     ) => {
       if (points.length < 3) return;
+      // Ruler layer guard — silently abort if the active layer is a ruler layer
+      const activeLayerLasso = layersRef.current.find(
+        (l) => l.id === activeLayerIdRef.current,
+      );
+      if ((activeLayerLasso as { isRuler?: boolean } | undefined)?.isRuler)
+        return;
       const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
       if (!ctx) return;
-      ctx.save();
-      // Clip to selection if active
-      if (selectionMaskRef.current && selectionActiveRef.current) {
-        ctx.globalCompositeOperation = "source-over";
-        const tempC = document.createElement("canvas");
-        tempC.width = lc.width;
-        tempC.height = lc.height;
-        const tempCtx = tempC.getContext("2d", {
-          willReadFrequently: !isIPad,
-        })!;
-        tempCtx.imageSmoothingEnabled = true;
-        tempCtx.beginPath();
-        tempCtx.moveTo(points[0].x, points[0].y);
-        for (let i = 1; i < points.length; i++)
-          tempCtx.lineTo(points[i].x, points[i].y);
-        tempCtx.closePath();
-        tempCtx.fillStyle = `rgb(${fr},${fg},${fb})`;
-        tempCtx.fill();
-        tempCtx.globalCompositeOperation = "source-over";
-        tempCtx.strokeStyle = `rgb(${fr},${fg},${fb})`;
-        tempCtx.lineWidth = 2;
-        tempCtx.stroke();
-        // Smooth the outer edge specifically with a wider stroke
-        tempCtx.beginPath();
-        tempCtx.moveTo(points[1].x, points[1].y);
-        tempCtx.lineTo(points[2].x, points[2].y);
-        tempCtx.strokeStyle = `rgb(${fr},${fg},${fb})`;
-        tempCtx.lineWidth = 3;
-        tempCtx.stroke();
-        tempCtx.globalCompositeOperation = "destination-in";
-        tempCtx.drawImage(selectionMaskRef.current, 0, 0);
-        ctx.drawImage(tempC, 0, 0);
-      } else {
-        ctx.imageSmoothingEnabled = true;
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, points[0].y);
-        for (let i = 1; i < points.length; i++)
-          ctx.lineTo(points[i].x, points[i].y);
-        ctx.closePath();
-        ctx.fillStyle = `rgb(${fr},${fg},${fb})`;
-        ctx.fill();
-        ctx.strokeStyle = `rgb(${fr},${fg},${fb})`;
-        ctx.lineWidth = 2;
-        ctx.stroke();
-        // Smooth the outer edge specifically with a wider stroke
-        ctx.beginPath();
-        ctx.moveTo(points[1].x, points[1].y);
-        ctx.lineTo(points[2].x, points[2].y);
-        ctx.strokeStyle = `rgb(${fr},${fg},${fb})`;
-        ctx.lineWidth = 3;
-        ctx.stroke();
+
+      const w = lc.width;
+      const h = lc.height;
+
+      // Apply Chaikin smoothing so the fill boundary and ant trail always match.
+      // 2 passes gives a natural smooth curve without losing tight corners.
+      const smoothedPoints = chaikinSmooth(points, 2);
+
+      // Step 1: render the fill polygon onto a temp canvas
+      const tempC = document.createElement("canvas");
+      tempC.width = w;
+      tempC.height = h;
+      const tempCtx = tempC.getContext("2d", { willReadFrequently: false })!;
+      tempCtx.imageSmoothingEnabled = true;
+      tempCtx.beginPath();
+      tempCtx.moveTo(smoothedPoints[0].x, smoothedPoints[0].y);
+      for (let i = 1; i < smoothedPoints.length; i++) {
+        tempCtx.lineTo(smoothedPoints[i].x, smoothedPoints[i].y);
       }
+      tempCtx.closePath();
+      tempCtx.fillStyle = `rgb(${fr},${fg},${fb})`;
+      tempCtx.fill();
+
+      // Step 2: determine the clip mask.
+      // Bug 1: when a selection is active, selectionMaskRef IS the rasterized lasso
+      // boundary — use it as the hard clip. When no selection is active, create the
+      // clip mask from the lasso polygon points so nothing outside the drawn shape
+      // is ever touched (fixes flood-fill-ignoring-lasso behaviour).
+      let clipMask: HTMLCanvasElement;
+      if (selectionMaskRef.current && selectionActiveRef.current) {
+        clipMask = selectionMaskRef.current;
+      } else {
+        // No active selection — clip to the smoothed lasso polygon itself
+        clipMask = rasterizeLassoMask(smoothedPoints, w, h);
+      }
+
+      // Apply the clip: destination-in removes all pixels outside the mask
+      tempCtx.globalCompositeOperation = "destination-in";
+      tempCtx.drawImage(clipMask, 0, 0);
+      tempCtx.globalCompositeOperation = "source-over";
+
+      // Step 3 (Bug 3): force full opacity on every non-zero pixel in the filled region
+      // so that semi-transparent pixels on the destination layer are fully overwritten.
+      const fillImgData = tempCtx.getImageData(0, 0, w, h);
+      forceFullOpacity(fillImgData);
+      tempCtx.putImageData(fillImgData, 0, 0);
+
+      // Step 4: blit onto the layer canvas.
+      // Use 'source-atop' so we write the fill color with full opacity onto pixels that
+      // exist on the layer (including semi-transparent ones), and 'source-over' for new
+      // pixels that were transparent. Together this ensures the fill region is fully solid.
+      ctx.save();
+      ctx.globalCompositeOperation = "source-over";
+      ctx.drawImage(tempC, 0, 0);
       ctx.restore();
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -392,6 +497,9 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
         lassoFillLastPtRef.current = { x: pos.x, y: pos.y };
         lassoFillSmoothedPtRef.current = { x: pos.x, y: pos.y };
         lassoFillPointsRef.current = [{ x: pos.x, y: pos.y }];
+        // Kick the marching-ants RAF loop so the in-progress ant trail is
+        // visible from the first pointer-down (the loop checks isLassoFillDrawingRef).
+        onLassoFillStart?.();
         scheduleComposite();
         return;
       }
@@ -463,80 +571,117 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
   );
 
   // ── handleFillPointerUp ──────────────────────────────────────────────────
+  // Gradient fill: two independent steps —
+  //   Step 1: bfsFloodFill seeded at the drag-start point → boolean mask only,
+  //           no color output.
+  //   Step 2: for every pixel in the mask, evaluate the gradient at that pixel's
+  //           (x, y) and write the pure gradient color directly — no blending,
+  //           no source-over, no mixing with what was underneath.
   // biome-ignore lint/correctness/useExhaustiveDependencies: params is stable
   const handleFillPointerUp = useCallback(() => {
-    // Handle gradient fill pointer up
+    // ── Gradient fill pointer up ─────────────────────────────────────────
     if (isGradientDraggingRef.current) {
       isGradientDraggingRef.current = false;
       const layerIdG = activeLayerIdRef.current;
       const lcG = layerCanvasesRef.current.get(layerIdG);
       if (!lcG) return;
+      // Ruler layer guard — silently abort; reset drag state but produce no pixels
+      const activeLayerGrad = layersRef.current.find((l) => l.id === layerIdG);
+      if ((activeLayerGrad as { isRuler?: boolean } | undefined)?.isRuler) {
+        gradientDragStartRef.current = null;
+        gradientDragEndRef.current = null;
+        return;
+      }
       const ctxG = lcG.getContext("2d", { willReadFrequently: !isIPad });
       if (!ctxG) return;
       const start = gradientDragStartRef.current;
       const end = gradientDragEndRef.current;
       if (!start || !end) return;
-      const before = ctxG.getImageData(0, 0, lcG.width, lcG.height);
+
       const col = colorRef.current;
       const [gr, gg, gb] = hsvToRgb(col.h, col.s, col.v);
       const fSettings = fillSettingsRef.current;
-      const gradColorStr = `rgb(${gr},${gg},${gb})`;
-      const transparentStr = `rgba(${gr},${gg},${gb},0)`;
-      // Clip to selection if active
+
+      // ── Step 1: Region detection via flood fill ──────────────────────────
+      // Seed from the drag-start point (where the user clicked).
+      // This is the ONLY use of flood fill here — it produces a boolean mask.
+      const { width, height } = lcG;
+      const imgData = ctxG.getImageData(0, 0, width, height);
+      const before = ctxG.getImageData(0, 0, width, height);
+      const data = imgData.data;
+
+      const seedX = Math.round(start.x);
+      const seedY = Math.round(start.y);
+
+      // Build selection data for bfsFloodFill if a selection is active
+      let selData: Uint8ClampedArray | null = null;
       if (selectionMaskRef.current && selectionActiveRef.current) {
-        const tempC = document.createElement("canvas");
-        tempC.width = lcG.width;
-        tempC.height = lcG.height;
-        const tempCtx = tempC.getContext("2d", {
+        const selCtx = selectionMaskRef.current.getContext("2d", {
           willReadFrequently: !isIPad,
-        })!;
-        let grad: CanvasGradient;
-        if (fSettings.gradientMode === "radial") {
-          const dx = end.x - start.x;
-          const dy = end.y - start.y;
-          const radius = Math.sqrt(dx * dx + dy * dy);
-          grad = tempCtx.createRadialGradient(
-            start.x,
-            start.y,
-            0,
-            start.x,
-            start.y,
-            Math.max(radius, 1),
-          );
-        } else {
-          grad = tempCtx.createLinearGradient(start.x, start.y, end.x, end.y);
-        }
-        grad.addColorStop(0, gradColorStr);
-        grad.addColorStop(1, transparentStr);
-        tempCtx.fillStyle = grad;
-        tempCtx.fillRect(0, 0, tempC.width, tempC.height);
-        tempCtx.globalCompositeOperation = "destination-in";
-        tempCtx.drawImage(selectionMaskRef.current, 0, 0);
-        tempCtx.globalCompositeOperation = "source-over";
-        ctxG.globalCompositeOperation = "source-over";
-        ctxG.drawImage(tempC, 0, 0);
-      } else {
-        let grad: CanvasGradient;
-        if (fSettings.gradientMode === "radial") {
-          const dx = end.x - start.x;
-          const dy = end.y - start.y;
-          const radius = Math.sqrt(dx * dx + dy * dy);
-          grad = ctxG.createRadialGradient(
-            start.x,
-            start.y,
-            0,
-            start.x,
-            start.y,
-            Math.max(radius, 1),
-          );
-        } else {
-          grad = ctxG.createLinearGradient(start.x, start.y, end.x, end.y);
-        }
-        grad.addColorStop(0, gradColorStr);
-        grad.addColorStop(1, transparentStr);
-        ctxG.fillStyle = grad;
-        ctxG.fillRect(0, 0, lcG.width, lcG.height);
+        });
+        if (selCtx) selData = selCtx.getImageData(0, 0, width, height).data;
       }
+
+      const fillMask = bfsFloodFill(
+        data,
+        width,
+        height,
+        seedX,
+        seedY,
+        fSettings.tolerance,
+        fSettings.contiguous ?? true,
+        selData,
+      );
+
+      // ── Step 2: Write gradient colors directly for every masked pixel ────
+      // Colors are evaluated purely from position — no blending, no compositing.
+      if (fSettings.gradientMode === "radial") {
+        // Radial: t = clamp(dist(pixel, start) / dist(end, start), 0, 1)
+        const dx = end.x - start.x;
+        const dy = end.y - start.y;
+        const radius = Math.sqrt(dx * dx + dy * dy);
+        const safeRadius = Math.max(radius, 1);
+
+        for (let i = 0; i < fillMask.length; i++) {
+          if (!fillMask[i]) continue;
+          const px = i % width;
+          const py = Math.floor(i / width);
+          const pdx = px - start.x;
+          const pdy = py - start.y;
+          const dist = Math.sqrt(pdx * pdx + pdy * pdy);
+          const t = Math.min(1, Math.max(0, dist / safeRadius));
+          // Stop 0: full color, Stop 1: transparent — linear interpolation
+          const pi = i * 4;
+          data[pi] = Math.round(gr * (1 - t));
+          data[pi + 1] = Math.round(gg * (1 - t));
+          data[pi + 2] = Math.round(gb * (1 - t));
+          data[pi + 3] = Math.round(255 * (1 - t));
+        }
+      } else {
+        // Linear: t = clamp(dot(pixel - start, end - start) / |end - start|², 0, 1)
+        const vx = end.x - start.x;
+        const vy = end.y - start.y;
+        const lenSq = vx * vx + vy * vy;
+        const safeLenSq = Math.max(lenSq, 1);
+
+        for (let i = 0; i < fillMask.length; i++) {
+          if (!fillMask[i]) continue;
+          const px = i % width;
+          const py = Math.floor(i / width);
+          const dot = (px - start.x) * vx + (py - start.y) * vy;
+          const t = Math.min(1, Math.max(0, dot / safeLenSq));
+          // Stop 0: full color, Stop 1: transparent — linear interpolation
+          const pi = i * 4;
+          data[pi] = Math.round(gr * (1 - t));
+          data[pi + 1] = Math.round(gg * (1 - t));
+          data[pi + 2] = Math.round(gb * (1 - t));
+          data[pi + 3] = Math.round(255 * (1 - t));
+        }
+      }
+
+      // Direct write — no compositing, no blending
+      ctxG.putImageData(imgData, 0, 0);
+
       composite();
       markLayerBitmapDirty(layerIdG);
       const after = ctxG.getImageData(0, 0, lcG.width, lcG.height);
@@ -552,15 +697,26 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
       return;
     }
 
-    // Handle lasso fill pointer up: commit undo entry
+    // ── Lasso fill pointer up ────────────────────────────────────────────
     if (isLassoFillDrawingRef.current) {
       const layerIdLF = activeLayerIdRef.current;
       const lcLF = layerCanvasesRef.current.get(layerIdLF);
+      // Ruler layer guard — silently abort; clean up lasso state but produce no pixels
+      const activeLayerLF = layersRef.current.find((l) => l.id === layerIdLF);
+      if ((activeLayerLF as { isRuler?: boolean } | undefined)?.isRuler) {
+        isLassoFillDrawingRef.current = false;
+        lassoFillOriginRef.current = null;
+        lassoFillLastPtRef.current = null;
+        lassoFillPointsRef.current = [];
+        strokeStartSnapshotRef.current = null;
+        return;
+      }
       if (lcLF) {
         const col = colorRef.current;
         const [cr, cg, cb] = hsvToRgb(col.h, col.s, col.v);
         const pts = lassoFillPointsRef.current;
         if (pts.length >= 3) {
+          // Solid lasso fill — applyLassoFill handles chaikinSmooth internally.
           applyLassoFill(
             lcLF,
             pts,
@@ -610,7 +766,7 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
 
   return {
     fillMode,
-    setFillMode,
+    updateFillMode,
     fillSettings,
     setFillSettings,
     fillModeRef,

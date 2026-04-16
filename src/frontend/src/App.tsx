@@ -1,8 +1,17 @@
+import { CloseTabDialog } from "@/components/CloseTabDialog";
+import { DocumentTabBar } from "@/components/DocumentTabBar";
+import { NewDocumentModal } from "@/components/NewDocumentModal";
 import { PaintingApp } from "@/components/PaintingApp";
 import { SplashScreen } from "@/components/SplashScreen";
 import { Toaster } from "@/components/ui/sonner";
+import {
+  DocumentProvider,
+  useDocumentContext,
+} from "@/context/DocumentContext";
+import { useIsMobile } from "@/hooks/useIsMobile";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { X } from "lucide-react";
+import { AnimatePresence } from "motion/react";
 import { Component, useCallback, useEffect, useRef, useState } from "react";
 import type { ErrorInfo, ReactNode } from "react";
 import { createActorWithConfig } from "./config";
@@ -10,7 +19,7 @@ import {
   InternetIdentityProvider,
   useInternetIdentity,
 } from "./hooks/useInternetIdentity";
-// hotkeyConfig not needed at App level — PaintingApp loads hotkeys internally
+import type { PresetsPayload } from "./hooks/usePresetSystem";
 import {
   type ThemeId,
   applyThemeOverrides,
@@ -20,9 +29,6 @@ import {
 const queryClient = new QueryClient();
 
 // ── PaintingApp error boundary ────────────────────────────────────────────────
-// Prevents a crash inside PaintingApp from unmounting the SplashScreen.
-// Without this, any render error in PaintingApp kills the entire AppInner tree,
-// producing a blank white page where even the splash cannot be seen.
 
 interface PaintingErrorBoundaryState {
   hasError: boolean;
@@ -52,8 +58,6 @@ class PaintingErrorBoundary extends Component<
 
   render() {
     if (this.state.hasError) {
-      // Render nothing — the SplashScreen (a sibling) will cover the viewport.
-      // The error is logged to the console for debugging.
       return null;
     }
     return this.props.children;
@@ -61,8 +65,9 @@ class PaintingErrorBoundary extends Component<
 }
 
 const THEME_KEY = "sl-theme";
-// Key used to mark that a session exists and can be resumed
 const SESSION_EXISTS_KEY = "sl_has_session";
+
+// ── AppInner ──────────────────────────────────────────────────────────────────
 
 function AppInner() {
   const [softwareWebGL, setSoftwareWebGL] = useState(false);
@@ -70,27 +75,46 @@ function AppInner() {
 
   const { identity, login, clear, isInitializing } = useInternetIdentity();
   const isLoggedIn = !!identity && !identity.getPrincipal().isAnonymous();
+  const { isMobile, forceDesktop } = useIsMobile();
 
   // Splash: shown on every launch until the user makes a choice
   const [showSplash, setShowSplash] = useState(true);
 
-  // Initial canvas size (set by splash, then passed to PaintingApp)
-  const [initialCanvasWidth, setInitialCanvasWidth] = useState<number | null>(
-    null,
-  );
-  const [initialCanvasHeight, setInitialCanvasHeight] = useState<number | null>(
-    null,
-  );
+  // All document operations come from context — no duplicate logic here
+  const {
+    documents,
+    activeDocumentId,
+    swappingToId,
+    removeDocument,
+    createDocument,
+    openFileAsDocument,
+    getSktchBlob,
+    setDirty,
+    handleSwitchDocument,
+  } = useDocumentContext();
 
-  // Track if we already synced settings for the current login session
+  // Return to splash when all tabs are closed
+  useEffect(() => {
+    if (activeDocumentId === null) {
+      setShowSplash(true);
+    }
+  }, [activeDocumentId]);
+
+  // Settings sync state
   const settingsSyncedRef = useRef(false);
-
-  // Cloud save removed — local saves only; login restores settings only
-
-  // Ref to PaintingApp's load function (used by handleOpenFile)
-  const handleLoadFileRef = useRef<((file: File) => Promise<void>) | null>(
+  const loadPresetsRef = useRef<((payload: PresetsPayload) => void) | null>(
     null,
   );
+  const presetSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Modal / dialog state
+  const [showNewDocModal, setShowNewDocModal] = useState(false);
+  const [newDocWidth, setNewDocWidth] = useState("");
+  const [newDocHeight, setNewDocHeight] = useState("");
+  const [closeDialogState, setCloseDialogState] = useState<{
+    docId: string;
+    filename: string;
+  } | null>(null);
 
   // Detect software WebGL
   useEffect(() => {
@@ -110,7 +134,7 @@ function AppInner() {
     }
   }, []);
 
-  // Silently sync settings when the user logs in — no toast, no splash trigger
+  // Silently sync settings when the user logs in
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional one-shot on login change
   useEffect(() => {
     if (isInitializing) return;
@@ -127,15 +151,18 @@ function AppInner() {
           agentOptions: { identity },
         });
 
-        // Sync settings from cloud — silently
+        console.log("[Load] Fetching user settings from backend...");
         const settingsJson = await actor.getUserSettings();
+        console.log("[Load] Raw user settings from backend:", settingsJson);
         if (settingsJson) {
           try {
             const settings = JSON.parse(settingsJson) as {
               theme?: string;
               themeOverrides?: Record<string, Record<string, string>>;
               hotkeys?: Record<string, string[]>;
+              presets?: PresetsPayload;
             };
+            console.log("[Load] Parsed user settings:", settings);
             if (settings.theme) {
               const validTheme = settings.theme as ThemeId;
               localStorage.setItem(THEME_KEY, validTheme);
@@ -146,15 +173,17 @@ function AppInner() {
               document.documentElement.classList.add(`theme-${validTheme}`);
               applyThemeOverrides(validTheme);
             }
+            console.log("[Load] Parsed preferences applied (theme/hotkeys):", {
+              theme: settings.theme,
+              hotkeys: settings.hotkeys,
+            });
             if (settings.themeOverrides) {
               const currentTheme = (localStorage.getItem(THEME_KEY) ||
                 "light") as ThemeId;
               importThemes(settings.themeOverrides, currentTheme);
             }
-            // Hotkeys: restored silently if present in settings
             if (settings.hotkeys) {
               try {
-                // Store hotkeys directly to localStorage — loadHotkeys() will pick them up on next read
                 localStorage.setItem(
                   "sl_hotkeys",
                   JSON.stringify(settings.hotkeys),
@@ -163,50 +192,191 @@ function AppInner() {
                 // ignore hotkey restore errors
               }
             }
+            console.log(
+              "[Load] Raw brush settings from storage:",
+              settings.presets,
+            );
+            if (settings.presets && loadPresetsRef.current) {
+              try {
+                loadPresetsRef.current(settings.presets);
+                console.log(
+                  "[Load] Brush settings handed off to preset system for application",
+                );
+              } catch {
+                // ignore preset restore errors
+              }
+            } else if (!settings.presets) {
+              console.warn("[Load] Brush settings: null — nothing to load");
+            }
           } catch (e) {
             console.warn("Failed to parse cloud settings", e);
           }
         }
       } catch (e) {
-        // Settings sync failure is silent — don't block the user
-        console.warn("Settings sync failed", e);
+        console.warn("[Load] Failed to load user settings:", e);
       }
     })();
   }, [isLoggedIn, isInitializing]);
 
-  const hasLocalSession =
-    typeof localStorage !== "undefined" &&
-    !!localStorage.getItem(SESSION_EXISTS_KEY);
+  // ── Splash handlers ──────────────────────────────────────────────────────
 
-  // Splash handlers
   const handleNewCanvas = useCallback(
     (opts: { width: number; height: number }) => {
-      setInitialCanvasWidth(opts.width);
-      setInitialCanvasHeight(opts.height);
+      createDocument(opts.width, opts.height, "Untitled-1.sktch");
       setShowSplash(false);
       localStorage.setItem(SESSION_EXISTS_KEY, "1");
     },
-    [],
+    [createDocument],
   );
 
-  const handleOpenFile = useCallback(async (file: File) => {
-    setShowSplash(false);
-    localStorage.setItem(SESSION_EXISTS_KEY, "1");
-    // Load the file after the canvas has mounted — use a short delay so PaintingApp
-    // has time to finish its mount cycle before we push pixel data into it.
-    setTimeout(() => {
-      handleLoadFileRef.current?.(file);
-    }, 100);
-  }, []);
-
-  const handleResume = useCallback(() => {
-    setShowSplash(false);
-  }, []);
+  const handleOpenFile = useCallback(
+    async (file: File) => {
+      setShowSplash(false);
+      localStorage.setItem(SESSION_EXISTS_KEY, "1");
+      // Short delay so the splash fade-out completes before loading
+      setTimeout(() => {
+        openFileAsDocument(file);
+      }, 100);
+    },
+    [openFileAsDocument],
+  );
 
   const handleLogout = useCallback(() => {
     clear();
     settingsSyncedRef.current = false;
   }, [clear]);
+
+  // ── Brush preset auto-save ────────────────────────────────────────────────
+
+  const identityRef = useRef(identity);
+  identityRef.current = identity;
+
+  const handlePresetsMutated = useCallback(
+    async (presetsJson: string) => {
+      if (presetSaveTimerRef.current !== null) {
+        clearTimeout(presetSaveTimerRef.current);
+        presetSaveTimerRef.current = null;
+      }
+      if (activeDocumentId) setDirty(activeDocumentId, true);
+
+      try {
+        const currentIdentity = identityRef.current;
+        if (!currentIdentity || currentIdentity.getPrincipal().isAnonymous())
+          return;
+        const actor = await createActorWithConfig({
+          agentOptions: { identity: currentIdentity },
+        });
+        let base: Record<string, unknown> = {};
+        try {
+          const existing = await actor.getUserSettings();
+          console.log("[Save] Existing user settings from backend:", existing);
+          if (existing) {
+            base = JSON.parse(existing) as Record<string, unknown>;
+          }
+        } catch {
+          // start fresh
+        }
+        const presets = JSON.parse(presetsJson) as PresetsPayload;
+        console.log(
+          "[Save] Brush settings: queuing save for presets payload:",
+          presets,
+        );
+        const merged = { ...base, presets };
+        console.log("[Save] Merged settings being written to backend:", merged);
+        await actor.saveUserSettings(JSON.stringify(merged));
+      } catch (error) {
+        console.warn("[Save] Brush settings: save failed:", error);
+      }
+    },
+    [activeDocumentId, setDirty],
+  );
+
+  // ── Tab bar handlers ──────────────────────────────────────────────────────
+
+  const handleNewDocument = useCallback(() => {
+    // Reset custom size fields each time the modal opens
+    setNewDocWidth("");
+    setNewDocHeight("");
+    setShowNewDocModal(true);
+  }, []);
+
+  const handleNewDocumentCreate = useCallback(
+    (width: number, height: number) => {
+      setShowNewDocModal(false);
+      createDocument(width, height);
+    },
+    [createDocument],
+  );
+
+  const handleOpenDocument = useCallback(() => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".sktch";
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      openFileAsDocument(file);
+    };
+    input.click();
+  }, [openFileAsDocument]);
+
+  const handleCloseTab = useCallback(
+    (id: string) => {
+      const doc = documents.find((d) => d.id === id);
+      if (!doc) return;
+      if (doc.isDirty) {
+        setCloseDialogState({ docId: id, filename: doc.filename });
+        return;
+      }
+      removeDocument(id);
+    },
+    [documents, removeDocument],
+  );
+
+  const handleCloseDialogSave = useCallback(async () => {
+    if (!closeDialogState) return;
+    const { docId, filename } = closeDialogState;
+    setCloseDialogState(null);
+
+    if (docId === activeDocumentId && getSktchBlob) {
+      try {
+        const blob = await getSktchBlob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch {
+        // Save failed silently — close anyway
+      }
+    }
+    removeDocument(docId);
+  }, [closeDialogState, activeDocumentId, getSktchBlob, removeDocument]);
+
+  const handleCloseDialogDiscard = useCallback(() => {
+    if (!closeDialogState) return;
+    removeDocument(closeDialogState.docId);
+    setCloseDialogState(null);
+  }, [closeDialogState, removeDocument]);
+
+  const handleCloseDialogCancel = useCallback(() => {
+    setCloseDialogState(null);
+  }, []);
+
+  // ── Mark dirty on first user interaction ─────────────────────────────────
+  useEffect(() => {
+    if (!activeDocumentId) return;
+    let marked = false;
+    const handlePointerDown = () => {
+      if (!marked) {
+        marked = true;
+        setDirty(activeDocumentId, true);
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [activeDocumentId, setDirty]);
 
   const principalId = isLoggedIn
     ? identity!.getPrincipal().toString()
@@ -236,35 +406,95 @@ function AppInner() {
         </div>
       )}
 
-      {/* PaintingApp is always mounted (so refs are valid), but hidden behind the splash.
-          Wrapped in an ErrorBoundary so any render crash does not unmount the SplashScreen. */}
+      {/* PaintingApp: always mounted (behind splash), single persistent instance.
+          Wrapped in ErrorBoundary so any render crash does not kill the SplashScreen. */}
       <PaintingErrorBoundary>
-        <PaintingApp
-          isLoggedIn={isLoggedIn}
-          identity={identity}
-          onLogin={login}
-          onLogout={handleLogout}
-          cloudSave={undefined}
-          getCanvasHash={undefined}
-          initialCanvasWidth={initialCanvasWidth ?? undefined}
-          initialCanvasHeight={initialCanvasHeight ?? undefined}
-          registerGetSktchBlob={undefined}
-          registerLoadFile={(fn) => {
-            handleLoadFileRef.current = fn;
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            height: "100vh",
+            overflow: "hidden",
           }}
-        />
+        >
+          {/* Main canvas area — paddingBottom compensates for fixed DocumentTabBar height */}
+          <div
+            style={{
+              flex: 1,
+              overflow: "hidden",
+              position: "relative",
+              paddingBottom: "36px",
+            }}
+          >
+            {/* PaintingApp reads registerSwapFn / registerLoadFileFn / registerGetSktchBlobFn
+                directly from DocumentContext — no prop drilling needed */}
+            <PaintingApp
+              isLoggedIn={isLoggedIn}
+              identity={identity ?? undefined}
+              onLogin={login}
+              onLogout={handleLogout}
+              onPresetsMutated={handlePresetsMutated}
+              registerLoadPresets={(fn) => {
+                loadPresetsRef.current = fn;
+              }}
+              cloudSave={undefined}
+              getCanvasHash={undefined}
+            />
+          </div>
+
+          {/* Tab bar — desktop only, fixed at bottom */}
+          <DocumentTabBar
+            documents={documents.map((d) => ({
+              id: d.id,
+              filename: d.filename,
+              isDirty: d.isDirty,
+            }))}
+            activeDocumentId={activeDocumentId}
+            swappingToId={swappingToId}
+            onSwitchDocument={handleSwitchDocument}
+            onCloseTab={handleCloseTab}
+            onNewDocument={handleNewDocument}
+            onOpenDocument={handleOpenDocument}
+            isMobile={isMobile}
+            forceDesktop={forceDesktop}
+          />
+        </div>
       </PaintingErrorBoundary>
+
+      {/* New Document Resolution Selector Modal */}
+      <AnimatePresence>
+        {showNewDocModal && (
+          <NewDocumentModal
+            onCreate={handleNewDocumentCreate}
+            onCancel={() => setShowNewDocModal(false)}
+            customW={newDocWidth}
+            customH={newDocHeight}
+            onCustomWChange={setNewDocWidth}
+            onCustomHChange={setNewDocHeight}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Close Tab Confirmation Dialog */}
+      <AnimatePresence>
+        {closeDialogState && (
+          <CloseTabDialog
+            filename={closeDialogState.filename}
+            onSave={handleCloseDialogSave}
+            onDiscard={handleCloseDialogDiscard}
+            onCancel={handleCloseDialogCancel}
+          />
+        )}
+      </AnimatePresence>
 
       {showSplash && (
         <SplashScreen
-          hasLocalSession={hasLocalSession}
           principalId={principalId}
           isLoggedIn={isLoggedIn}
           onLogin={login}
           onLogout={handleLogout}
           onNewCanvas={handleNewCanvas}
           onOpenFile={handleOpenFile}
-          onResume={handleResume}
         />
       )}
 
@@ -277,7 +507,9 @@ export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <InternetIdentityProvider>
-        <AppInner />
+        <DocumentProvider>
+          <AppInner />
+        </DocumentProvider>
       </InternetIdentityProvider>
     </QueryClientProvider>
   );

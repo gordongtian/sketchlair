@@ -25,4 +25,5 @@
 
 ## Learnings
 
-[No learnings yet]
+- Layer order convention: the composite loop iterates BACKWARDS (high index = bottom, low index = top). Background (bottom layer) must be at the LAST/highest index, Layer 1 must be at a lower index. The useState default and the Phase 2 toDoc.layers assignment must both use [Layer1, Background] order.
+- Layer order in the initial useState default must match the Phase 2 swap initialization — Background at index 0 (bottom), Layer 1 at index 1 (top). These two places must stay in sync.

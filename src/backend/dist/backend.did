@@ -32,12 +32,14 @@ service : {
   _immutableObjectStorageUpdateGatewayPrincipals: () -> ();
   _initializeAccessControl: () -> ();
   assignCallerUserRole: (user: principal, role: UserRole) -> ();
+  getBrushPresets: () -> (opt text) query;
   getCallerUserProfile: () -> (opt UserProfile) query;
   getCallerUserRole: () -> (UserRole) query;
   getCanvasHash: () -> (opt CanvasSave) query;
   getUserProfile: (user: principal) -> (opt UserProfile) query;
   getUserSettings: () -> (opt SettingsSave) query;
   isCallerAdmin: () -> (bool) query;
+  saveBrushPresets: (data: text) -> ();
   saveCallerUserProfile: (profile: UserProfile) -> ();
   saveCanvasHash: (canvasHash: CanvasSave) -> ();
   saveUserSettings: (settings: SettingsSave) -> ();

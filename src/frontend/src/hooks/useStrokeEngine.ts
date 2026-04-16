@@ -27,12 +27,8 @@ import type { BrushSettings } from "@/components/BrushSettingsPanel";
 import type { Tool } from "@/components/Toolbar";
 import { hsvToRgb, rgbToHsv } from "@/utils/colorUtils";
 import { useCallback, useRef } from "react";
+import { isIPad } from "../utils/constants";
 import type { WebGLBrushContext } from "../utils/webglBrush";
-
-// ─── isIPad (duplicated so this module is self-contained) ────────────────────
-const isIPad =
-  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type Point = { x: number; y: number };
@@ -43,11 +39,6 @@ export type StrokePoint = {
   opacity: number;
   capAlpha?: number;
 };
-
-// ─── Module-level tint canvas (avoids per-stamp canvas allocation) ────────────
-const _tintCanvas = document.createElement("canvas");
-_tintCanvas.width = _tintCanvas.height = 128;
-const _tintCtx = _tintCanvas.getContext("2d", { willReadFrequently: !isIPad })!;
 
 // ─── Module-level smudge buffer ───────────────────────────────────────────────
 export let _smudgeBufferData: Uint8ClampedArray | null = null;
@@ -125,7 +116,7 @@ export function evalPressureCurve(
   const [p1x, p1y, p2x, p2y] = cp;
   let lo = 0;
   let hi = 1;
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 32; i++) {
     const t = (lo + hi) / 2;
     const x =
       3 * t * (1 - t) * (1 - t) * p1x + 3 * t * t * (1 - t) * p2x + t * t * t;
@@ -156,6 +147,8 @@ export interface UseStrokeEngineParams {
   distAccumRef: React.MutableRefObject<number>;
   dualDistAccumRef: React.MutableRefObject<number>;
   markLayerBitmapDirty: (id: string) => void;
+  /** Flat layers array ref — used to guard ruler layer writes */
+  layersRef?: React.MutableRefObject<{ id: string; isRuler?: boolean }[]>;
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
@@ -168,6 +161,7 @@ export function useStrokeEngine({
   distAccumRef,
   dualDistAccumRef,
   markLayerBitmapDirty,
+  layersRef,
 }: UseStrokeEngineParams) {
   // ── Stroke lifecycle refs ─────────────────────────────────────────────────
   const tailRafIdRef = useRef<number | null>(null);
@@ -258,6 +252,12 @@ export function useStrokeEngine({
       settings: BrushSettings,
       strokeAngle: number,
     ) => {
+      // Ruler layer guard — silently abort; tool stays active but produces no output
+      if (
+        layersRef?.current.find((l) => l.id === activeLayerIdRef.current)
+          ?.isRuler
+      )
+        return;
       const r = size / 2;
       const angle =
         settings.rotateMode === "follow"
@@ -273,42 +273,52 @@ export function useStrokeEngine({
           // Tip not loaded yet — skip this stamp entirely (no circle fallback)
           return;
         }
-        // Create tinted stamp: fill with brush color, mask with tip alpha (reuse module-level canvas)
-        _tintCtx.clearRect(0, 0, 128, 128);
-        _tintCtx.globalCompositeOperation = "source-over";
-        _tintCtx.fillStyle = ctx.fillStyle as string;
-        _tintCtx.fillRect(0, 0, 128, 128);
-        _tintCtx.globalCompositeOperation = "destination-in";
-        _tintCtx.drawImage(tipCanvas, 0, 0);
-        _tintCtx.globalCompositeOperation = "source-over";
+        // Create tinted stamp: fill with brush color, mask with tip alpha (fresh canvas per stamp)
+        const tintCanvas = document.createElement("canvas");
+        tintCanvas.width = tintCanvas.height = 128;
+        const tintCtx = tintCanvas.getContext("2d", {
+          willReadFrequently: true,
+        })!;
+        tintCtx.clearRect(0, 0, 128, 128);
+        tintCtx.globalCompositeOperation = "source-over";
+        tintCtx.fillStyle = ctx.fillStyle as string;
+        tintCtx.fillRect(0, 0, 128, 128);
+        tintCtx.globalCompositeOperation = "destination-in";
+        tintCtx.drawImage(tipCanvas, 0, 0);
+        tintCtx.globalCompositeOperation = "source-over";
 
         ctx.save();
         ctx.translate(x, y);
         if (angle !== 0) ctx.rotate(angle);
-        ctx.drawImage(_tintCanvas, -size / 2, -size / 2, size, size);
+        ctx.drawImage(tintCanvas, -size / 2, -size / 2, size, size);
         ctx.restore();
         return;
       }
 
-      // Default tip fallback: use preloaded circle tip or arc (reuse module-level tint canvas)
+      // Default tip fallback: use preloaded circle tip or arc (fresh canvas per stamp)
       const defTip = defaultTipCanvasRef.current;
       if (defTip) {
-        _tintCtx.clearRect(0, 0, 128, 128);
-        _tintCtx.globalCompositeOperation = "source-over";
-        _tintCtx.filter =
+        const tintCanvas = document.createElement("canvas");
+        tintCanvas.width = tintCanvas.height = 128;
+        const tintCtx = tintCanvas.getContext("2d", {
+          willReadFrequently: true,
+        })!;
+        tintCtx.clearRect(0, 0, 128, 128);
+        tintCtx.globalCompositeOperation = "source-over";
+        tintCtx.filter =
           settings.softness > 0
             ? `blur(${Math.round(settings.softness * 20)}px)`
             : "none";
-        _tintCtx.fillStyle = ctx.fillStyle as string;
-        _tintCtx.fillRect(0, 0, 128, 128);
-        _tintCtx.globalCompositeOperation = "destination-in";
-        _tintCtx.drawImage(defTip, 0, 0);
-        _tintCtx.globalCompositeOperation = "source-over";
-        _tintCtx.filter = "none";
+        tintCtx.fillStyle = ctx.fillStyle as string;
+        tintCtx.fillRect(0, 0, 128, 128);
+        tintCtx.globalCompositeOperation = "destination-in";
+        tintCtx.drawImage(defTip, 0, 0);
+        tintCtx.globalCompositeOperation = "source-over";
+        tintCtx.filter = "none";
         ctx.save();
         ctx.translate(x, y);
         if (angle !== 0) ctx.rotate(angle);
-        ctx.drawImage(_tintCanvas, -size / 2, -size / 2, size, size);
+        ctx.drawImage(tintCanvas, -size / 2, -size / 2, size, size);
         ctx.restore();
       } else {
         ctx.save();
@@ -343,6 +353,12 @@ export function useStrokeEngine({
       dualFillStyle?: string,
       capAlpha?: number,
     ) => {
+      // Ruler layer guard — silently abort; tool stays active but produces no output
+      if (
+        layersRef?.current.find((l) => l.id === activeLayerIdRef.current)
+          ?.isRuler
+      )
+        return;
       const glBrush = webglBrushRef.current;
       if (!glBrush) return;
       if (fillStyle !== _cachedFillStyle) {
@@ -596,6 +612,12 @@ export function useStrokeEngine({
       settings: BrushSettings,
       strength = 0.8,
     ) => {
+      // Ruler layer guard — silently abort; tool stays active but produces no output
+      if (
+        layersRef?.current.find((l) => l.id === activeLayerIdRef.current)
+          ?.isRuler
+      )
+        return;
       const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
       if (!ctx || points.length < 2) return;
       const size = brushSizeVal;

@@ -1,3 +1,5 @@
+import { useDocumentContext } from "@/context/DocumentContext";
+import type { DocumentState } from "@/types/DocumentTypes";
 import type { HSVAColor } from "@/utils/colorUtils";
 import {
   generateLayerThumbnail,
@@ -7,6 +9,8 @@ import {
   rgbToHex,
   rgbToHsv,
 } from "@/utils/colorUtils";
+import type { FlatEntry } from "@/utils/groupUtils";
+import { resetGroupIdCounterFromFlat } from "@/utils/groupUtils";
 import {
   type HotkeyAction,
   loadHotkeys,
@@ -53,15 +57,7 @@ import { useIsMobile } from "../hooks/useIsMobile";
 import { useLayerSystem } from "../hooks/useLayerSystem";
 import type { UndoEntry } from "../hooks/useLayerSystem";
 import { useLineRuler } from "../hooks/useLineRuler";
-import {
-  getLiquifySnapshot as _getLiquifySnapshot,
-  initLiquifyField as _initLiquifyField,
-  renderLiquifyFromSnapshot as _renderLiquifyFromSnapshot,
-  setLiquifySnapshot as _setLiquifySnapshot,
-  updateLiquifyDisplacementField as _updateLiquifyDisplacementField,
-  resetLiquifyField,
-  useLiquifySystem,
-} from "../hooks/useLiquifySystem";
+import { resetLiquifyField, useLiquifySystem } from "../hooks/useLiquifySystem";
 import { usePaintingCanvasEvents } from "../hooks/usePaintingCanvasEvents";
 import type { PaintingCanvasEventsCallbacks } from "../hooks/usePaintingCanvasEvents";
 import { usePresetSystem } from "../hooks/usePresetSystem";
@@ -69,26 +65,14 @@ import type { BrushSizes } from "../hooks/usePresetSystem";
 import { useRulerUIHandlers } from "../hooks/useRulerUIHandlers";
 import { useSelectionSystem } from "../hooks/useSelectionSystem";
 import { useSnapSystem } from "../hooks/useSnapSystem";
-import {
-  PRESSURE_SMOOTHING as _PRESSURE_SMOOTHING,
-  applyColorJitter as _applyColorJitter,
-  evalPressureCurve as _evalPressureCurve,
-  resetSmudgeInitialized as _resetSmudgeInitialized,
-  useStrokeEngine,
-} from "../hooks/useStrokeEngine";
+import { useStrokeEngine } from "../hooks/useStrokeEngine";
 import { useToolSwitchSystem } from "../hooks/useToolSwitchSystem";
 import { useTransformSystem } from "../hooks/useTransformSystem";
 import type { SelectionGeom, SelectionSnapshot } from "../selectionTypes";
 import type { ViewTransform } from "../types";
+import { isIPad } from "../utils/constants";
 import {
-  flattenTree as _flattenTree,
-  getEffectiveOpacity as _getEffectiveOpacity,
-  getEffectiveVisibility as _getEffectiveVisibility,
-  getEffectivelySelectedLayers as _getEffectivelySelectedLayers,
-  findNode,
-} from "../utils/layerTree";
-import {
-  bfsFloodFill as _bfsFloodFill,
+  chaikinSmooth,
   computeMaskBounds,
   growShrinkMask,
 } from "../utils/selectionUtils";
@@ -124,26 +108,25 @@ import type { LassoMode, Tool } from "./Toolbar";
 import { ToolbarArea } from "./ToolbarArea";
 import { WebGL1WarningBanner } from "./WebGL1WarningBanner";
 
-// Per-stamp color jitter helper → now in useStrokeEngine.ts
-// evalPressureCurve → now in useStrokeEngine.ts
-// PRESSURE_SMOOTHING → now in useStrokeEngine.ts
-// applyColorJitter → now in useStrokeEngine.ts
-
-const isIPad =
-  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-
 const CANVAS_WIDTH = isIPad ? 1280 : 2560;
 const CANVAS_HEIGHT = isIPad ? 720 : 1440;
 
 type Point = { x: number; y: number };
 
-let layerCounter = 2;
+// IMPORTANT: Layer IDs must be globally unique across ALL open documents.
+// Never use sequential integers or position-based keys — two documents with
+// identical layer structure would collide in layerCanvasMap and share canvases.
+// Always use generateLayerId() so each layer has a unique ID regardless of
+// how many documents are open or when they were created.
+let _layerNameCounter = 0;
+function generateLayerId(): string {
+  return `layer_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
 function newLayer(): Layer {
-  layerCounter++;
+  _layerNameCounter++;
   return {
-    id: `layer-${layerCounter}`,
-    name: `Layer ${layerCounter - 1}`,
+    id: generateLayerId(),
+    name: `Layer ${_layerNameCounter}`,
     visible: true,
     opacity: 1,
     blendMode: "source-over",
@@ -151,6 +134,11 @@ function newLayer(): Layer {
     alphaLock: false,
   };
 }
+
+// Module-level unique IDs for the cold-start useState defaults.
+// These are allocated once at module load time and never reused.
+const _INIT_LAYER1_ID = generateLayerId();
+const _INIT_LAYER2_ID = generateLayerId();
 
 const DEFAULT_TRANSFORM: ViewTransform = {
   panX: 0,
@@ -323,11 +311,19 @@ interface PaintingAppProps {
   onLogout?: () => void;
   cloudSave?: (getBlob: () => Promise<Blob>) => Promise<void>;
   getCanvasHash?: () => Promise<string | null>;
-  registerGetSktchBlob?: (fn: () => Promise<Blob>) => void;
-  registerLoadFile?: (fn: (file: File) => Promise<void>) => void;
-  /** Initial canvas size chosen from the splash screen */
-  initialCanvasWidth?: number;
-  initialCanvasHeight?: number;
+  /**
+   * Called (debounced 500 ms inside usePresetSystem) whenever presets are
+   * mutated and the user is logged in. Receives the full JSON string to
+   * persist to the backend.
+   */
+  onPresetsMutated?: (json: string) => void;
+  /**
+   * Registers the loadPresets function so the caller (App.tsx) can invoke it
+   * on login to restore saved presets from the cloud.
+   */
+  registerLoadPresets?: (
+    fn: (payload: import("../hooks/usePresetSystem").PresetsPayload) => void,
+  ) => void;
 }
 
 export function PaintingApp({
@@ -337,11 +333,12 @@ export function PaintingApp({
   onLogout,
   cloudSave,
   getCanvasHash,
-  registerGetSktchBlob,
-  registerLoadFile,
-  initialCanvasWidth,
-  initialCanvasHeight,
+  onPresetsMutated,
+  registerLoadPresets,
 }: PaintingAppProps = {}) {
+  // Access DocumentContext to register imperative functions and react to document events
+  const { registerSwapFn, registerLoadFileFn, registerGetSktchBlobFn } =
+    useDocumentContext();
   // UI state
   const [activeTool, setActiveTool] = useState<Tool>("brush");
   const [activeRulerPresetType, setActiveRulerPresetType] =
@@ -375,7 +372,7 @@ export function PaintingApp({
   const [color, setColor] = useState<HSVAColor>({ h: 0, s: 0, v: 0.05, a: 1 });
   const [layers, setLayers] = useState<Layer[]>([
     {
-      id: "layer-1",
+      id: _INIT_LAYER1_ID,
       name: "Layer 1",
       visible: true,
       opacity: 1,
@@ -384,7 +381,7 @@ export function PaintingApp({
       alphaLock: false,
     },
     {
-      id: "layer-2",
+      id: _INIT_LAYER2_ID,
       name: "Background",
       visible: true,
       opacity: 1,
@@ -393,7 +390,7 @@ export function PaintingApp({
       alphaLock: false,
     },
   ]);
-  const [activeLayerId, setActiveLayerId] = useState("layer-1");
+  const [activeLayerId, setActiveLayerId] = useState(_INIT_LAYER1_ID);
   const [recentColors, setRecentColors] = useState<string[]>([]);
   const [undoCount, setUndoCount] = useState(0);
   const [redoCount, setRedoCount] = useState(0);
@@ -437,7 +434,7 @@ export function PaintingApp({
   // canvas being locked at viewport size regardless of the preset chosen.
   const [canvasWidth, setCanvasWidth] = useState(CANVAS_WIDTH);
   const [canvasHeight, setCanvasHeight] = useState(CANVAS_HEIGHT);
-  // canvasWidthRef, canvasHeightRef, splashDimsAppliedRef → now in uiRefs group (declared below)
+  // canvasWidthRef, canvasHeightRef → now in uiRefs group (declared below)
 
   const [webGLFallbackWarning, setWebGLFallbackWarning] = useState(false);
   const [activeSubpanel, setActiveSubpanel] = useState<Tool | null>("brush");
@@ -486,6 +483,7 @@ export function PaintingApp({
     handleImportBrushes,
     processImportAppend,
     resolveConflict,
+    loadPresets,
     handleCanvasBrushSizeChange,
     handleCanvasBrushOpacityChange,
     handleCanvasBrushFlowChange,
@@ -496,7 +494,18 @@ export function PaintingApp({
     setBrushSettings,
     setColor,
     setActiveTool: (t) => setActiveTool(t),
+    onPresetsMutated,
+    isLoggedIn,
   });
+
+  // Register loadPresets with the parent so it can restore cloud presets on login.
+  // Use a ref to avoid triggering re-runs when loadPresets identity changes.
+  const loadPresetsRef = useRef(loadPresets);
+  loadPresetsRef.current = loadPresets;
+  useEffect(() => {
+    registerLoadPresets?.((payload) => loadPresetsRef.current(payload));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [registerLoadPresets]);
 
   // Import dialog state (cloud overwrite — preset import/conflict dialogs are in usePresetSystem)
   const [showCloudOverwriteDialog, setShowCloudOverwriteDialog] =
@@ -630,6 +639,15 @@ export function PaintingApp({
     layersBeingExtractedRef,
   } = drawingRefs;
 
+  // Stroke opacity locked at stroke start — see Fix 3 in useCompositing.
+  // Owned here (PaintingApp) so it can be passed to useCompositing as a ref.
+  const strokeActiveLayerOpacityRef = useRef<number | null>(null);
+
+  // strokeActiveRef: true between pointer-down (stroke start) and flushStrokeBuffer commit.
+  // While true, layer canvases are strictly read-only — any write attempt will be blocked
+  // with a console warning. Cleared by flushStrokeBuffer at the end of every stroke.
+  const strokeActiveRef = useRef<boolean>(false);
+
   // ── Grouped state refs ────────────────────────────────────────────────────
   const stateRefs = {
     activeToolRef: useRef(activeTool),
@@ -747,8 +765,6 @@ export function PaintingApp({
     updateNavigatorCanvasRef: useRef<() => void>(() => {}),
     canvasWidthRef: useRef(CANVAS_WIDTH),
     canvasHeightRef: useRef(CANVAS_HEIGHT),
-    // Guard: apply splash-screen dimensions exactly once after the canvas is ready
-    splashDimsAppliedRef: useRef(false),
     _isIPadRef: useRef(
       typeof navigator !== "undefined" &&
         (/iPad/.test(navigator.userAgent) ||
@@ -780,7 +796,6 @@ export function PaintingApp({
     updateNavigatorCanvasRef,
     canvasWidthRef,
     canvasHeightRef,
-    splashDimsAppliedRef,
     _isIPadRef,
     // biome-ignore lint/correctness/noUnusedVariables: kept for potential future use in hotkey config
     rotateHotkeyBehaviorRef,
@@ -800,6 +815,111 @@ export function PaintingApp({
   // Undo/redo stacks (not grouped — used directly as history primitives)
   const undoStackRef = useRef<UndoEntry[]>([]);
   const redoStackRef = useRef<UndoEntry[]>([]);
+
+  // ── getOrCreateLayerCanvas ─────────────────────────────────────────────────
+  // Returns a correctly-sized HTMLCanvasElement for the given layerId.
+  // - Found and correctly sized → return as-is.
+  // - Found but wrong size → resize in place (clears it — a wrongly-sized
+  //   canvas would produce corrupt pixel writes anyway) and return.
+  // - Not found → create new canvas at live dimensions, register, return.
+  //
+  // STROKE GUARD: While strokeActiveRef is true (a stroke is in progress),
+  // layer canvases are strictly read-only. Any code path that would resize or
+  // create a layer canvas mid-stroke is blocked — layer canvases must not be
+  // mutated between pointer-down and flushStrokeBuffer commit.
+  //
+  // Uses canvasWidthRef/canvasHeightRef (live refs, never React state) so the
+  // result is always accurate even if called synchronously during a render.
+  //
+  // Pass this function to useLayerSystem and useCompositing via their props so
+  // canvas creation/validation is centralised here — do NOT duplicate the logic.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: layerCanvasesRef, canvasWidthRef, canvasHeightRef are stable refs
+  const getOrCreateLayerCanvas = useCallback(
+    (layerId: string): HTMLCanvasElement => {
+      const cw = canvasWidthRef.current;
+      const ch = canvasHeightRef.current;
+      const existing = layerCanvasesRef.current.get(layerId);
+      if (existing) {
+        if (existing.width !== cw || existing.height !== ch) {
+          // Guard: never resize a layer canvas during an active stroke — doing so would
+          // clear it and destroy in-progress pixel data.
+          if (strokeActiveRef.current) {
+            console.warn(
+              "[Stroke Guard] blocked resize of layer canvas during active stroke: layer id",
+              layerId,
+            );
+            return existing;
+          }
+          existing.width = cw;
+          existing.height = ch;
+          // After a resize the canvas is cleared — re-fill Background with white
+          const resizedLayerMeta = layersRef.current.find(
+            (l) => l.id === layerId,
+          );
+          if (
+            resizedLayerMeta &&
+            (resizedLayerMeta as { name?: string }).name === "Background"
+          ) {
+            const fillCtx = existing.getContext("2d");
+            if (fillCtx) {
+              fillCtx.fillStyle = "#ffffff";
+              fillCtx.fillRect(0, 0, cw, ch);
+            }
+          }
+        }
+        return existing;
+      }
+      // Guard: never create a new layer canvas during an active stroke — the stroke
+      // pipeline has already captured a snapshot and must not see a new empty canvas.
+      if (strokeActiveRef.current) {
+        console.warn(
+          "[Stroke Guard] blocked creation of layer canvas during active stroke: layer id",
+          layerId,
+        );
+        // Return a dummy empty canvas rather than null to avoid null-dereference crashes.
+        // The stroke will paint to this temporary canvas and the result will be discarded
+        // at the next non-stroke composite.
+        const dummy = document.createElement("canvas");
+        dummy.width = cw;
+        dummy.height = ch;
+        return dummy;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = cw;
+      canvas.height = ch;
+      // If this is a Background layer being created for the first time (e.g. recovered
+      // by getOrCreateLayerCanvas after a missing-canvas scenario), fill it with opaque
+      // white so it is never transparent. Identify by layer name, not by hardcoded ID.
+      const layerMeta = layersRef.current.find((l) => l.id === layerId);
+      if (layerMeta && (layerMeta as { name?: string }).name === "Background") {
+        const fillCtx = canvas.getContext("2d");
+        if (fillCtx) {
+          fillCtx.fillStyle = "#ffffff";
+          fillCtx.fillRect(0, 0, cw, ch);
+        }
+      }
+      layerCanvasesRef.current.set(layerId, canvas);
+      console.debug(
+        `[Canvas] Created missing canvas for layer ${layerId} at ${cw}×${ch}`,
+      );
+      return canvas;
+    },
+    [],
+  );
+
+  // ── Spring-loaded tool switching refs ─────────────────────────────────────
+  // Owned by PaintingApp so they can be cleared from the toolbar click handler.
+  const springLoadedPreviousToolRef = useRef<Tool | null>(null);
+  const springLoadedKeyRef = useRef<string | null>(null);
+  const pendingSpringRestoreRef = useRef<boolean>(false);
+  // holdTimerRef: the pending 500ms timer before spring-load activates.
+  // Non-null means the key is held but the timer hasn't fired yet (tap window).
+  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // pendingSpringKeyRef: the key that was pressed and is awaiting the hold timer.
+  // Set on keydown, cleared on keyup or timer fire.
+  const pendingSpringKeyRef = useRef<string | null>(null);
+  // pendingSpringToolRef: the target tool waiting to be activated by the hold timer.
+  const pendingSpringToolRef = useRef<Tool | null>(null);
 
   // ─── useStrokeEngine: stroke lifecycle, stampWebGL, smudge, tail RAF ──────
   const {
@@ -858,6 +978,16 @@ export function PaintingApp({
   const pushHistoryForHooks = useCallback((entry: UndoEntry) => {
     pushHistoryRef.current(entry);
   }, []);
+
+  // Refs for useLayerSystem's applyLayerEntry / undoLayerEntry — populated after
+  // useLayerSystem is called, below. useHistory is called before useLayerSystem so
+  // these refs bridge the ordering gap without changing hook call order.
+  const applyLayerEntryRef = useRef<
+    (entry: import("../hooks/useLayerSystem").LayerSystemEntry) => void
+  >(() => {});
+  const undoLayerEntryRef = useRef<
+    (entry: import("../hooks/useLayerSystem").LayerSystemEntry) => void
+  >(() => {});
 
   // ── Selection animation + lasso refs (not grouped) ─────────────────────────
   const lassoModeRef = useRef<LassoMode>("free");
@@ -1067,6 +1197,10 @@ export function PaintingApp({
   // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
   useEffect(() => {
     layersRef.current = layers;
+    console.log(
+      "[Reorder] layersRef updated, ids:",
+      layers.map((l) => l.id),
+    );
     const al = layers.find((l) => l.id === activeLayerIdRef.current);
     activeLayerAlphaLockRef.current = al?.alphaLock ?? false;
     // Invalidate below/above stroke canvas cache whenever layer stack changes
@@ -1140,6 +1274,18 @@ export function PaintingApp({
   // Stable ref for updateNavigatorCanvas — now in uiRefs group (declared above).
   // The .current is synced to the real callback after it is defined.
 
+  // ---- Layer tree stable refs (declared early, before useSelectionSystem and useTransformSystem) ----
+  // These are populated/synced once useLayerSystem returns below.
+  // layerTreeRef: still referenced by useTransformSystem and useCursorSystem as an optional param.
+  // It is kept as a stub (always empty array) — the flat layers array is now the source of truth.
+  const layerTreeRef = useRef<import("../types").LayerNode[]>([]);
+  const selectedLayerIdsRef = useRef<Set<string>>(new Set());
+  // setLayerTreeRef: kept as a no-op stub for hooks that accept it as an optional param
+  // (useSelectionSystem, useHistory, useFileIOSystem). Declared before useSelectionSystem.
+  const setLayerTreeRef = useRef<
+    React.Dispatch<React.SetStateAction<import("../types").LayerNode[]>>
+  >(() => {});
+
   // ---- Selection system hook ----
   const {
     selectionActive,
@@ -1180,6 +1326,7 @@ export function PaintingApp({
     compositeRef,
     markLayerBitmapDirty,
     rebuildChainsNowRef,
+    setLayerTreeRef,
   });
 
   // Wire cancelBoundaryRebuildRef — called by clearSelection() to clear stale chains.
@@ -1206,14 +1353,8 @@ export function PaintingApp({
     };
   }, [selectionBoundaryPathRef]);
 
-  // ---- Layer tree stable refs (declared early for useTransformSystem) ----
-  // These are populated/synced once useLayerSystem returns below.
-  const layerTreeRef = useRef<import("../types").LayerNode[]>([]);
-  const selectedLayerIdsRef = useRef<Set<string>>(new Set());
-  // Stable ref for setLayerTree — populated after useLayerSystem returns below.
-  const setLayerTreeRef = useRef<
-    React.Dispatch<React.SetStateAction<import("../types").LayerNode[]>>
-  >(() => {});
+  // ---- Layer tree stable refs (declared early for useTransformSystem and useSelectionSystem) ----
+  // (moved before useSelectionSystem — see declaration above)
 
   // BUG_3b: Stable ref to markLayerBitmapDirty so useTransformSystem can call it
   const markLayerBitmapDirtyRef =
@@ -1250,7 +1391,8 @@ export function PaintingApp({
     setRedoCount,
     layerCanvasesRef,
     activeLayerIdRef,
-    layerTreeRef,
+    layersRef,
+    viewTransformRef,
     selectedLayerIdsRef,
     undoStackRef,
     redoStackRef,
@@ -1263,6 +1405,7 @@ export function PaintingApp({
     rebuildChainsNowRef,
     markLayerBitmapDirtyRef,
     layersBeingExtractedRef,
+    strokeCanvasCacheKeyRef,
   });
 
   // ─── useCompositing: composite, compositeWithStrokePreview, buildStrokeCanvases, etc. ──
@@ -1271,7 +1414,7 @@ export function PaintingApp({
     compositeWithStrokePreview,
     buildStrokeCanvases,
     flushStrokeBuffer,
-    scheduleComposite,
+    scheduleComposite: _rawScheduleComposite,
     _strokeCommitDirty,
   } = useCompositing({
     displayCanvasRef,
@@ -1281,17 +1424,18 @@ export function PaintingApp({
     activePreviewCanvasRef,
     strokeBufferRef,
     layerCanvasesRef,
-    layerTreeRef,
     layersRef,
     activeLayerIdRef,
     activeLayerAlphaLockRef,
     brushBlendModeRef,
     tailRafIdRef,
     needsFullCompositeRef,
+    strokeActiveRef,
     strokeDirtyRectRef,
     strokeStartSnapshotRef,
     strokeCanvasCacheKeyRef,
     strokeCanvasLastBuiltGenRef,
+    strokeActiveLayerOpacityRef,
     selectionActiveRef,
     selectionMaskRef,
     layersBeingExtractedRef,
@@ -1305,7 +1449,16 @@ export function PaintingApp({
     transformOrigFloatCanvasRef,
     webglBrushRef,
     getActiveSize,
+    getOrCreateLayerCanvas,
   });
+
+  // scheduleComposite — thin wrapper around _rawScheduleComposite.
+  // Option B: no swap guard needed since canvases are owned per-document and
+  // the display canvas is never cleared mid-swap.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: _rawScheduleComposite is a stable fn
+  const scheduleComposite = useCallback(() => {
+    _rawScheduleComposite();
+  }, [_rawScheduleComposite]);
 
   // ---- History hook ----
   // Stable ref pointing to the current revertTransform function (wired up after useTransformSystem)
@@ -1349,6 +1502,9 @@ export function PaintingApp({
         if (!lc) return "";
         return generateLayerThumbnail(lc, getThumbCanvas(), getThumbCtx());
       },
+      // Provide a live flat-array reference so markCanvasDirty can skip thumbnail
+      // regeneration for layers inside collapsed groups (performance B5).
+      getLayers: () => layersRef.current as unknown as FlatEntry[],
     });
   }, [setLayerThumbnails, setNavigatorVersion]);
   const {
@@ -1396,6 +1552,8 @@ export function PaintingApp({
     canvasHeightRef,
     markLayerBitmapDirty,
     invalidateAllLayerBitmaps,
+    applyLayerEntryRef,
+    undoLayerEntryRef,
   });
 
   // Wire revertTransformRef to the current revertTransform from useTransformSystem
@@ -1439,9 +1597,24 @@ export function PaintingApp({
     setUndoCount,
     setRedoCount,
     clearSelection,
-    registerGetSktchBlob,
-    registerLoadFile,
+    registerGetSktchBlob: registerGetSktchBlobFn,
+    registerLoadFile: registerLoadFileFn,
   });
+
+  // ── Multi-document swap ref ────────────────────────────────────────────────
+  // Stable ref holding the three-phase swap function.
+  // The wrapper calls swapDocumentRef.current(fromDoc, toDoc) on tab switch.
+  // The actual implementation is assigned on every render (no deps array) so
+  // it always closes over the latest state and refs.
+  const swapDocumentRef = useRef<
+    (fromDoc: DocumentState, toDoc: DocumentState) => void
+  >(() => {});
+
+  // Register the stable wrapper with DocumentContext so DocumentManager can call it on tab switch
+  // biome-ignore lint/correctness/useExhaustiveDependencies: registerSwapFn is stable
+  useEffect(() => {
+    registerSwapFn((fromDoc, toDoc) => swapDocumentRef.current(fromDoc, toDoc));
+  }, [registerSwapFn]);
 
   // App-level initialization: themes, beforeunload guard, preset loading, hotkey reload
   useAppInitialization({
@@ -1487,7 +1660,7 @@ export function PaintingApp({
   // ─── Fill system ────────────────────────────────────────────────────────────
   const {
     fillMode,
-    setFillMode,
+    updateFillMode,
     fillSettings,
     setFillSettings,
     fillModeRef,
@@ -1498,6 +1671,7 @@ export function PaintingApp({
     gradientDragStartRef,
     gradientDragEndRef,
     isGradientDraggingRef,
+    applyLassoFill,
     handleFillPointerDown,
     handleFillPointerMove,
     handleFillPointerUp,
@@ -1513,6 +1687,13 @@ export function PaintingApp({
     pushHistory,
     composite,
     scheduleComposite,
+    // Kick the marching-ants RAF loop when lasso fill drawing begins so the
+    // in-progress ant trail is visible immediately (loop checks isLassoFillDrawingRef).
+    onLassoFillStart: () => {
+      if (marchingAntsRafRef.current === null && drawAntsRef.current) {
+        marchingAntsRafRef.current = requestAnimationFrame(drawAntsRef.current);
+      }
+    },
   });
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: zoomLockedRef is a stable ref
@@ -1800,10 +1981,13 @@ export function PaintingApp({
       // being drawn (lasso/rect/ellipse draft) so the in-progress preview is visible.
       // BUG_3a FIX: Also keep the loop alive while a transform is active so the
       // transform bounding box is drawn even when no selection is present.
+      // LASSO FILL FIX: Also keep alive while lasso fill is being drawn so the
+      // marching ants trail is visible in real time.
       if (
         !selectionActiveRef.current &&
         !isDrawingSelectionRef.current &&
-        !transformActiveRef.current
+        !transformActiveRef.current &&
+        !isLassoFillDrawingRef.current
       ) {
         marchingAntsRafRef.current = null;
         if (!_overlayCtxCached)
@@ -2120,7 +2304,7 @@ export function PaintingApp({
         }
       }
 
-      // Draw lasso fill in-progress preview — path outline + semi-transparent fill (like scratchpad)
+      // Draw lasso fill in-progress preview — marching ants trail along the smoothed path
       if (
         isLassoFillDrawingRef.current &&
         activeToolRef.current === "fill" &&
@@ -2128,33 +2312,30 @@ export function PaintingApp({
       ) {
         const lfPts = lassoFillPointsRef.current;
         const lfOrigin = lassoFillOriginRef.current;
-        ctx.save();
         if (lfPts.length >= 2) {
-          // Draw semi-transparent filled shape
-          ctx.beginPath();
-          ctx.moveTo(lfPts[0].x, lfPts[0].y);
-          for (let i = 1; i < lfPts.length; i++) {
-            ctx.lineTo(lfPts[i].x, lfPts[i].y);
-          }
-          ctx.closePath();
-          ctx.fillStyle = "rgba(0,120,255,0.12)";
-          ctx.fill();
-          // Draw outline
-          ctx.beginPath();
-          ctx.moveTo(lfPts[0].x, lfPts[0].y);
-          for (let i = 1; i < lfPts.length; i++) {
-            ctx.lineTo(lfPts[i].x, lfPts[i].y);
-          }
-          ctx.closePath();
-          ctx.strokeStyle = "rgba(0,120,255,0.85)";
-          ctx.lineWidth = 1.5;
-          ctx.setLineDash([]);
-          ctx.stroke();
+          // Apply the same Chaikin smoothing used at fill-commit time so the
+          // ant trail and the filled area always match exactly.
+          const smoothedLfPts = chaikinSmooth(lfPts, 2);
+          strokeAnts(0, 0, (c) => {
+            c.moveTo(smoothedLfPts[0].x, smoothedLfPts[0].y);
+            for (let i = 1; i < smoothedLfPts.length; i++) {
+              c.lineTo(smoothedLfPts[i].x, smoothedLfPts[i].y);
+            }
+            // Close path back to origin so user sees the full closed region preview
+            c.lineTo(lfOrigin.x, lfOrigin.y);
+            c.closePath();
+          });
         }
-        // Draw origin pip
+        // Draw origin pip (same style as lasso selection tool)
+        ctx.save();
+        ctx.setLineDash([]);
         ctx.beginPath();
-        ctx.arc(lfOrigin.x, lfOrigin.y, 5, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(0,120,255,0.85)";
+        ctx.arc(lfOrigin.x, lfOrigin.y, 7, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(0,0,0,0.5)";
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(lfOrigin.x, lfOrigin.y, 6, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(255,255,255,0.9)";
         ctx.fill();
         ctx.restore();
       }
@@ -2235,14 +2416,19 @@ export function PaintingApp({
             "s",
             "se",
           ] as const;
+          // Scale handle size inversely with zoom so handles maintain a consistent
+          // screen-pixel footprint. At zoom >= 1 hr = 4 (8×8px handle). When
+          // zoomed out (zoom < 1) hr grows so the handle stays easy to grab.
+          const zoom = viewTransformRef.current.zoom;
+          const hr = Math.max(4, 4 / zoom);
           for (const key of handleKeys) {
             const pt = handles[key] as { x: number; y: number };
             ctx.fillStyle = "white";
             ctx.strokeStyle = "rgba(0,100,220,0.9)";
-            ctx.lineWidth = 1.5;
+            ctx.lineWidth = Math.max(1.5, 1.5 / zoom);
             ctx.setLineDash([]);
-            ctx.fillRect(pt.x - 4, pt.y - 4, 8, 8);
-            ctx.strokeRect(pt.x - 4, pt.y - 4, 8, 8);
+            ctx.fillRect(pt.x - hr, pt.y - hr, hr * 2, hr * 2);
+            ctx.strokeRect(pt.x - hr, pt.y - hr, hr * 2, hr * 2);
           }
           ctx.restore();
         }
@@ -2347,30 +2533,17 @@ export function PaintingApp({
     webglBrushRef.current?.preloadTipTexture(tipImageData);
   }, [brushSettings.tipImageData]);
 
-  // Initialize fixed canvas size
+  // Initialize WebGL brush and auxiliary canvases (one-time setup on mount).
+  // Option B: layer canvases are created inside the swap function (per-document),
+  // NOT here. This effect only sets up the WebGL brush context and the
+  // offscreen compositing canvases that are shared across all documents.
   // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable
   useEffect(() => {
     const display = displayCanvasRef.current;
     if (!display) return;
     display.width = canvasWidthRef.current;
     display.height = canvasHeightRef.current;
-    for (const [id, lc] of layerCanvasesRef.current) {
-      lc.width = canvasWidthRef.current;
-      lc.height = canvasHeightRef.current;
-      // Fill background layer (last layer, named "Background") with white
-      if (id === "layer-2") {
-        const bgCtx = lc.getContext("2d", { willReadFrequently: !isIPad });
-        if (bgCtx) {
-          bgCtx.fillStyle = "#ffffff";
-          bgCtx.fillRect(0, 0, canvasWidthRef.current, canvasHeightRef.current);
-          // Mark dirty so getBitmapOrCanvas doesn't serve a stale transparent bitmap
-          // that was cached before the white fill ran.
-          markLayerBitmapDirty(id);
-          // Generate initial thumbnail for the white background layer
-          markCanvasDirty(id);
-        }
-      }
-    }
+
     const glBrush = createWebGLBrushContext(
       canvasWidthRef.current,
       canvasHeightRef.current,
@@ -2400,121 +2573,11 @@ export function PaintingApp({
     activePreviewCanvasRef.current = makeOffscreenCanvas();
 
     scheduleComposite();
-    // The composite-done callback (registered above) will update the navigator
-    // automatically after scheduleComposite fires composite().
 
     return () => {
       webglBrushRef.current?.dispose();
     };
   }, [scheduleComposite]);
-
-  // Apply exact dimensions chosen on the splash screen.
-  // PaintingApp is always mounted before the splash resolves, so we can't use
-  // useState(initialCanvasWidth) — it would capture `undefined`. Instead, we
-  // watch the prop and apply the resize once, after the canvas is fully set up.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: composite/updateNavigatorCanvas are stable refs
-  useEffect(() => {
-    if (splashDimsAppliedRef.current) return;
-    if (!initialCanvasWidth || !initialCanvasHeight) return;
-    const display = displayCanvasRef.current;
-    if (!display) return;
-
-    splashDimsAppliedRef.current = true;
-
-    const newW = Math.max(1, Math.round(initialCanvasWidth));
-    const newH = Math.max(1, Math.round(initialCanvasHeight));
-
-    // Resize every layer canvas to the chosen dimensions, refilling the background white
-    const nonRulerLayers = layersRef.current.filter((l) => !l.isRuler);
-    const backgroundLayerId =
-      nonRulerLayers.length > 0
-        ? nonRulerLayers[nonRulerLayers.length - 1].id
-        : null;
-    for (const [id, lc] of layerCanvasesRef.current) {
-      lc.width = newW;
-      lc.height = newH;
-      if (id === backgroundLayerId) {
-        const bgCtx = lc.getContext("2d", { willReadFrequently: !isIPad });
-        if (bgCtx) {
-          bgCtx.fillStyle = "#ffffff";
-          bgCtx.fillRect(0, 0, newW, newH);
-          markLayerBitmapDirty(id);
-          markCanvasDirty(id);
-        }
-      }
-    }
-
-    // Resize display canvas
-    display.width = newW;
-    display.height = newH;
-
-    // Invalidate context caches (dimensions changed)
-    invalidateCompositeContextCaches();
-    _overlayCtxCached = null;
-
-    // Resize ruler overlay canvas
-    if (rulerCanvasRef.current) {
-      rulerCanvasRef.current.width = newW;
-      rulerCanvasRef.current.height = newH;
-    }
-
-    // Resize WebGL stroke buffer
-    if (webglBrushRef.current) {
-      webglBrushRef.current.resize(newW, newH);
-    }
-
-    // Resize offscreen compositing canvases
-    for (const canvasRef of [
-      belowActiveCanvasRef,
-      aboveActiveCanvasRef,
-      snapshotCanvasRef,
-      activePreviewCanvasRef,
-    ]) {
-      if (canvasRef.current) {
-        canvasRef.current.width = newW;
-        canvasRef.current.height = newH;
-      }
-    }
-
-    // Update navigator thumbnail canvas aspect ratio
-    _navThumbCanvas.width = NAV_THUMB_W;
-    _navThumbCanvas.height = Math.round(NAV_THUMB_W * (newH / newW));
-
-    // Sync state and refs to the new dimensions
-    canvasWidthRef.current = newW;
-    canvasHeightRef.current = newH;
-    setCanvasWidth(newW);
-    setCanvasHeight(newH);
-
-    // Invalidate the below/above stroke canvas cache — resizing those canvases cleared
-    // them to transparent. Without this bump the first stroke sees cacheValid=true and
-    // skips the rebuild, causing compositeWithStrokePreview to draw a transparent below.
-    strokeCanvasCacheKeyRef.current++;
-    // Force the next composite() to do a full repaint so dirty-rect optimisation
-    // cannot run against a just-cleared display canvas.
-    needsFullCompositeRef.current = true;
-
-    // Fit the canvas to the viewport
-    const container = containerRef.current;
-    if (container) {
-      const cw = container.clientWidth;
-      const ch = container.clientHeight;
-      const zoom = Math.min((cw * 0.85) / newW, (ch * 0.85) / newH, 1);
-      const vt = { zoom, panX: 0, panY: 0, rotation: 0 };
-      viewTransformRef.current = vt;
-      setViewTransform(vt);
-      applyTransformToDOMRef.current(vt);
-    }
-
-    composite();
-    updateNavigatorCanvas();
-  }, [
-    initialCanvasWidth,
-    initialCanvasHeight,
-    composite,
-    updateNavigatorCanvas,
-    markLayerBitmapDirty,
-  ]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: applyTransformToDOMRef is a stable ref
   const resetView = useCallback(() => {
@@ -2531,17 +2594,33 @@ export function PaintingApp({
     const _stack = undoStackRef.current;
     const _first = _stack[_stack.length - _d];
     const _last = _stack[_stack.length - 1];
-    if (
-      _first &&
-      _last &&
-      _first !== _last &&
-      (_first as { type: string }).type === "ruler-edit" &&
-      (_last as { type: string }).type === "ruler-edit"
-    ) {
-      (_first as unknown as { after: unknown }).after = (
-        _last as unknown as { after: unknown }
-      ).after;
+    if (_first && _last && _first !== _last) {
+      const firstType = (_first as { type: string }).type;
+      const lastType = (_last as { type: string }).type;
+      if (firstType === "ruler-edit" && lastType === "ruler-edit") {
+        // Both are ruler-edits: merge final state into the first entry
+        (_first as unknown as { after: unknown }).after = (
+          _last as unknown as { after: unknown }
+        ).after;
+      } else if (firstType === "layer-add" && lastType === "ruler-edit") {
+        // Base is a ruler layer-add: fold final ruler state into the layer object
+        // so a single Ctrl+Z undoes the entire ruler creation.
+        const layerAddEntry = _first as unknown as {
+          type: "layer-add";
+          layer: { [key: string]: unknown };
+        };
+        const lastRulerEdit = _last as unknown as {
+          type: "ruler-edit";
+          after: { [key: string]: unknown };
+        };
+        // Merge all ruler-edit "after" fields into the layer-add layer
+        layerAddEntry.layer = {
+          ...layerAddEntry.layer,
+          ...lastRulerEdit.after,
+        };
+      }
     }
+    // Splice out all ruler-edit entries after the base entry (layer-add or first ruler-edit)
     _stack.splice(-(_d - 1), _d - 1);
     rulerEditHistoryDepthRef.current = 1;
     setUndoCount(_stack.length);
@@ -2553,6 +2632,56 @@ export function PaintingApp({
     redoStackRef,
     setUndoCount,
     setRedoCount,
+  ]);
+
+  /**
+   * Wraps handleUndo to detect when a ruler layer-add entry was just undone.
+   * If the user is in ruler tool mode but no ruler layer remains after the undo,
+   * automatically switch back to the last paint tool so the UI stays consistent.
+   */
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
+  const handleUndoWithRulerToolSwitch = useCallback(() => {
+    // Peek at the top entry before undoing to check if it's a ruler layer-add
+    const topEntry = undoStackRef.current[undoStackRef.current.length - 1];
+    const isRulerLayerAdd =
+      topEntry &&
+      (topEntry as { type: string }).type === "layer-add" &&
+      (topEntry as { layer: { isRuler?: boolean } }).layer?.isRuler === true;
+
+    handleUndo();
+
+    // After undo: if a ruler layer-add was removed and the ruler tool is still active,
+    // switch back to the last paint tool so the user can draw immediately.
+    if (isRulerLayerAdd && activeToolRef.current === "ruler") {
+      const restoreTool = lastPaintToolRef2.current ?? "brush";
+      setActiveTool(restoreTool);
+      activeToolRef.current = restoreTool;
+      rulerEditHistoryDepthRef.current = 0;
+      if (
+        restoreTool === "brush" ||
+        restoreTool === "smudge" ||
+        restoreTool === "eraser"
+      ) {
+        setActiveSubpanel(restoreTool as "brush" | "smudge" | "eraser");
+      } else {
+        setActiveSubpanel(null);
+      }
+      if (lastPaintLayerIdRef.current) {
+        setActiveLayerId(lastPaintLayerIdRef.current);
+        activeLayerIdRef.current = lastPaintLayerIdRef.current;
+      }
+    }
+  }, [
+    handleUndo,
+    undoStackRef,
+    activeToolRef,
+    lastPaintToolRef2,
+    lastPaintLayerIdRef,
+    activeLayerIdRef,
+    rulerEditHistoryDepthRef,
+    setActiveTool,
+    setActiveSubpanel,
+    setActiveLayerId,
   ]);
 
   // stampDot, normalizePressure, flushStrokeBuffer → now from useStrokeEngine/useCompositing hooks
@@ -2578,6 +2707,292 @@ export function PaintingApp({
   }, [layers, activeLayerId]); // eslint-disable-line
   // compositeWithStrokePreview, buildStrokeCanvases, stampWebGL, renderBrushSegmentAlongPoints,
   // renderSmearAlongPoints → all moved to useCompositing/useStrokeEngine hooks.
+
+  // ── Option B document swap implementation ────────────────────────────────
+  // Each document owns its layer canvases in doc.layerCanvases (a Map).
+  // Switching tabs = re-point layerCanvasesRef at the new doc's map + composite().
+  // No getImageData, no putImageData, no pixel data loss risk.
+  //
+  // Runs on every render (no deps) to keep the ref current with latest state and refs.
+  // swapDocumentRef.current(fromDoc, toDoc) is called by DocumentManager on tab switch.
+  useEffect(() => {
+    swapDocumentRef.current = (
+      fromDoc: DocumentState,
+      toDoc: DocumentState,
+    ): void => {
+      // ── SAVE: Write all current non-pixel state into fromDoc ───────────────
+      // Pixel data is NOT saved here — it's already live in fromDoc.layerCanvases.
+      fromDoc.layers = [...layersRef.current];
+      fromDoc.activeLayerId = activeLayerIdRef.current;
+      fromDoc.undoStack = structuredClone(undoStackRef.current);
+      fromDoc.redoStack = structuredClone(redoStackRef.current);
+      fromDoc.viewTransform = { ...viewTransformRef.current };
+      fromDoc.isFlipped = isFlippedRef.current;
+      fromDoc.isDirty = isDirtyRef.current;
+      fromDoc.canvasWidth = canvasWidthRef.current;
+      fromDoc.canvasHeight = canvasHeightRef.current;
+      fromDoc.activeTool = activeToolRef.current;
+      fromDoc.brushSettings = brushSettings ? { ...brushSettings } : null;
+      fromDoc.brushSizes = { ...brushSizes };
+      fromDoc.brushBlendMode = brushBlendMode;
+      fromDoc.color = color ? { ...color } : null;
+      fromDoc.recentColors = [...recentColors];
+      fromDoc.lassoMode = lassoMode;
+      fromDoc.activeRulerPresetType = activeRulerPresetType;
+      fromDoc.wandTolerance = wandTolerance;
+      fromDoc.wandContiguous = wandContiguous;
+      // BUG-005 FIX: Read from ref (always current) rather than React state
+      // (which can be stale when called synchronously during a render cycle).
+      fromDoc.activeSubpanel = activeSubpanelRef.current;
+      fromDoc.layerThumbnails = { ...layerThumbnails };
+
+      // ── INITIALIZE: If toDoc has no layers, create Layer 1 + Background ──
+      // Canvases are created here and stored in toDoc.layerCanvases so they
+      // survive across tab switches without ever needing save/restore.
+      if (toDoc.layers.length === 0) {
+        const newW = Math.max(1, toDoc.canvasWidth);
+        const newH = Math.max(1, toDoc.canvasHeight);
+
+        // Generate globally unique IDs so that two documents with the same
+        // layer structure never collide in layerCanvasMap.
+        const layer1Id = generateLayerId();
+        const bgLayerId = generateLayerId();
+
+        const layer1: Layer = {
+          id: layer1Id,
+          name: "Layer 1",
+          type: "paint",
+          visible: true,
+          opacity: 1,
+          blendMode: "source-over",
+          isClippingMask: false,
+          alphaLock: false,
+        };
+        const bgLayer: Layer = {
+          id: bgLayerId,
+          name: "Background",
+          type: "paint",
+          visible: true,
+          opacity: 1,
+          blendMode: "source-over",
+          isClippingMask: false,
+          alphaLock: false,
+        };
+
+        // Layer 1 canvas — transparent
+        const l1Canvas = document.createElement("canvas");
+        l1Canvas.width = newW;
+        l1Canvas.height = newH;
+        toDoc.layerCanvases.set(layer1.id, l1Canvas);
+
+        // Background canvas — filled white
+        const bgCanvas = document.createElement("canvas");
+        bgCanvas.width = newW;
+        bgCanvas.height = newH;
+        const bgCtx = bgCanvas.getContext("2d", {
+          willReadFrequently: !isIPad,
+        });
+        if (bgCtx) {
+          bgCtx.fillStyle = "#ffffff";
+          bgCtx.fillRect(0, 0, newW, newH);
+        }
+        toDoc.layerCanvases.set(bgLayer.id, bgCanvas);
+
+        // Layer 1 at index 0 (top), Background at index 1 (bottom).
+        // Composite loop iterates BACKWARDS: high index = bottom, low = top.
+        toDoc.layers = [layer1, bgLayer];
+        toDoc.activeLayerId = layer1Id;
+
+        // Fit new canvas to viewport
+        const containerNew = containerRef.current;
+        if (containerNew) {
+          const cw = containerNew.clientWidth;
+          const ch = containerNew.clientHeight;
+          const zoom = Math.min((cw * 0.85) / newW, (ch * 0.85) / newH, 1);
+          const vt = { zoom, panX: 0, panY: 0, rotation: 0 };
+          viewTransformRef.current = vt;
+          applyTransformToDOMRef.current(vt);
+          toDoc.viewTransform = { ...vt };
+        }
+      }
+
+      const newW = Math.max(1, toDoc.canvasWidth);
+      const newH = Math.max(1, toDoc.canvasHeight);
+
+      // ── SWAP (synchronous) ─────────────────────────────────────────────────
+      clearSelection();
+      invalidateAllLayerBitmaps();
+
+      // 1. Point layerCanvasesRef at the incoming document's canvas map.
+      //    This is the core of Option B — no pixel data copy needed.
+      layerCanvasesRef.current = toDoc.layerCanvases;
+
+      // 2. Resize display canvas if dimensions differ
+      if (displayCanvasRef.current) {
+        if (
+          displayCanvasRef.current.width !== newW ||
+          displayCanvasRef.current.height !== newH
+        ) {
+          displayCanvasRef.current.width = newW;
+          displayCanvasRef.current.height = newH;
+        }
+      }
+
+      // 3. Resize auxiliary canvases (ruler, webgl brush, offscreen compositing)
+      if (rulerCanvasRef.current) {
+        rulerCanvasRef.current.width = newW;
+        rulerCanvasRef.current.height = newH;
+      }
+      if (webglBrushRef.current) {
+        webglBrushRef.current.resize(newW, newH);
+      }
+      for (const offscreen of [
+        belowActiveCanvasRef,
+        aboveActiveCanvasRef,
+        snapshotCanvasRef,
+        activePreviewCanvasRef,
+      ]) {
+        if (offscreen.current) {
+          offscreen.current.width = newW;
+          offscreen.current.height = newH;
+        }
+      }
+      invalidateCompositeContextCaches();
+      _overlayCtxCached = null;
+      strokeCanvasCacheKeyRef.current++;
+      needsFullCompositeRef.current = true;
+
+      // 4. Update all refs from toDoc
+      canvasWidthRef.current = newW;
+      canvasHeightRef.current = newH;
+      layersRef.current = [...toDoc.layers];
+      activeLayerIdRef.current = toDoc.activeLayerId;
+      setActiveLayerIdForBitmap(toDoc.activeLayerId);
+      undoStackRef.current = structuredClone(toDoc.undoStack);
+      redoStackRef.current = structuredClone(toDoc.redoStack);
+      viewTransformRef.current = { ...toDoc.viewTransform };
+      isFlippedRef.current = toDoc.isFlipped;
+      brushBlendModeRef.current = toDoc.brushBlendMode;
+      activeToolRef.current = toDoc.activeTool as Tool;
+      activeSubpanelRef.current = toDoc.activeSubpanel as Tool | null;
+      isDirtyRef.current = toDoc.isDirty;
+      applyTransformToDOMRef.current({ ...toDoc.viewTransform });
+
+      // Mark all layer bitmaps dirty so composite() re-reads fresh canvases
+      for (const layer of toDoc.layers) {
+        if (layer.type !== undefined && layer.type !== "paint") continue;
+        if (layer.isRuler) continue;
+        markLayerBitmapDirty(layer.id);
+      }
+
+      // 5a. Ensure Background layer has white fill on the incoming document.
+      //     Covers the file-load case where pixelData was null and the canvas
+      //     was created empty, as well as any document where the Background
+      //     canvas was silently cleared by an earlier resize.
+      for (const layer of toDoc.layers) {
+        if (layer.type !== "paint") continue;
+        const layerMeta = layer as { name?: string };
+        if (layerMeta.name !== "Background") continue;
+        const bgCanvas =
+          layerCanvasesRef.current.get(layer.id) ||
+          getOrCreateLayerCanvas(layer.id);
+        const bgCtx = bgCanvas.getContext("2d");
+        if (bgCtx) {
+          const imageData = bgCtx.getImageData(
+            0,
+            0,
+            Math.max(1, bgCanvas.width),
+            Math.max(1, bgCanvas.height),
+          );
+          const hasPixels = imageData.data.some((v, i) => i % 4 === 3 && v > 0);
+          if (!hasPixels) {
+            bgCtx.fillStyle = "#ffffff";
+            bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+            // Invalidate the cached bitmap so composite() re-reads the filled canvas
+            markLayerBitmapDirty(layer.id);
+          }
+        }
+      }
+
+      // ── BUG-004 FIX: Validate canvases before first composite ─────────────
+      // After canvases are created/pointed at for toDoc, verify every paint
+      // layer has a correctly-sized canvas before compositeAllLayers() runs.
+      // Warn and auto-create/resize any canvas that is missing or wrong-sized.
+      // This guard prevents silent corruption when a canvas is absent or was
+      // resized to wrong dimensions before the swap settled.
+      for (const layer of toDoc.layers) {
+        if (layer.type !== undefined && layer.type !== "paint") continue;
+        if (layer.isRuler) continue;
+        const existingCanvas = layerCanvasesRef.current.get(layer.id);
+        if (
+          !existingCanvas ||
+          existingCanvas.width !== newW ||
+          existingCanvas.height !== newH
+        ) {
+          console.warn(
+            `[Canvas Validation] Missing or wrong-size canvas for layer ${layer.id} ("${(layer as { name?: string }).name ?? "?"}") — expected ${newW}×${newH}, got ${existingCanvas ? `${existingCanvas.width}×${existingCanvas.height}` : "none"}. Auto-creating.`,
+          );
+          const recovered = existingCanvas ?? document.createElement("canvas");
+          recovered.width = newW;
+          recovered.height = newH;
+          // Re-fill Background if it was just cleared by resize
+          if ((layer as { name?: string }).name === "Background") {
+            const rCtx = recovered.getContext("2d");
+            if (rCtx) {
+              rCtx.fillStyle = "#ffffff";
+              rCtx.fillRect(0, 0, newW, newH);
+            }
+          }
+          layerCanvasesRef.current.set(layer.id, recovered);
+          toDoc.layerCanvases.set(layer.id, recovered);
+          markLayerBitmapDirty(layer.id);
+        }
+      }
+
+      // 5b. Composite synchronously — pixels are already on the layer canvases
+      composite();
+      updateNavigatorCanvas();
+
+      // ── REACT SYNC (rAF — only affects UI chrome, not canvas pixels) ──────
+      requestAnimationFrame(() => {
+        setLayers([...toDoc.layers]);
+        // BUG-006 FIX: Advance the group ID counter past any group IDs present in
+        // the incoming document's layer array. This prevents newly-created groups
+        // in this document from colliding with group IDs that were loaded from a
+        // file or imported from another document. Must be called here (in addition
+        // to handleLoadFile) because the swap path is also a bulk layer restore.
+        resetGroupIdCounterFromFlat(toDoc.layers as FlatEntry[]);
+        setActiveLayerId(toDoc.activeLayerId);
+        setCanvasWidth(newW);
+        setCanvasHeight(newH);
+        setViewTransform({ ...toDoc.viewTransform });
+        setIsFlipped(toDoc.isFlipped);
+        setActiveTool(toDoc.activeTool as Tool);
+        if (toDoc.brushSettings) setBrushSettings(toDoc.brushSettings);
+        setBrushSizes(toDoc.brushSizes);
+        setBrushBlendMode(toDoc.brushBlendMode);
+        if (toDoc.color) setColor(toDoc.color);
+        setRecentColors(toDoc.recentColors);
+        setLassoMode(toDoc.lassoMode as LassoMode);
+        setActiveRulerPresetType(
+          toDoc.activeRulerPresetType as RulerPresetType,
+        );
+        setWandTolerance(toDoc.wandTolerance);
+        setWandContiguous(toDoc.wandContiguous);
+        setActiveSubpanel(toDoc.activeSubpanel as Tool | null);
+        setHasUnsavedChanges(toDoc.isDirty);
+        setLayerThumbnails(toDoc.layerThumbnails);
+        setUndoCount(toDoc.undoStack.length);
+        setRedoCount(toDoc.redoStack.length);
+
+        // Re-composite after React re-render to confirm pixels are displayed
+        layersRef.current = [...toDoc.layers];
+        composite();
+        updateNavigatorCanvas();
+      });
+    };
+  }); // No deps array — runs after every render to keep refs current
+
   // Apply view transform directly to DOM during gesture — no React re-render
   // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable
   const applyTransformToDOM = useCallback((vt: ViewTransform) => {
@@ -2600,9 +3015,12 @@ export function PaintingApp({
   // overwrite the DOM transform with the stale React state value.
   // By running applyTransformToDOM here, we ensure every render that touches viewTransform
   // or isFlipped also pushes the correct transform to the DOM immediately after paint.
+  // Also schedule a ruler overlay redraw so the ruler canvas (which applies the view
+  // transform manually) stays in sync with pan/zoom/rotation/flip changes.
   // biome-ignore lint/correctness/useExhaustiveDependencies: applyTransformToDOM is stable
   useEffect(() => {
     applyTransformToDOM(viewTransform);
+    scheduleRulerOverlayRef.current();
   }, [viewTransform, isFlipped, applyTransformToDOM]);
 
   // Keep the selection overlay canvas pixel dimensions in sync with the main canvas.
@@ -2628,22 +3046,56 @@ export function PaintingApp({
 
   // ---- Ruler overlay rendering ----
   // Delegates to the four ruler sub-hooks which contain the drawing logic.
+  // The ruler canvas is sized to the container viewport (not the canvas rect) so
+  // ruler lines can extend past canvas boundaries into the surrounding background.
+  // We apply a context transform that maps canvas-space coordinates to container
+  // space so all existing draw functions work without change.
   // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable
   const drawRulerOverlay = useCallback(() => {
     const rc = rulerCanvasRef.current;
     if (!rc) return;
+    const container = containerRef.current;
+    if (!container) return;
     const ctx = rc.getContext("2d");
     if (!ctx) return;
+
+    // Resize canvas to container dimensions so ruler lines are not clipped.
+    const cw = container.clientWidth;
+    const ch = container.clientHeight;
+    if (rc.width !== cw || rc.height !== ch) {
+      rc.width = cw;
+      rc.height = ch;
+    }
+
     ctx.clearRect(0, 0, rc.width, rc.height);
 
+    // Always read fresh from the ref — never use a captured/stale variable
     const rulerLayer = layersRef.current.find((l) => l.isRuler);
     if (!rulerLayer || !rulerLayer.visible) return;
 
     const opacity = rulerLayer.opacity;
     const presetType = rulerLayer.rulerPresetType ?? "perspective-1pt";
 
+    // Build the canvas-space → container-space transform.
+    // This replicates the CSS transform applied to canvasWrapperRef so that
+    // canvas-space 0,0 maps to the canvas's on-screen top-left corner.
+    const vt = viewTransformRef.current;
+    const flip = isFlippedRef.current ? -1 : 1;
+    const rad = (vt.rotation * Math.PI) / 180;
+    const W = canvasWidthRef.current;
+    const H = canvasHeightRef.current;
+
     ctx.save();
     ctx.globalAlpha = opacity;
+
+    // Translate to container center + pan offset
+    ctx.translate(cw / 2 + vt.panX, ch / 2 + vt.panY);
+    // Apply rotation
+    ctx.rotate(rad);
+    // Apply zoom and horizontal flip
+    ctx.scale(vt.zoom * flip, vt.zoom);
+    // Translate so that canvas-space 0,0 maps correctly
+    ctx.translate(-W / 2, -H / 2);
 
     if (presetType === "line") {
       lineRuler.drawLineRulerOverlay(ctx, rulerLayer);
@@ -2853,6 +3305,7 @@ export function PaintingApp({
     drawBrushTipOverlay,
     getCursorStyle,
     sampleEyedropperColor,
+    updateTransformCursorForHandle,
   } = useCursorSystem({
     activeTool,
     color,
@@ -2877,7 +3330,6 @@ export function PaintingApp({
     viewTransformRef,
     eyedropperHoverColorRef,
     layerCanvasesRef,
-    layerTreeRef,
     selectedLayerIdsRef,
     activeLayerIdRef,
     eyedropperSampleSourceRef,
@@ -2909,6 +3361,8 @@ export function PaintingApp({
     handleRenameLayer,
     handleToggleAlphaLock,
     handleSetOpacity,
+    handleSetOpacityLive,
+    handleSetOpacityCommit,
     handleMergeLayers,
     handleMergeLayersRef,
     handleToggleClippingMask,
@@ -2921,13 +3375,18 @@ export function PaintingApp({
     handleToggleGroupCollapse: _handleToggleGroupCollapse,
     handleRenameGroup: _handleRenameGroup,
     handleSetGroupOpacity: _handleSetGroupOpacity,
+    handleSetGroupOpacityLive: _handleSetGroupOpacityLive,
+    handleSetGroupOpacityCommit: _handleSetGroupOpacityCommit,
     handleToggleGroupVisible: _handleToggleGroupVisible,
     handleReorderTree: _handleReorderTree,
-    layerTree,
-    setLayerTree: _setLayerTree,
+    handleReorderTreeSilent: _handleReorderTreeSilent,
+    handleReorderLayersSilent: _handleReorderLayersSilent,
+    handleCommitReorderHistory: _handleCommitReorderHistory,
     selectedLayerIds,
     setSelectedLayerIds,
     handleToggleLayerSelection: _handleToggleLayerSelection,
+    applyLayerEntry,
+    undoLayerEntry,
   } = useLayerSystem({
     layers,
     setLayers,
@@ -2950,23 +3409,23 @@ export function PaintingApp({
     // This ensures extractFloat always reads the correct selection even when called
     // in the same event-loop tick as a layer-selection click.
     selectedLayerIdsRef,
+    getOrCreateLayerCanvas,
   });
 
-  // Stable refs that mirror layerTree and selectedLayerIds state for context consumers
-  // (Refs declared earlier near useTransformSystem — only sync effects here)
-  useEffect(() => {
-    layerTreeRef.current = layerTree;
-  }, [layerTree]);
-  // selectedLayerIdsRef is now also updated synchronously inside handleToggleLayerSelection,
+  // selectedLayerIdsRef is also updated synchronously inside handleToggleLayerSelection,
   // but we keep this effect as a fallback for any other setSelectedLayerIds call sites
   // (layer add, group create, undo/redo, etc.) that don't go through the toggle handler.
   useEffect(() => {
     selectedLayerIdsRef.current = selectedLayerIds;
   }, [selectedLayerIds]);
-  // Keep setLayerTreeRef in sync so useHistory can call it for group undo/redo
+  // Keep applyLayerEntryRef / undoLayerEntryRef in sync so useHistory delegates
+  // pure layer-state undo/redo to useLayerSystem without prop-ordering issues.
   useEffect(() => {
-    setLayerTreeRef.current = _setLayerTree;
-  }, [_setLayerTree]);
+    applyLayerEntryRef.current = applyLayerEntry;
+  }, [applyLayerEntry]);
+  useEffect(() => {
+    undoLayerEntryRef.current = undoLayerEntry;
+  }, [undoLayerEntry]);
 
   // ── usePaintingCanvasEvents: wires all keyboard/wheel/touch/pointer events ─
   // canvasEventCallbacksRef is updated every render so event handlers always
@@ -3003,7 +3462,7 @@ export function PaintingApp({
     {} as PaintingCanvasEventsCallbacks,
   );
   canvasEventCallbacksRef.current = {
-    handleUndo,
+    handleUndo: handleUndoWithRulerToolSwitch,
     handleRedo,
     pasteFloat: (img: HTMLImageElement) => {
       const layerId = activeLayerIdRef.current;
@@ -3083,6 +3542,8 @@ export function PaintingApp({
     setActiveSubpanel,
     setActiveLayerId,
     setLayers,
+    // setLayerTree: no-op stub — flat array is the single source of truth
+    setLayerTree: () => {},
     setViewTransform,
     setIsFlipped,
     setBrushSizes,
@@ -3101,7 +3562,13 @@ export function PaintingApp({
     // Compositing / stroke helpers
     scheduleComposite,
     compositeWithStrokePreview,
-    buildStrokeCanvases,
+    // Wrap buildStrokeCanvases to set strokeActiveRef at stroke start.
+    // This must fire before any stamp or compositeWithStrokePreview call so
+    // the layer canvas write guard is active for the full duration of the stroke.
+    buildStrokeCanvases: (layerId: string) => {
+      strokeActiveRef.current = true;
+      buildStrokeCanvases(layerId);
+    },
     flushStrokeBuffer,
     strokeCommitDirty: _strokeCommitDirty,
     getActiveSize,
@@ -3122,9 +3589,11 @@ export function PaintingApp({
     handleFillPointerDown,
     handleFillPointerMove,
     handleFillPointerUp,
+    applyLassoFill,
     // Cursor
     sampleEyedropperColor,
     updateEyedropperCursorRef,
+    updateTransformCursorForHandle,
     // Ruler handlers bundle
     rulerHandlers: {
       handleLineRulerPointerDown: lineRuler.handleLineRulerPointerDown,
@@ -3154,7 +3623,7 @@ export function PaintingApp({
     },
   };
 
-  usePaintingCanvasEvents({
+  const { shiftHeld } = usePaintingCanvasEvents({
     callbacksRef: canvasEventCallbacksRef,
     displayCanvasRef,
     containerRef,
@@ -3339,6 +3808,13 @@ export function PaintingApp({
     // Brush blend mode (for toggleClearBlendMode hotkey)
     brushBlendModeRef,
     prevBrushBlendModeRef,
+    // Spring-loaded tool switching
+    springLoadedPreviousToolRef,
+    springLoadedKeyRef,
+    pendingSpringRestoreRef,
+    holdTimerRef,
+    pendingSpringKeyRef,
+    pendingSpringToolRef,
   });
 
   const handleZoomLockToggle = useCallback(() => {
@@ -3393,6 +3869,26 @@ export function PaintingApp({
       setActiveSubpanel("eyedropper" as never);
     }
   }, []);
+
+  // Wraps handleToolChange for panel/toolbar clicks. Clears any active spring-load
+  // so that releasing the spring key after a manual tool click does nothing.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
+  const handleToolChangeFromPanel = useCallback(
+    (tool: Tool) => {
+      // Cancel any pending hold timer before it fires
+      if (holdTimerRef.current !== null) {
+        clearTimeout(holdTimerRef.current);
+        holdTimerRef.current = null;
+      }
+      springLoadedPreviousToolRef.current = null;
+      springLoadedKeyRef.current = null;
+      pendingSpringRestoreRef.current = false;
+      pendingSpringKeyRef.current = null;
+      pendingSpringToolRef.current = null;
+      handleToolChange(tool);
+    },
+    [handleToolChange],
+  );
 
   const { panX, panY, zoom, rotation } = viewTransform;
   const isDefaultTransform =
@@ -3458,9 +3954,9 @@ export function PaintingApp({
 
   const handleSelectFillMode = useCallback(
     (mode: FillMode) => {
-      setFillMode(mode);
+      updateFillMode(mode);
     },
-    [setFillMode],
+    [updateFillMode],
   );
 
   const handleFillSettingsChange = useCallback(
@@ -3542,7 +4038,6 @@ export function PaintingApp({
       setRedoCount={setRedoCount}
       markLayerBitmapDirty={markLayerBitmapDirty}
       invalidateAllLayerBitmaps={invalidateAllLayerBitmaps}
-      layerTreeRef={layerTreeRef}
       selectedLayerIdsRef={selectedLayerIdsRef}
       setSelectedLayerIds={setSelectedLayerIds}
     >
@@ -3566,7 +4061,7 @@ export function PaintingApp({
             activeTool={activeTool}
             activeSubpanel={activeSubpanel}
             activeLassoMode={lassoMode}
-            onToolChange={handleToolChange}
+            onToolChange={handleToolChangeFromPanel}
             onToolReselect={handleToolReselect}
             zoomLocked={zoomLocked}
             rotateLocked={rotateLocked}
@@ -3661,25 +4156,6 @@ export function PaintingApp({
             />
           )}{" "}
           {/* end mobile/desktop conditional for left sidebar */}
-          {/* Hidden layer canvases */}
-          <div
-            style={{
-              position: "absolute",
-              left: -9999,
-              top: -9999,
-              pointerEvents: "none",
-            }}
-          >
-            {layers.map((layer) => (
-              <canvas
-                key={layer.id}
-                ref={(el) => {
-                  if (el) layerCanvasesRef.current.set(layer.id, el);
-                  else layerCanvasesRef.current.delete(layer.id);
-                }}
-              />
-            ))}
-          </div>
           {/* Canvas + top bar */}
           <div className="flex flex-col flex-1 min-w-0">
             <BottomBar
@@ -3729,7 +4205,7 @@ export function PaintingApp({
                   );
                   return;
                 }
-                handleUndo();
+                handleUndoWithRulerToolSwitch();
               }}
               onRedo={() => {
                 if (isDrawingRef.current || isCommittingRef.current) return;
@@ -3867,6 +4343,10 @@ export function PaintingApp({
               onBrushSizeChange={handleCanvasBrushSizeChange}
               onBrushOpacityChange={handleCanvasBrushOpacityChange}
               onBrushFlowChange={handleCanvasBrushFlowChange}
+              liquifySize={liquifySize}
+              liquifyStrength={liquifyStrength}
+              onLiquifySizeChange={setLiquifySize}
+              onLiquifyStrengthChange={setLiquifyStrength}
               onSelectPreset={handleSelectPreset}
               onUpdatePreset={handleUpdatePreset}
               onAddPreset={handleAddPreset}
@@ -3923,10 +4403,11 @@ export function PaintingApp({
               thumbnailVersion={navigatorVersion}
               isFlipped={isFlipped}
               layers={layers}
-              layerTree={layerTree}
+              layerTree={[]}
               activeLayerId={activeLayerId}
               selectedLayerIds={selectedLayerIds}
               layerThumbnails={layerThumbnails}
+              shiftHeld={shiftHeld}
               onSetActive={(id) => {
                 const clickedLayer = layersRef.current.find((l) => l.id === id);
 
@@ -4068,14 +4549,24 @@ export function PaintingApp({
                       rulerActiveBeforeHide: undefined,
                     };
                   };
-                  setLayers((prev) => prev.map(updFn));
+                  // Update the ref synchronously FIRST so drawRulerOverlay
+                  // reads the new visibility value immediately.
                   layersRef.current = layersRef.current.map(updFn);
-                  scheduleRulerOverlay();
+                  setLayers((prev) => prev.map(updFn));
+                  // Cancel any pending debounced RAF so it cannot override our
+                  // draw with stale state, then render immediately — no delay.
+                  if (rulerRafRef.current !== null) {
+                    cancelAnimationFrame(rulerRafRef.current);
+                    rulerRafRef.current = null;
+                  }
+                  drawRulerOverlay();
                 } else {
                   handleToggleVisible(id);
                 }
               }}
               onSetOpacity={handleSetOpacity}
+              onSetOpacityLive={handleSetOpacityLive}
+              onSetOpacityCommit={handleSetOpacityCommit}
               onSetBlendMode={handleSetLayerBlendMode}
               onAddLayer={handleAddLayer}
               onDeleteLayer={(id) => {
@@ -4093,31 +4584,29 @@ export function PaintingApp({
               onToggleAlphaLock={handleToggleAlphaLock}
               onCtrlClickLayer={handleCtrlClickLayer}
               onToggleRulerActive={(id) => {
-                setLayers((prev) =>
-                  prev.map((l) =>
-                    l.id === id
-                      ? { ...l, rulerActive: !(l.rulerActive ?? true) }
-                      : l,
-                  ),
-                );
-                layersRef.current = layersRef.current.map((l) =>
+                const toggleFn = (l: Layer): Layer =>
                   l.id === id
                     ? { ...l, rulerActive: !(l.rulerActive ?? true) }
-                    : l,
-                );
+                    : l;
+                setLayers((prev) => prev.map(toggleFn));
+                layersRef.current = layersRef.current.map(toggleFn);
                 scheduleRulerOverlay();
               }}
               onToggleGroupCollapse={_handleToggleGroupCollapse}
               onRenameGroup={_handleRenameGroup}
               onSetGroupOpacity={_handleSetGroupOpacity}
+              onSetGroupOpacityLive={_handleSetGroupOpacityLive}
+              onSetGroupOpacityCommit={_handleSetGroupOpacityCommit}
               onToggleGroupVisible={_handleToggleGroupVisible}
               onOpenDeleteGroup={(groupId) => {
-                const loc = findNode(layerTreeRef.current, groupId);
-                const groupName =
-                  loc?.node.kind === "group" ? loc.node.name : "Group";
+                const groupLayer = layers.find((l) => l.id === groupId);
+                const groupName = groupLayer?.name ?? "Group";
                 setDeleteGroupConfirm({ groupId, groupName });
               }}
               onReorderTree={_handleReorderTree}
+              onReorderTreeSilent={_handleReorderTreeSilent}
+              onReorderLayersSilent={_handleReorderLayersSilent}
+              onCommitReorderHistory={_handleCommitReorderHistory}
               onToggleLayerSelection={_handleToggleLayerSelection}
               onCreateGroup={handleCreateGroup}
             />

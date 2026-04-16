@@ -1,4 +1,9 @@
-// TODO: PaintingApp wiring is a separate step. This hook is not yet called from PaintingApp.tsx.
+// ============================================================
+// RESERVED FOR FUTURE USE
+// This ruler hook is not yet wired into PaintingApp event handlers.
+// It is intentionally preserved for the upcoming perspective/ellipse
+// ruler feature implementation. Do not delete.
+// ============================================================
 
 /**
  * useEllipseGridRuler — Ellipse (oval) and Grid ruler sub-system hook
@@ -1361,18 +1366,64 @@ export function useEllipseGridRuler({
 
       if (!anyOval && !anyGrid) return false;
 
+      // Fix 2: Clamp non-VP position handles to canvas bounds on pointer-up.
+      const W = canvasWidthRef.current;
+      const H = canvasHeightRef.current;
+      const cx = (v: number | undefined) =>
+        v !== undefined ? Math.max(0, Math.min(W, v)) : v;
+      const cy = (v: number | undefined) =>
+        v !== undefined ? Math.max(0, Math.min(H, v)) : v;
+
       let afterState: Record<string, unknown>;
 
       if (anyOval) {
+        // Clamp ovalCenter position. ovalAngle and semi-axes are not positions.
+        const clampedOvalCX = cx(layer.ovalCenterX);
+        const clampedOvalCY = cy(layer.ovalCenterY);
+        const needsClampOval =
+          clampedOvalCX !== layer.ovalCenterX ||
+          clampedOvalCY !== layer.ovalCenterY;
+        if (needsClampOval) {
+          const patchOval: Partial<Layer> = {};
+          if (clampedOvalCX !== undefined)
+            patchOval.ovalCenterX = clampedOvalCX;
+          if (clampedOvalCY !== undefined)
+            patchOval.ovalCenterY = clampedOvalCY;
+          const fnOval = (l: Layer) =>
+            l.id === layer.id ? { ...l, ...patchOval } : l;
+          setLayers((prev) => prev.map(fnOval));
+          layersRef.current = layersRef.current.map(fnOval);
+        }
+        const refreshedOval =
+          layersRef.current.find((l) => l.id === layer.id) ?? layer;
         afterState = {
-          ovalCenterX: layer.ovalCenterX,
-          ovalCenterY: layer.ovalCenterY,
-          ovalAngle: layer.ovalAngle ?? 0,
-          ovalSemiMajor: layer.ovalSemiMajor ?? 120,
-          ovalSemiMinor: layer.ovalSemiMinor ?? 60,
+          ovalCenterX: refreshedOval.ovalCenterX,
+          ovalCenterY: refreshedOval.ovalCenterY,
+          ovalAngle: refreshedOval.ovalAngle ?? 0,
+          ovalSemiMajor: refreshedOval.ovalSemiMajor ?? 120,
+          ovalSemiMinor: refreshedOval.ovalSemiMinor ?? 60,
         };
       } else {
-        afterState = { gridCorners: layer.gridCorners };
+        // Grid: clamp each corner to canvas bounds.
+        const gc = layer.gridCorners;
+        if (gc) {
+          const clampedCorners = gc.map((pt) => ({
+            x: Math.max(0, Math.min(W, pt.x)),
+            y: Math.max(0, Math.min(H, pt.y)),
+          })) as typeof gc;
+          const needsClampGrid = clampedCorners.some(
+            (pt, i) => pt.x !== gc[i].x || pt.y !== gc[i].y,
+          );
+          if (needsClampGrid) {
+            const fnGrid = (l: Layer) =>
+              l.id === layer.id ? { ...l, gridCorners: clampedCorners } : l;
+            setLayers((prev) => prev.map(fnGrid));
+            layersRef.current = layersRef.current.map(fnGrid);
+          }
+        }
+        const refreshedGrid =
+          layersRef.current.find((l) => l.id === layer.id) ?? layer;
+        afterState = { gridCorners: refreshedGrid.gridCorners };
       }
 
       const preState =
@@ -1403,7 +1454,15 @@ export function useEllipseGridRuler({
       scheduleRulerOverlay();
       return true;
     },
-    [pushHistory, rulerEditHistoryDepthRef, scheduleRulerOverlay],
+    [
+      canvasWidthRef,
+      canvasHeightRef,
+      layersRef,
+      setLayers,
+      pushHistory,
+      rulerEditHistoryDepthRef,
+      scheduleRulerOverlay,
+    ],
   );
 
   // ── isOvalDragging ────────────────────────────────────────────────────────

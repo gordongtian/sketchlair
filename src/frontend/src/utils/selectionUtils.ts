@@ -1,3 +1,34 @@
+// ─── Chaikin curve smoothing ──────────────────────────────────────────────────
+/**
+ * Apply Chaikin's corner-cutting algorithm to smooth a polyline.
+ * Each pass replaces every segment (P0→P1) with two new points:
+ *   Q = 0.25·P0 + 0.75·P1   (¾ of the way from P0 to P1)
+ *   R = 0.75·P0 + 0.25·P1   (¼ of the way from P0 to P1)
+ * The first and last points are preserved so the path endpoints don't drift.
+ * 2–3 passes give a natural smooth curve without destroying tight corners.
+ */
+export function chaikinSmooth(
+  points: { x: number; y: number }[],
+  iterations = 2,
+): { x: number; y: number }[] {
+  if (points.length < 3) return points;
+  let pts = points;
+  for (let iter = 0; iter < iterations; iter++) {
+    const out: { x: number; y: number }[] = [pts[0]];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[i];
+      const p1 = pts[i + 1];
+      out.push(
+        { x: 0.75 * p0.x + 0.25 * p1.x, y: 0.75 * p0.y + 0.25 * p1.y },
+        { x: 0.25 * p0.x + 0.75 * p1.x, y: 0.25 * p0.y + 0.75 * p1.y },
+      );
+    }
+    out.push(pts[pts.length - 1]);
+    pts = out;
+  }
+  return pts;
+}
+
 // ─── Shared BFS flood fill utility ───────────────────────────────────────────
 export function bfsFloodFill(
   srcData: Uint8ClampedArray,

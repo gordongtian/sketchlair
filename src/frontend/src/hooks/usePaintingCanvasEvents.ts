@@ -27,7 +27,7 @@ import {
   matchesBinding,
 } from "@/utils/hotkeyConfig";
 import type { Preset } from "@/utils/toolPresets";
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type React from "react";
 import { toast } from "sonner";
 import type { BrushSettings } from "../components/BrushSettingsPanel";
@@ -42,7 +42,11 @@ import type {
 import type { SelectionGeom, SelectionSnapshot } from "../selectionTypes";
 import type { LayerNode } from "../types";
 import type { ViewTransform } from "../types";
-import { getEffectivelySelectedLayers } from "../utils/layerTree";
+import {
+  type FlatEntry,
+  flattenLayersForOps,
+  getEffectivelySelectedLayers,
+} from "../utils/groupUtils";
 import {
   bfsFloodFill,
   computeMaskBounds,
@@ -52,10 +56,16 @@ import type { WebGLBrushContext } from "../utils/webglBrush";
 import { markCanvasDirty, markLayerBitmapDirty } from "./useCompositing";
 import type { UndoEntry } from "./useLayerSystem";
 import {
+  expandLiquifyFrameDirty,
+  getLiquifySnapH,
+  getLiquifySnapW,
   getLiquifySnapshot,
   initLiquifyField,
   renderLiquifyFromSnapshot,
+  renderLiquifyMultiLayer,
+  resetLiquifyFrameDirty,
   setLiquifySnapshot,
+  setLiquifyStrokeActive,
   updateLiquifyDisplacementField,
 } from "./useLiquifySystem";
 import {
@@ -232,11 +242,14 @@ export interface PaintingCanvasEventsCallbacks {
     y: number,
   ) => { r: number; g: number; b: number };
   updateEyedropperCursorRef: React.MutableRefObject<() => void>;
+  // Transform handle cursor — update cursor icon based on hovered handle
+  updateTransformCursorForHandle: (handle: string | null) => void;
   // State setters
   setActiveTool: React.Dispatch<React.SetStateAction<Tool>>;
   setActiveSubpanel: React.Dispatch<React.SetStateAction<Tool | null>>;
   setActiveLayerId: React.Dispatch<React.SetStateAction<string>>;
   setLayers: React.Dispatch<React.SetStateAction<Layer[]>>;
+  setLayerTree: React.Dispatch<React.SetStateAction<LayerNode[]>>;
   setViewTransform: React.Dispatch<React.SetStateAction<ViewTransform>>;
   setIsFlipped: React.Dispatch<React.SetStateAction<boolean>>;
   setBrushSizes: React.Dispatch<React.SetStateAction<BrushSizes>>;
@@ -328,6 +341,14 @@ export interface PaintingCanvasEventsCallbacks {
     getPos: (cx: number, cy: number) => Point,
   ) => boolean;
   handleFillPointerUp: () => void;
+  /** Apply lasso fill to the active layer canvas */
+  applyLassoFill: (
+    lc: HTMLCanvasElement,
+    points: { x: number; y: number }[],
+    fr: number,
+    fg: number,
+    fb: number,
+  ) => void;
   // Ruler handlers bundle
   rulerHandlers: RulerHandlers;
 }
@@ -520,6 +541,9 @@ export interface PaintingCanvasEventsParams {
     fy: number;
     origBounds?: { x: number; y: number; w: number; h: number };
     initRotation?: number;
+    /** For scale handle drags: the canvas-space pivot point (opposite handle's position at drag start) */
+    pivotX?: number;
+    pivotY?: number;
   } | null>;
   transformActionsRef: React.MutableRefObject<{
     hitTestTransformHandle: (x: number, y: number) => string | null;
@@ -633,6 +657,20 @@ export interface PaintingCanvasEventsParams {
 
   // Ruler edit history depth (for ruler pointer down)
   rulerEditHistoryDepthRef: React.MutableRefObject<number>;
+
+  // ---- Spring-loaded tool switching refs ----
+  // The tool that was active before a spring-load was triggered. Null when not spring-loaded.
+  springLoadedPreviousToolRef: React.MutableRefObject<Tool | null>;
+  // The exact key string (e.key) that triggered the spring-load.
+  springLoadedKeyRef: React.MutableRefObject<string | null>;
+  // Set to true when the spring key is released mid-stroke; cleared and restore applied after pointer-up.
+  pendingSpringRestoreRef: React.MutableRefObject<boolean>;
+  // Pending 500ms hold timer — non-null means key is held but spring hasn't activated yet (tap window).
+  holdTimerRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>;
+  // The key being held while we wait for the hold timer to fire.
+  pendingSpringKeyRef: React.MutableRefObject<string | null>;
+  // The target tool waiting to be activated once the hold timer fires.
+  pendingSpringToolRef: React.MutableRefObject<Tool | null>;
 }
 
 // ─── The hook ─────────────────────────────────────────────────────────────────
@@ -681,6 +719,41 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     cropPrevViewRef,
   } = p;
 
+  // ── Shift-held React state (mirrors shiftHeldRef for re-render on key events) ──
+  // The ref is the fast synchronous path used by snap/stroke calculations.
+  // The state drives indicator re-renders in LayerRow without touching any logic.
+  const [shiftHeld, setShiftHeld] = useState(false);
+
+  // ── Liquify performance refs ─────────────────────────────────────────────
+  // throttle counter: in multi-layer mode, skip every other coalesced event
+  const _liqThrottleCounterRef = useRef(0);
+  // Batch layers built once at pointer-down, reused on every pointer-move event.
+  // Avoids rebuilding ctx lookups and snapshot references on each coalesced event.
+  const _liqBatchLayersRef = useRef<
+    Array<{
+      ctx: CanvasRenderingContext2D;
+      snapshot: ImageData;
+      layerId: string;
+      isRuler?: boolean;
+    }>
+  >([]);
+  // Whether the current liquify stroke is operating in multi-layer mode.
+  const _liqIsMultiRef = useRef(false);
+  // Stride chosen at stroke start based on layer count.
+  const _liqStrideRef = useRef(1);
+  // NOTE: The liquify stroke active flag lives in useLiquifySystem as
+  // _liquifyStrokeActive (accessed via getLiquifyStrokeActive / setLiquifyStrokeActive).
+  // scheduleComposite in useCompositing gates on that flag — this is the single
+  // authoritative suppression point for all pre-warp renders (A4 fix).
+
+  // ── Session max pressure (Linux/Wacom fix) ───────────────────────────────
+  // True when a stroke started outside the canvas element (within the viewport
+  // container background) and hasn't yet transitioned onto the canvas.
+  const _offCanvasStrokeRef = useRef(false);
+  // Buffered pointermove events accumulated while the stroke is still off-canvas,
+  // to be replayed when the pointer enters the canvas for a seamless carry-on.
+  const _offCanvasPendingPathRef = useRef<PointerEvent[]>([]);
+
   // ── 1. Global hotkey handler ─────────────────────────────────────────────
   // biome-ignore lint/correctness/useExhaustiveDependencies: all mutable state accessed via stable refs / callbacksRef
   useEffect(() => {
@@ -705,7 +778,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         const currentTool = activeToolRef.current;
         if (
           shiftHeldRef.current &&
-          (currentTool === "brush" || currentTool === "eraser")
+          (currentTool === "brush" ||
+            currentTool === "eraser" ||
+            currentTool === "liquify")
         ) {
           altSpaceModeRef.current = true;
           updateBrushCursorRef.current();
@@ -940,26 +1015,93 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       }
 
       if (!e.ctrlKey && !e.metaKey) {
-        if (matchAct("brush")) {
-          if (activeToolRef.current !== "brush") {
-            cb.handleToolChange("brush");
+        // ── Spring-loadable tools: brush, eraser, smudge, liquify, fill, lasso, move/transform, ruler ──
+        // On keydown: if the hotkey maps to a tool that is NOT currently active,
+        // start a 500ms hold timer. If the key is released before the timer fires
+        // (tap), permanently switch to the tool. If the timer fires first (hold),
+        // activate spring-loading and snap back to the previous tool on key release.
+        const _springTools: Array<{ action: string; tool: Tool }> = [
+          { action: "brush", tool: "brush" },
+          { action: "eraser", tool: "eraser" },
+          { action: "smudge", tool: "smudge" },
+          { action: "liquify", tool: "liquify" },
+          { action: "fill", tool: "fill" },
+          { action: "lasso", tool: "lasso" },
+          { action: "ruler", tool: "ruler" },
+          { action: "transform", tool: "move" },
+        ];
+        let _springHandled = false;
+        for (const { action, tool: springTool } of _springTools) {
+          if (matchAct(action)) {
+            const currentTool = activeToolRef.current;
+            const isSameToolActive =
+              currentTool === springTool ||
+              (springTool === "move" &&
+                (currentTool === "move" || currentTool === "transform"));
+            if (!isSameToolActive) {
+              // Clear any existing hold timer before starting a new one
+              if (p.holdTimerRef.current !== null) {
+                clearTimeout(p.holdTimerRef.current);
+                p.holdTimerRef.current = null;
+              }
+              // Record the previous tool before switching
+              const previousTool = currentTool;
+              // Record which key is pending (for the tap/hold detection on keyup)
+              p.pendingSpringKeyRef.current = e.key;
+              p.pendingSpringToolRef.current = springTool;
+
+              // Switch tool IMMEDIATELY on key down — no delay
+              if (springTool === "lasso") {
+                cancelInProgressSelectionRef.current();
+                callbacksRef.current.handleToolChange("lasso");
+              } else if (springTool === "ruler") {
+                cancelInProgressSelectionRef.current();
+                const _rl = p.layersRef.current.find((l) => l.isRuler);
+                p.lastPaintToolRef2.current = previousTool;
+                p.lastPaintLayerIdRef.current = p.activeLayerIdRef.current;
+                callbacksRef.current.setActiveTool("ruler");
+                callbacksRef.current.setActiveSubpanel("ruler" as Tool);
+                if (_rl) {
+                  callbacksRef.current.setActiveLayerId(_rl.id);
+                  p.activeLayerIdRef.current = _rl.id;
+                }
+              } else if (springTool === "move") {
+                cancelInProgressSelectionRef.current();
+                if (transformActiveRef.current) {
+                  p.selectionActionsRef.current.commitFloat({
+                    keepSelection: true,
+                  });
+                } else {
+                  p.lastToolBeforeTransformRef.current = previousTool;
+                }
+                callbacksRef.current.setActiveTool("move");
+                callbacksRef.current.setActiveSubpanel(null);
+              } else {
+                callbacksRef.current.handleToolChange(springTool);
+              }
+
+              // Start the 500ms hold timer. If it fires, mark this session as
+              // spring-loaded (so key-up will snap back to the previous tool).
+              // If key-up fires before the timer, this was a tap — keep the tool.
+              p.holdTimerRef.current = setTimeout(() => {
+                p.holdTimerRef.current = null;
+                // Guard: only activate spring-load if the same key is still pending
+                if (p.pendingSpringKeyRef.current !== e.key) return;
+                // Spring-load is now active: store previous tool for restore on key-up
+                p.springLoadedPreviousToolRef.current = previousTool;
+                p.springLoadedKeyRef.current = e.key;
+                p.pendingSpringKeyRef.current = null;
+                p.pendingSpringToolRef.current = null;
+              }, 500);
+            }
+            // Already on this tool — do nothing (no spring-load)
+            _springHandled = true;
+            e.preventDefault();
+            break;
           }
-        } else if (matchAct("eraser")) {
-          if (activeToolRef.current !== "eraser") {
-            cb.handleToolChange("eraser");
-          }
-        } else if (matchAct("smudge")) {
-          if (activeToolRef.current !== "smudge") {
-            cb.handleToolChange("smudge");
-          }
-        } else if (matchAct("liquify")) {
-          if (activeToolRef.current !== "liquify") {
-            cb.handleToolChange("liquify");
-          }
-        } else if (matchAct("fill")) {
-          if (activeToolRef.current !== "fill") {
-            cb.handleToolChange("fill");
-          }
+        }
+        if (_springHandled) {
+          // Spring-load handled; skip all the legacy individual checks below
         } else if (matchAct("eyedropper")) {
           if (activeToolRef.current !== "eyedropper") {
             cb.handleToolChange("eyedropper");
@@ -997,12 +1139,14 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             cb.setIsFlipped((f) => !f);
           }
         } else if (matchAct("lasso")) {
+          // Handled by spring-load path above; this fallback is kept for safety
           if (activeToolRef.current !== "lasso") {
             cancelInProgressSelectionRef.current();
             cb.setActiveTool("lasso");
             cb.setActiveSubpanel("lasso" as Tool);
           }
         } else if (matchAct("ruler")) {
+          // Handled by spring-load path above; this fallback is kept for safety
           cancelInProgressSelectionRef.current();
           const rulerLayer2 = p.layersRef.current.find((l) => l.isRuler);
           if (activeToolRef.current !== "ruler") {
@@ -1016,6 +1160,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             }
           }
         } else if (matchAct("transform")) {
+          // Handled by spring-load path above; this fallback is kept for safety
           if (activeToolRef.current === "move" && !transformActiveRef.current) {
             // Already on move with no active transform — no-op
           } else {
@@ -1027,13 +1172,14 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             } else {
               p.lastToolBeforeTransformRef.current = activeToolRef.current;
             }
-            // Mirror exactly what the toolbar button does: just activate the move
-            // tool. extractFloat is called on the first pointer-down, which already
-            // handles multi-layer union bounds correctly. Do NOT call extractFloat
-            // here — the inline single-layer scan that was here bypassed the
-            // multi-layer path in useTransformSystem.
             cb.setActiveTool("move");
             cb.setActiveSubpanel(null);
+          }
+        } else if (matchAct("crop")) {
+          e.preventDefault();
+          if (activeToolRef.current !== "crop") {
+            cropPrevToolRef.current = activeToolRef.current;
+            cb.handleToolChange("crop");
           }
         } else if (e.key === "Escape") {
           if (isCropActiveRef.current) {
@@ -1055,19 +1201,43 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             p.selectionActionsRef.current.clearSelection();
           } else if (viewTransformRef.current.rotation !== 0) {
             const vtE = viewTransformRef.current;
-            const RE = (-vtE.rotation * Math.PI) / 180;
-            const cosRE = Math.cos(RE);
-            const sinRE = Math.sin(RE);
-            const newPanXE = vtE.panX * cosRE + vtE.panY * sinRE;
-            const newPanYE = -vtE.panX * sinRE + vtE.panY * cosRE;
-            const newVtE = {
-              ...vtE,
-              rotation: 0,
-              panX: newPanXE,
-              panY: newPanYE,
-            };
-            applyTransformToDOMRef.current(newVtE);
-            cb.setViewTransform(newVtE);
+            const canvas = displayCanvasRef.current;
+            if (canvas) {
+              // Step 1: Capture the canvas-space point currently at the viewport center.
+              // The viewport center client coords cancel out in the _getCanvasPosTransformed
+              // formula (clientX - centerX = 0), leaving the pan offset as the sole term:
+              //   ox = 0 - vtE.panX = -vtE.panX
+              //   oy = 0 - vtE.panY = -vtE.panY
+              const ox = -vtE.panX;
+              const oy = -vtE.panY;
+              const sx = ox / vtE.zoom;
+              const sy = oy / vtE.zoom;
+              const px = isFlippedRef.current ? -sx : sx;
+              const rad = (-vtE.rotation * Math.PI) / 180;
+              const canvasCX =
+                px * Math.cos(rad) - sy * Math.sin(rad) + canvas.width / 2;
+              const canvasCY =
+                px * Math.sin(rad) + sy * Math.cos(rad) + canvas.height / 2;
+              // Step 2 & 3: Reset rotation to 0 and recompute pan so that
+              // canvasCX/canvasCY maps back to the viewport center.
+              // With rotation=0: screenX = (canvasCX - canvas.width/2)*zoom + panX + vpCX
+              // We want screenX = vpCX, so: newPanX = -(canvasCX - canvas.width/2)*zoom
+              const newPanXE = -(canvasCX - canvas.width / 2) * vtE.zoom;
+              const newPanYE = -(canvasCY - canvas.height / 2) * vtE.zoom;
+              const newVtE = {
+                ...vtE,
+                rotation: 0,
+                panX: newPanXE,
+                panY: newPanYE,
+              };
+              applyTransformToDOMRef.current(newVtE);
+              cb.setViewTransform(newVtE);
+            } else {
+              // Fallback: canvas ref not ready, just reset rotation
+              const newVtE = { ...vtE, rotation: 0 };
+              applyTransformToDOMRef.current(newVtE);
+              cb.setViewTransform(newVtE);
+            }
           }
         } else if (e.key === "Delete" || e.key === "Backspace") {
           if (selectionActiveRef.current) {
@@ -1338,6 +1508,59 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         isBrushSizeAdjustingRef.current = false;
         updateBrushCursorRef.current();
       }
+
+      // ── Spring-load key release ──
+      // Guard: don't process if focused on a text input
+      const _upTag = (e.target as HTMLElement).tagName;
+      const _upIsEditable =
+        (e.target as HTMLElement).isContentEditable === true;
+      if (
+        _upTag !== "INPUT" &&
+        _upTag !== "TEXTAREA" &&
+        _upTag !== "SELECT" &&
+        !_upIsEditable
+      ) {
+        // ── TAP path: hold timer still pending (key released before 500ms) ──
+        // The tool was already switched immediately on keydown. Since the hold timer
+        // hasn't fired yet, spring-load was never activated. Just cancel the timer
+        // and clear refs — the tool change is permanent (same as clicking in the panel).
+        if (
+          p.pendingSpringKeyRef.current !== null &&
+          e.key === p.pendingSpringKeyRef.current &&
+          p.holdTimerRef.current !== null
+        ) {
+          // Cancel the hold timer — this was a tap, tool stays on the new selection
+          clearTimeout(p.holdTimerRef.current);
+          p.holdTimerRef.current = null;
+          p.pendingSpringKeyRef.current = null;
+          p.pendingSpringToolRef.current = null;
+          // No tool switch needed — the tool was already switched on keydown
+        }
+        // ── HOLD path: timer already fired (spring-load is active), restore previous tool ──
+        else if (
+          p.springLoadedKeyRef.current !== null &&
+          e.key === p.springLoadedKeyRef.current
+        ) {
+          const _prevTool = p.springLoadedPreviousToolRef.current;
+          if (_prevTool !== null) {
+            if (p.isDrawingRef.current || p.isCommittingRef.current) {
+              // Mid-stroke — defer the restore until pointer-up completes
+              p.pendingSpringRestoreRef.current = true;
+            } else {
+              // Not mid-stroke — restore immediately
+              p.springLoadedPreviousToolRef.current = null;
+              p.springLoadedKeyRef.current = null;
+              p.pendingSpringRestoreRef.current = false;
+              callbacksRef.current.handleToolChange(_prevTool);
+            }
+          } else {
+            // No previous tool stored — just clear refs
+            p.springLoadedPreviousToolRef.current = null;
+            p.springLoadedKeyRef.current = null;
+            p.pendingSpringRestoreRef.current = false;
+          }
+        }
+      }
     };
 
     const blurHandler = () => {
@@ -1351,8 +1574,25 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         updateBrushCursorRef.current();
       }
       shiftHeldRef.current = false;
+      setShiftHeld(false);
+      // Cancel any pending hold timer on blur
+      if (p.holdTimerRef.current !== null) {
+        clearTimeout(p.holdTimerRef.current);
+        p.holdTimerRef.current = null;
+      }
+      p.pendingSpringKeyRef.current = null;
+      p.pendingSpringToolRef.current = null;
+      // Cancel any active spring-load on window blur (key-up won't fire)
+      if (p.springLoadedPreviousToolRef.current !== null) {
+        const _blurPrevTool = p.springLoadedPreviousToolRef.current;
+        p.springLoadedPreviousToolRef.current = null;
+        p.springLoadedKeyRef.current = null;
+        p.pendingSpringRestoreRef.current = false;
+        if (!p.isDrawingRef.current && !p.isCommittingRef.current) {
+          callbacksRef.current.handleToolChange(_blurPrevTool);
+        }
+      }
     };
-
     window.addEventListener("keydown", handler);
     window.addEventListener("keyup", upHandler);
     window.addEventListener("blur", blurHandler);
@@ -1372,6 +1612,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
 
       if (e.key === "Shift") {
         shiftHeldRef.current = true;
+        setShiftHeld(true);
         const prevToolForAltShift = altEyedropperActiveRef.current
           ? prevToolRef.current
           : activeToolRef.current;
@@ -1379,7 +1620,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           e.altKey &&
           (prevToolForAltShift === "brush" ||
             prevToolForAltShift === "eraser" ||
-            prevToolForAltShift === "smudge")
+            prevToolForAltShift === "smudge" ||
+            prevToolForAltShift === "liquify")
         ) {
           if (altEyedropperActiveRef.current) {
             altEyedropperActiveRef.current = false;
@@ -1448,6 +1690,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       let cameraKeyReleased = false;
       if (e.key === "Shift") {
         shiftHeldRef.current = false;
+        setShiftHeld(false);
         if (altSpaceModeRef.current) {
           altSpaceModeRef.current = false;
           isBrushSizeAdjustingRef.current = false;
@@ -1891,7 +2134,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       tool === "smudge"
     ) {
       const _effectiveSel = getEffectivelySelectedLayers(
-        p.layerTreeRef.current,
+        p.layersRef.current as FlatEntry[],
         p.selectedLayerIdsRef.current,
       );
       if (_effectiveSel.length > 1) return;
@@ -1967,17 +2210,87 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           alphaLock: false,
         };
         const prevActiveIdForRuler = p.activeLayerIdRef.current;
-        cb.setLayers((prev) => [...prev, newRulerLayer]);
-        p.layersRef.current = [...p.layersRef.current, newRulerLayer];
+        // Insert the ruler ABOVE (visually) the current active layer.
+        // Index 0 = topmost in the panel, so "above active" = same index as
+        // active (shifting active down by 1). Fall back to appending if no
+        // active layer is found.
+        const activeIdNow = p.activeLayerIdRef.current;
+        cb.setLayers((prev) => {
+          const idx = prev.findIndex((l) => l.id === activeIdNow);
+          if (idx === -1) return [...prev, newRulerLayer];
+          const next = [...prev];
+          next.splice(idx, 0, newRulerLayer);
+          return next;
+        });
+        cb.setLayerTree((prev) => {
+          const idx = prev.findIndex(
+            (n) => n.kind === "layer" && n.id === activeIdNow,
+          );
+          const rulerNode: import("../types").LayerItem = {
+            kind: "layer",
+            id: newRulerLayer.id,
+            layer: newRulerLayer as unknown as import("../types").Layer,
+          };
+          if (idx === -1) return [...prev, rulerNode];
+          const next = [...prev];
+          next.splice(idx, 0, rulerNode);
+          return next;
+        });
+        const activeIdxFlat = p.layersRef.current.findIndex(
+          (l) => l.id === activeIdNow,
+        );
+        if (activeIdxFlat === -1) {
+          p.layersRef.current = [...p.layersRef.current, newRulerLayer];
+        } else {
+          const next = [...p.layersRef.current];
+          next.splice(activeIdxFlat, 0, newRulerLayer);
+          p.layersRef.current = next;
+        }
+        const rulerInsertIndex =
+          activeIdxFlat === -1 ? p.layersRef.current.length - 1 : activeIdxFlat;
         cb.setActiveLayerId(newRulerLayer.id);
         p.activeLayerIdRef.current = newRulerLayer.id;
         cb.pushHistory({
           type: "layer-add",
           layer: newRulerLayer,
-          index: p.layersRef.current.length - 1,
+          index: rulerInsertIndex,
           previousActiveLayerId: prevActiveIdForRuler,
         });
         p.rulerEditHistoryDepthRef.current = 1;
+
+        // Fix 1: Immediately begin ruler setup on the first pointer-down.
+        // The layer is now in layersRef so the ruler handlers can find it.
+        const rh2 = cb.rulerHandlers;
+        const handleRadius2 = Math.max(
+          12,
+          24 / p.viewTransformRef.current.zoom,
+        );
+        if (currentPresetType === "line") {
+          rh2.handleLineRulerPointerDown(pos, newRulerLayer, handleRadius2);
+        } else if (currentPresetType === "perspective-1pt") {
+          rh2.handle1ptRulerPointerDown(pos, newRulerLayer, handleRadius2);
+        } else if (currentPresetType === "perspective-2pt") {
+          rh2.handle2ptRulerPointerDown(pos, newRulerLayer, handleRadius2);
+        } else if (currentPresetType === "perspective-3pt") {
+          rh2.handle3ptRulerPointerDown(
+            pos,
+            newRulerLayer,
+            handleRadius2,
+            p.shiftHeldRef.current,
+          );
+        } else if (currentPresetType === "perspective-5pt") {
+          rh2.handle5ptRulerPointerDown(
+            pos,
+            newRulerLayer,
+            handleRadius2,
+            p.shiftHeldRef.current,
+          );
+        } else if (currentPresetType === "oval") {
+          rh2.handleOvalRulerPointerDown(pos, newRulerLayer, handleRadius2);
+        } else if (currentPresetType === "grid") {
+          rh2.handleGridRulerPointerDown(pos, newRulerLayer, handleRadius2);
+        }
+
         cb.scheduleRulerOverlay();
       }
       return;
@@ -2160,6 +2473,55 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         if (hitHandle) {
           p.transformHandleRef.current = hitHandle;
           const xfDown = p.xfStateRef.current;
+          // Compute pivot for scale handles (opposite handle's position) and
+          // rotation center for the rot handle, both captured at drag-start.
+          let pivotX: number | undefined;
+          let pivotY: number | undefined;
+          if (xfDown) {
+            const { x: bx, y: by, w: bw, h: bh } = xfDown;
+            if (hitHandle === "rot") {
+              // Rotation always pivots around the exact bounding box center.
+              // Capture it once at drag-start so it never drifts mid-drag.
+              pivotX = bx + bw / 2;
+              pivotY = by + bh / 2;
+            } else if (hitHandle !== "move") {
+              // Scale handle: pivot is the opposite handle's position
+              switch (hitHandle) {
+                case "nw":
+                  pivotX = bx + bw;
+                  pivotY = by + bh;
+                  break; // se
+                case "n":
+                  pivotX = bx + bw / 2;
+                  pivotY = by + bh;
+                  break; // s
+                case "ne":
+                  pivotX = bx;
+                  pivotY = by + bh;
+                  break; // sw
+                case "e":
+                  pivotX = bx;
+                  pivotY = by + bh / 2;
+                  break; // w
+                case "se":
+                  pivotX = bx;
+                  pivotY = by;
+                  break; // nw
+                case "s":
+                  pivotX = bx + bw / 2;
+                  pivotY = by;
+                  break; // n
+                case "sw":
+                  pivotX = bx + bw;
+                  pivotY = by;
+                  break; // ne
+                case "w":
+                  pivotX = bx + bw;
+                  pivotY = by + bh / 2;
+                  break; // e
+              }
+            }
+          }
           p.floatDragStartRef.current = {
             px: pos.x,
             py: pos.y,
@@ -2169,6 +2531,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               ? { x: xfDown.x, y: xfDown.y, w: xfDown.w, h: xfDown.h }
               : undefined,
             initRotation: xfDown ? xfDown.rotation : 0,
+            pivotX,
+            pivotY,
           };
         }
         return;
@@ -2251,13 +2615,13 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       // For multi-layer smudge: capture per-layer before-snapshots so pen_up can push
       // a history entry for each affected layer (same pattern as multi-layer liquify).
       const _smudgeSelDown = getEffectivelySelectedLayers(
-        p.layerTreeRef.current,
+        p.layersRef.current as FlatEntry[],
         p.selectedLayerIdsRef.current,
       );
       if (_smudgeSelDown.length > 1) {
         const newSmudgeSnaps = new Map<string, ImageData>();
         for (const layerItem of _smudgeSelDown) {
-          const lid2 = layerItem.layer.id;
+          const lid2 = layerItem.id;
           const lc2 = p.layerCanvasesRef.current.get(lid2);
           if (!lc2) continue;
           const ctx2 = lc2.getContext("2d", { willReadFrequently: !isIPad });
@@ -2283,41 +2647,68 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       if (lc) return lc;
       if (tool !== "liquify") return undefined;
       const _eSel = getEffectivelySelectedLayers(
-        p.layerTreeRef.current,
+        p.layersRef.current as FlatEntry[],
         p.selectedLayerIdsRef.current,
       );
       for (const item of _eSel) {
-        const _c = p.layerCanvasesRef.current.get(item.layer.id);
+        const _c = p.layerCanvasesRef.current.get(item.id);
         if (_c) return _c;
       }
       return undefined;
     })();
 
     if (tool === "liquify" && liqLcResolved) {
+      // Set the single authoritative stroke-active flag (A4 fix).
+      // scheduleComposite in useCompositing checks this flag and skips any
+      // trailing RAF from the previous stroke — no RAF cancellation needed here.
+      setLiquifyStrokeActive(true);
+
       const _liqSnapCtx = liqLcResolved.getContext("2d", {
         willReadFrequently: !isIPad,
       });
       if (_liqSnapCtx) {
-        const _liqSel = getEffectivelySelectedLayers(
-          p.layerTreeRef.current,
-          p.selectedLayerIdsRef.current,
-        );
-        const _liqIsMulti = _liqSel.length > 1;
+        // Determine the working layer set based on scope:
+        //   "all-visible" → every visible layer in the tree (regardless of selection)
+        //   "active"       → only the effectively selected layers
+        const _liqScope = p.liquifyScopeRef.current;
+        const _liqWorkingLayers =
+          _liqScope === "all-visible"
+            ? flattenLayersForOps(p.layersRef.current as FlatEntry[]).filter(
+                (item) => item.visible,
+              )
+            : getEffectivelySelectedLayers(
+                p.layersRef.current as FlatEntry[],
+                p.selectedLayerIdsRef.current,
+              );
+
+        const _liqIsMulti = _liqWorkingLayers.length > 1;
         if (_liqIsMulti) {
           const newSnapshots = new Map<string, ImageData>();
-          for (const layerItem of _liqSel) {
-            const lid2 = layerItem.layer.id;
+          const newBatchLayers: Array<{
+            ctx: CanvasRenderingContext2D;
+            snapshot: ImageData;
+            layerId: string;
+            isRuler?: boolean;
+          }> = [];
+          for (const layerItem of _liqWorkingLayers) {
+            const lid2 = layerItem.id;
             const lc2 = p.layerCanvasesRef.current.get(lid2);
             if (!lc2) continue;
             const ctx2 = lc2.getContext("2d", { willReadFrequently: !isIPad });
             if (!ctx2) continue;
-            newSnapshots.set(
-              lid2,
-              ctx2.getImageData(0, 0, lc2.width, lc2.height),
-            );
+            const snap2 = ctx2.getImageData(0, 0, lc2.width, lc2.height);
+            newSnapshots.set(lid2, snap2);
+            newBatchLayers.push({
+              ctx: ctx2,
+              snapshot: snap2,
+              layerId: lid2,
+              isRuler: (layerItem as { isRuler?: boolean }).isRuler === true,
+            });
           }
           p.liquifyMultiBeforeSnapshotsRef.current = newSnapshots;
           p.liquifyBeforeSnapshotRef.current = null;
+          // Store batch at stroke-start so pointer-move can reuse without rebuilding
+          _liqBatchLayersRef.current = newBatchLayers;
         } else {
           p.liquifyBeforeSnapshotRef.current = _liqSnapCtx.getImageData(
             0,
@@ -2326,40 +2717,18 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             liqLcResolved.height,
           );
           p.liquifyMultiBeforeSnapshotsRef.current.clear();
+          _liqBatchLayersRef.current = [];
         }
-        let snapData: ImageData;
-        if (p.liquifyScopeRef.current === "all-visible") {
-          const tmpCanvas = document.createElement("canvas");
-          tmpCanvas.width = liqLcResolved.width;
-          tmpCanvas.height = liqLcResolved.height;
-          const tmpCtx = tmpCanvas.getContext("2d")!;
-          const ls = p.layersRef.current;
-          for (let i = ls.length - 1; i >= 0; i--) {
-            const layer = ls[i];
-            if (!layer.visible) continue;
-            const layerCanvas = p.layerCanvasesRef.current.get(layer.id);
-            if (!layerCanvas) continue;
-            tmpCtx.globalAlpha = layer.opacity;
-            tmpCtx.globalCompositeOperation = (layer.blendMode ||
-              "source-over") as GlobalCompositeOperation;
-            tmpCtx.drawImage(layerCanvas, 0, 0);
-          }
-          tmpCtx.globalAlpha = 1;
-          tmpCtx.globalCompositeOperation = "source-over";
-          snapData = tmpCtx.getImageData(
-            0,
-            0,
-            liqLcResolved.width,
-            liqLcResolved.height,
-          );
-        } else {
-          snapData = _liqSnapCtx.getImageData(
-            0,
-            0,
-            liqLcResolved.width,
-            liqLcResolved.height,
-          );
-        }
+        // Store multi/stride state for reuse in pointer-move
+        _liqIsMultiRef.current = _liqIsMulti;
+        _liqStrideRef.current = _liqWorkingLayers.length >= 3 ? 2 : 1;
+
+        const snapData = _liqSnapCtx.getImageData(
+          0,
+          0,
+          liqLcResolved.width,
+          liqLcResolved.height,
+        );
         initLiquifyField(snapData, liqLcResolved.width, liqLcResolved.height);
       }
       if (p.liquifyHoldIntervalRef.current)
@@ -2401,16 +2770,15 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         pressure,
         p.universalPressureCurveRef.current as [number, number, number, number],
       );
+
       const effectiveSize = settings.pressureSize
         ? baseSize *
           (settings.minSize / 100 +
             (1 - settings.minSize / 100) * curvedPressure)
         : baseSize;
       const flow = settings.flow ?? 1.0;
-      // STEP 5: effectiveOpacity is always flow — unconditionally, no pressure gating.
-      // Flow controls per-stamp deposit rate regardless of pressure mode.
-      // The opacity ceiling is handled by opacityFBO in the WebGL brush engine.
       const effectiveOpacity = (() => {
+        if (settings.pressureOpacity) return flow;
         if (settings.pressureFlow)
           return (
             flow *
@@ -2432,10 +2800,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         (tool === "brush" || tool === "eraser")
       ) {
         const _initStabOpacity = effectiveOpacity;
-        // STEP 2d: capAlpha is always numeric — baseOpacity when pressure→opacity is off
         const _initStabCapAlpha = settings.pressureOpacity
           ? curvedPressure * baseOpacity
-          : baseOpacity;
+          : undefined;
         p.stabBrushPosRef.current = {
           ...startPos,
           size: effectiveSize,
@@ -2460,10 +2827,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         }
       } else {
         const _initCappedOpacity = effectiveOpacity;
-        // STEP 2d: capAlpha is always numeric
         const _initCapAlpha = settings.pressureOpacity
           ? curvedPressure * baseOpacity
-          : baseOpacity;
+          : undefined;
         if (tool === "eraser") {
           cb.stampWebGL(
             startPos.x,
@@ -2495,7 +2861,21 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           );
         }
         p.webglBrushRef.current?.flushDisplay(p.flushDisplayCapRef.current);
-        cb.compositeWithStrokePreview(p.lastCompositeOpacityRef.current, tool);
+        // For liquify: do NOT call compositeWithStrokePreview at pointer-down.
+        // The stroke-active flag in useLiquifySystem gates scheduleComposite
+        // so no pre-warp layer state can reach the display canvas.
+        // The first pointer-move RAF will composite correctly after warp is applied.
+        if (tool !== "liquify") {
+          // Use the dirty rect from the initial stamp (set by stampWebGL above) so only
+          // the stamp area is composited — avoids a full-canvas redraw for the first stamp.
+          const _initDR = p.strokeDirtyRectRef.current;
+          const _initUseDirty = _initDR ? _initDR : undefined;
+          cb.compositeWithStrokePreview(
+            p.lastCompositeOpacityRef.current,
+            tool,
+            _initUseDirty,
+          );
+        }
         p.strokeStampsPlacedRef.current = 1;
       }
     }
@@ -2834,6 +3214,12 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       const drag = p.floatDragStartRef.current;
       const dx = pos3.x - drag.px;
       const dy = pos3.y - drag.py;
+
+      // Keep cursor matching the active drag handle while dragging
+      if (p.transformHandleRef.current) {
+        cb.updateTransformCursorForHandle(p.transformHandleRef.current);
+      }
+
       if (
         (p.activeToolRef.current === "transform" ||
           p.activeToolRef.current === "move") &&
@@ -2846,8 +3232,10 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         if (handle === "rot") {
           const xfRot = p.xfStateRef.current;
           if (!xfRot) return;
-          const cx = xfRot.x + xfRot.w / 2;
-          const cy = xfRot.y + xfRot.h / 2;
+          // Use the pivot captured at drag-start so the rotation center never
+          // drifts if the box was scaled or moved earlier in the same session.
+          const cx = drag.pivotX ?? xfRot.x + xfRot.w / 2;
+          const cy = drag.pivotY ?? xfRot.y + xfRot.h / 2;
           const startAngle = Math.atan2(drag.py - cy, drag.px - cx);
           const curAngle = Math.atan2(pos3.y - cy, pos3.x - cx);
           const initRot = drag.initRotation ?? 0;
@@ -2874,32 +3262,50 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           let newY = origBounds.y;
           let newW = origBounds.w;
           let newH = origBounds.h;
+          // Pivot (opposite handle) captured at drag-start — the fixed anchor point.
+          // For each handle, the opposite edge stays pinned to the pivot coordinate.
+          const pX = drag.pivotX ?? origBounds.x + origBounds.w / 2;
+          const pY = drag.pivotY ?? origBounds.y + origBounds.h / 2;
           if (handle === "nw") {
+            // Dragged: top-left. Pivot: bottom-right (pX, pY).
             newX = origBounds.x + dx2;
             newY = origBounds.y + dy2;
-            newW = origBounds.w - dx2;
-            newH = origBounds.h - dy2;
+            newW = pX - newX;
+            newH = pY - newY;
           } else if (handle === "ne") {
+            // Dragged: top-right. Pivot: bottom-left (pX, pY).
             newY = origBounds.y + dy2;
-            newW = origBounds.w + dx2;
-            newH = origBounds.h - dy2;
+            newW = origBounds.x + origBounds.w + dx2 - pX;
+            newX = pX;
+            newH = pY - newY;
           } else if (handle === "sw") {
+            // Dragged: bottom-left. Pivot: top-right (pX, pY).
             newX = origBounds.x + dx2;
-            newW = origBounds.w - dx2;
-            newH = origBounds.h + dy2;
+            newW = pX - newX;
+            newH = origBounds.y + origBounds.h + dy2 - pY;
+            newY = pY;
           } else if (handle === "se") {
-            newW = origBounds.w + dx2;
-            newH = origBounds.h + dy2;
+            // Dragged: bottom-right. Pivot: top-left (pX, pY).
+            newX = pX;
+            newY = pY;
+            newW = origBounds.x + origBounds.w + dx2 - pX;
+            newH = origBounds.y + origBounds.h + dy2 - pY;
           } else if (handle === "n") {
+            // Dragged: top edge. Pivot: bottom edge (pY fixed).
             newY = origBounds.y + dy2;
-            newH = origBounds.h - dy2;
+            newH = pY - newY;
           } else if (handle === "s") {
-            newH = origBounds.h + dy2;
+            // Dragged: bottom edge. Pivot: top edge (pY fixed).
+            newY = pY;
+            newH = origBounds.y + origBounds.h + dy2 - pY;
           } else if (handle === "w") {
+            // Dragged: left edge. Pivot: right edge (pX fixed).
             newX = origBounds.x + dx2;
-            newW = origBounds.w - dx2;
+            newW = pX - newX;
           } else if (handle === "e") {
-            newW = origBounds.w + dx2;
+            // Dragged: right edge. Pivot: left edge (pX fixed).
+            newX = pX;
+            newW = origBounds.x + origBounds.w + dx2 - pX;
           }
           if (e.shiftKey && origBounds.w > 0 && origBounds.h > 0) {
             const aspect = origBounds.w / origBounds.h;
@@ -2907,23 +3313,21 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               Math.abs(newW - origBounds.w) >= Math.abs(newH - origBounds.h)
             ) {
               newH = newW / aspect;
-              if (handle === "nw" || handle === "n")
-                newY = origBounds.y + origBounds.h - newH;
+              if (handle === "nw" || handle === "n") newY = pY - newH;
             } else {
               newW = newH * aspect;
-              if (handle === "nw" || handle === "w")
-                newX = origBounds.x + origBounds.w - newW;
+              if (handle === "nw" || handle === "w") newX = pX - newW;
             }
           }
           const MIN = 10;
           if (newW < MIN) {
             if (handle === "nw" || handle === "w" || handle === "sw")
-              newX = origBounds.x + origBounds.w - MIN;
+              newX = pX - MIN;
             newW = MIN;
           }
           if (newH < MIN) {
             if (handle === "nw" || handle === "n" || handle === "ne")
-              newY = origBounds.y + origBounds.h - MIN;
+              newY = pY - MIN;
             newH = MIN;
           }
           const xfScale = p.xfStateRef.current;
@@ -2953,6 +3357,32 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       }
       cb.scheduleComposite();
       return;
+    }
+
+    // Hover cursor update: transform tool active, not actively dragging
+    if (
+      (p.activeToolRef.current === "move" ||
+        p.activeToolRef.current === "transform") &&
+      (p.transformActiveRef.current || p.isDraggingFloatRef.current) &&
+      !p.floatDragStartRef.current
+    ) {
+      const displayHov = p.displayCanvasRef.current;
+      const containerHov = p.containerRef.current;
+      if (displayHov && containerHov) {
+        const posHov = _getCanvasPosTransformed(
+          e.clientX,
+          e.clientY,
+          containerHov,
+          displayHov,
+          p.viewTransformRef.current,
+          p.isFlippedRef.current,
+        );
+        const hovHandle = p.transformActionsRef.current.hitTestTransformHandle(
+          posHov.x,
+          posHov.y,
+        );
+        cb.updateTransformCursorForHandle(hovHandle);
+      }
     }
 
     if (!p.isDrawingRef.current) return;
@@ -2991,7 +3421,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     if (tool === "smudge") {
       // Bug 1 fix: resolve multi-layer selection so smudge applies to all selected layers
       const _smudgeSel = getEffectivelySelectedLayers(
-        p.layerTreeRef.current,
+        p.layersRef.current as FlatEntry[],
         p.selectedLayerIdsRef.current,
       );
       const _isSmudgeMulti = _smudgeSel.length > 1;
@@ -3057,9 +3487,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               };
               if (_isSmudgeMulti) {
                 for (const layerItem of _smudgeSel) {
-                  const _smearLc = p.layerCanvasesRef.current.get(
-                    layerItem.layer.id,
-                  );
+                  const _smearLc = p.layerCanvasesRef.current.get(layerItem.id);
                   if (_smearLc) {
                     cb.renderSmearAlongPoints(
                       _smearLc,
@@ -3069,7 +3497,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
                       effectiveSmearStrength,
                     );
                     // Invalidate bitmap cache so compositor re-reads live canvas on next frame
-                    markLayerBitmapDirty(layerItem.layer.id);
+                    markLayerBitmapDirty(layerItem.id);
                   }
                 }
               } else {
@@ -3094,9 +3522,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             if (sceDist > 0.5) {
               if (_isSmudgeMulti) {
                 for (const layerItem of _smudgeSel) {
-                  const _smearLc = p.layerCanvasesRef.current.get(
-                    layerItem.layer.id,
-                  );
+                  const _smearLc = p.layerCanvasesRef.current.get(layerItem.id);
                   if (_smearLc) {
                     cb.renderSmearAlongPoints(
                       _smearLc,
@@ -3106,7 +3532,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
                       effectiveSmearStrength,
                     );
                     // Invalidate bitmap cache so compositor re-reads live canvas on next frame
-                    markLayerBitmapDirty(layerItem.layer.id);
+                    markLayerBitmapDirty(layerItem.id);
                   }
                 }
               } else {
@@ -3153,13 +3579,14 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         });
       }
     } else if (tool === "liquify") {
-      const _liqMoveSel2 = getEffectivelySelectedLayers(
-        p.layerTreeRef.current,
-        p.selectedLayerIdsRef.current,
-      );
+      // Reuse the canvas for the active layer (or first visible layer as fallback).
+      // The actual per-layer rendering uses _liqBatchLayersRef built at pointer-down.
       let liqLc = p.layerCanvasesRef.current.get(layerId);
-      if (!liqLc && _liqMoveSel2.length > 0) {
-        liqLc = p.layerCanvasesRef.current.get(_liqMoveSel2[0].layer.id);
+      if (!liqLc) {
+        const _fallbackBatch = _liqBatchLayersRef.current;
+        if (_fallbackBatch.length > 0) {
+          liqLc = p.layerCanvasesRef.current.get(_fallbackBatch[0].layerId);
+        }
       }
       if (liqLc) {
         const liqCtx = liqLc.getContext("2d", { willReadFrequently: !isIPad });
@@ -3170,11 +3597,27 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               ? coalescedEvents
               : [e];
           const containerRect = container.getBoundingClientRect();
-          const _liqMoveSel = _liqMoveSel2;
-          const _liqMoveIsMulti =
-            _liqMoveSel.length > 1 &&
-            p.liquifyMultiBeforeSnapshotsRef.current.size > 1;
-          for (const ce of evts) {
+          // Use the multi/stride flags captured at stroke-start — fixed for the
+          // entire stroke duration, no per-event recalculation.
+          const _liqMoveIsMulti = _liqIsMultiRef.current;
+          const _liqStride = _liqStrideRef.current;
+          // Pre-read the batch array once for the whole pointer-move call
+          const _liqBatch = _liqBatchLayersRef.current;
+
+          // Reset per-frame dirty rect at the start of processing this batch
+          resetLiquifyFrameDirty();
+
+          const lastEvtIndex = evts.length - 1;
+          for (let _evtIdx = 0; _evtIdx < evts.length; _evtIdx++) {
+            const ce = evts[_evtIdx];
+            const isLastEvt = _evtIdx === lastEvtIndex;
+
+            // Throttle: in multi-layer mode skip every other non-final event
+            if (_liqMoveIsMulti && !isLastEvt) {
+              _liqThrottleCounterRef.current++;
+              if (_liqThrottleCounterRef.current % 2 !== 0) continue;
+            }
+
             const cePos = _getCanvasPosWithRect(
               ce.clientX,
               ce.clientY,
@@ -3193,6 +3636,21 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               if (ddist >= spacing) {
                 const ndx = ddist > 0 ? ddx / ddist : 0;
                 const ndy = ddist > 0 ? ddy / ddist : 0;
+
+                // Compute stamp bounds — expand per-frame dirty rect
+                const stampX0 = Math.max(0, Math.floor(cePos.x - radius));
+                const stampY0 = Math.max(0, Math.floor(cePos.y - radius));
+                const stampX1 = Math.min(
+                  getLiquifySnapW() > 0 ? getLiquifySnapW() : liqLc.width,
+                  Math.ceil(cePos.x + radius + 1),
+                );
+                const stampY1 = Math.min(
+                  getLiquifySnapH() > 0 ? getLiquifySnapH() : liqLc.height,
+                  Math.ceil(cePos.y + radius + 1),
+                );
+                expandLiquifyFrameDirty(stampX0, stampY0, stampX1, stampY1);
+
+                // Compute displacement once — reused for all layers
                 updateLiquifyDisplacementField(
                   cePos.x,
                   cePos.y,
@@ -3201,31 +3659,31 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
                   ndx,
                   ndy,
                 );
-                if (_liqMoveIsMulti) {
-                  // BUG_4 FIX: displacement field is computed once above, then applied to
-                  // each layer using its own per-stroke snapshot. We collect all layer
-                  // renders first, then trigger a SINGLE composite at the very end —
-                  // never between layers, which is what caused the jumping artifact.
+
+                if (_liqMoveIsMulti && _liqBatch.length > 0) {
+                  // Apply the same displacement field to every layer in the
+                  // pre-built batch. No merging/compositing — each layer is
+                  // processed and written back independently.
                   const savedSnapshot = getLiquifySnapshot();
-                  for (const layerItem of _liqMoveSel) {
-                    const lid2 = layerItem.layer.id;
-                    const lc2 = p.layerCanvasesRef.current.get(lid2);
-                    if (!lc2) continue;
-                    const ctx2 = lc2.getContext("2d", {
-                      willReadFrequently: !isIPad,
-                    });
-                    if (!ctx2) continue;
-                    const perSnap =
-                      p.liquifyMultiBeforeSnapshotsRef.current.get(lid2);
-                    if (perSnap) {
-                      setLiquifySnapshot(perSnap);
-                      renderLiquifyFromSnapshot(ctx2);
-                    }
-                  }
-                  // Restore to the original all-layers snapshot (not per-layer)
+                  renderLiquifyMultiLayer(_liqBatch, _liqStride);
+                  // Restore global snapshot pointer (renderLiquifyMultiLayer
+                  // may have shifted it while iterating per-layer snapshots)
                   setLiquifySnapshot(savedSnapshot);
+                  // Invalidate bitmap caches for all rendered layers
+                  for (const batchItem of _liqBatch) {
+                    markLayerBitmapDirty(batchItem.layerId);
+                  }
                 } else {
-                  renderLiquifyFromSnapshot(liqCtx);
+                  // Single-layer path: ruler layer guard — silently skip the write
+                  const _liqActiveLayer = p.layersRef.current.find(
+                    (l) => l.id === layerId,
+                  );
+                  if (
+                    !(_liqActiveLayer as { isRuler?: boolean } | undefined)
+                      ?.isRuler
+                  ) {
+                    renderLiquifyFromSnapshot(liqCtx);
+                  }
                 }
                 p.lastPosRef.current = cePos;
               }
@@ -3233,6 +3691,10 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               p.lastPosRef.current = cePos;
             }
           }
+
+          // Defer composite to rAF via scheduleComposite — deduped internally.
+          // scheduleComposite is a no-op while liquifyStrokeActive is true, so
+          // no pre-warp state can flash at stroke start.
           cb.scheduleComposite();
         }
       }
@@ -3303,8 +3765,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               (1 - settings.minSize / 100) * curvedPressure)
           : baseSize;
         const flow = settings.flow ?? 1.0;
-        // STEP 5: cappedOpacity is always flow — unconditionally, no pressure gating.
         const cappedOpacity = (() => {
+          if (settings.pressureOpacity) return flow;
           if (settings.pressureFlow)
             return (
               flow *
@@ -3320,10 +3782,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         p.flushDisplayCapRef.current = settings.pressureOpacity
           ? baseOpacity
           : 1.0;
-        // STEP 2d: _moveCapAlpha is always numeric
         const _moveCapAlpha = settings.pressureOpacity
           ? curvedPressure * baseOpacity
-          : baseOpacity;
+          : undefined;
         const sbufCtxMove = p.strokeBufferRef.current?.getContext("2d", {
           willReadFrequently: !isIPad,
         });
@@ -3807,6 +4268,67 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           pts: { x: number; y: number }[],
           ev?: PointerEvent | null,
         ) => {
+          // ── Lasso fill hook ───────────────────────────────────────────────
+          // When the fill tool is active in lasso fill mode, fill the enclosed
+          // region instead of creating a selection. The lasso tool's core path
+          // tracking and boundary detection logic is unchanged — we only intercept
+          // the close event here.
+          if (
+            p.activeToolRef.current === "fill" &&
+            p.fillModeRef.current === "lasso" &&
+            pts.length >= 3
+          ) {
+            const layerId = p.activeLayerIdRef.current;
+            const lc = p.layerCanvasesRef.current.get(layerId);
+            if (lc) {
+              const col = p.colorRef.current;
+              const [cr, cg, cbC] = hsvToRgb(col.h, col.s, col.v) as [
+                number,
+                number,
+                number,
+              ];
+              // Capture before state for undo
+              const lcCtx = lc.getContext("2d", {
+                willReadFrequently: !isIPad,
+              });
+              const beforePixels =
+                lcCtx?.getImageData(0, 0, lc.width, lc.height) ?? null;
+              // Apply lasso fill — handles semi-transparent blending and edge expansion
+              cb.applyLassoFill(
+                lc,
+                pts,
+                Math.round(cr),
+                Math.round(cg),
+                Math.round(cbC),
+              );
+              cb.composite();
+              markLayerBitmapDirty(layerId);
+              const afterPixels =
+                lcCtx?.getImageData(0, 0, lc.width, lc.height) ?? null;
+              if (beforePixels && afterPixels) {
+                cb.pushHistory({
+                  type: "pixels",
+                  layerId,
+                  before: beforePixels,
+                  after: afterPixels,
+                });
+              }
+              markCanvasDirty(layerId);
+            }
+            // Reset lasso drawing state — do NOT create a selection
+            p.selectionDraftPointsRef.current = [];
+            p.selectionDraftCursorRef.current = null;
+            p.isDrawingSelectionRef.current = false;
+            p.lassoHasPolyPointsRef.current = false;
+            p.lassoIsDraggingRef.current = false;
+            p.lassoStrokeStartRef.current = null;
+            p.selectionPolyClosingRef.current = false;
+            p.selectionBeforeRef.current = null;
+            cb.scheduleComposite();
+            return;
+          }
+          // ── End lasso fill hook ───────────────────────────────────────────
+
           if (pts.length >= 3) {
             if ((ev?.shiftKey || ev?.altKey) && p.selectionMaskRef.current) {
               const tempC2 = document.createElement("canvas");
@@ -3964,6 +4486,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
 
     // Liquify: commit stroke as one history entry
     if (p.activeToolRef.current === "liquify") {
+      // Stroke is ending — clear the single authoritative suppression flag so
+      // subsequent non-liquify composites are not accidentally blocked.
+      setLiquifyStrokeActive(false);
       if (p.liquifyHoldIntervalRef.current) {
         clearInterval(p.liquifyHoldIntervalRef.current);
         p.liquifyHoldIntervalRef.current = null;
@@ -3990,6 +4515,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           markCanvasDirty(lid);
         }
         p.liquifyMultiBeforeSnapshotsRef.current.clear();
+        _liqBatchLayersRef.current = [];
         p.isCommittingRef.current = false;
         p.lastPosRef.current = null;
         cb.composite();
@@ -3999,6 +4525,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       const liqLc = p.layerCanvasesRef.current.get(liqLayerId);
       const liqBefore = p.liquifyBeforeSnapshotRef.current;
       p.liquifyBeforeSnapshotRef.current = null;
+      _liqBatchLayersRef.current = [];
       if (liqLc && liqBefore) {
         const liqCtx = liqLc.getContext("2d", { willReadFrequently: !isIPad });
         if (liqCtx) {
@@ -4485,6 +5012,25 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         [hex, ...prev.filter((c) => c !== hex)].slice(0, 8),
       );
     }
+
+    // ── Pending spring-load restore ──
+    // If a spring key was released mid-stroke, apply the deferred tool restore now.
+    if (
+      p.pendingSpringRestoreRef.current &&
+      p.springLoadedPreviousToolRef.current !== null
+    ) {
+      const _restoreTool = p.springLoadedPreviousToolRef.current;
+      p.springLoadedPreviousToolRef.current = null;
+      p.springLoadedKeyRef.current = null;
+      p.pendingSpringRestoreRef.current = false;
+      p.holdTimerRef.current = null;
+      p.pendingSpringKeyRef.current = null;
+      p.pendingSpringToolRef.current = null;
+      // Use a microtask to ensure all stroke state is fully settled before switching
+      Promise.resolve().then(() => {
+        callbacksRef.current.handleToolChange(_restoreTool);
+      });
+    }
   }, []);
 
   // ── 6. Attach pointer events to display canvas ───────────────────────────
@@ -4493,6 +5039,11 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     const canvas = displayCanvasRef.current;
     if (!canvas) return;
     const onLeave = (e: PointerEvent) => {
+      // If there's an active off-canvas pending stroke, don't hide the cursor
+      // or terminate the stroke — the window-level listeners keep tracking it.
+      if (_offCanvasStrokeRef.current) {
+        return;
+      }
       if (softwareCursorRef.current)
         softwareCursorRef.current.style.display = "none";
       // Reset stored position so updateBrushCursor won't re-show the software
@@ -4508,7 +5059,24 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       // Update pointer position so the software cursor doesn't snap to (0,0)
       p.pointerScreenPosRef.current = { x: e.clientX, y: e.clientY };
       updateBrushCursorRef.current();
+
+      // If a stroke started off-canvas and pointer is now entering the canvas,
+      // begin painting from the buffered off-canvas path.
+      if (_offCanvasStrokeRef.current && !p.isDrawingRef.current) {
+        _offCanvasStrokeRef.current = false;
+        const buffered = _offCanvasPendingPathRef.current;
+        _offCanvasPendingPathRef.current = [];
+
+        // Start the stroke at the canvas entry point (current event)
+        handlePointerDown(e);
+
+        // Replay any buffered moves that came after the entry point
+        for (const bufferedMove of buffered) {
+          handlePointerMove(bufferedMove);
+        }
+      }
     };
+
     canvas.addEventListener("pointerenter", onEnter, { passive: true });
     canvas.addEventListener("pointerdown", handlePointerDown, {
       passive: false,
@@ -4528,4 +5096,115 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       canvas.removeEventListener("pointerleave", onLeave);
     };
   }, [handlePointerDown, handlePointerMove, handlePointerUp]);
+
+  // ── 7. Window-level listeners for off-canvas stroke start & cursor ────────
+  // These allow strokes that begin outside the canvas element to carry onto
+  // the canvas naturally. The brush cursor also shows in the viewport bg area.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all mutable state accessed via stable refs
+  useEffect(() => {
+    // Tracks whether a stroke started off-canvas and hasn't yet entered the canvas
+    _offCanvasStrokeRef.current = false;
+    // Buffered pointermove events while the off-canvas stroke hasn't entered yet
+    _offCanvasPendingPathRef.current = [];
+
+    const isPointerOverCanvas = (e: PointerEvent): boolean => {
+      const canvas = displayCanvasRef.current;
+      if (!canvas) return false;
+      const rect = canvas.getBoundingClientRect();
+      return (
+        e.clientX >= rect.left &&
+        e.clientX <= rect.right &&
+        e.clientY >= rect.top &&
+        e.clientY <= rect.bottom
+      );
+    };
+
+    const isPointerOverContainer = (e: PointerEvent): boolean => {
+      const container = containerRef.current;
+      if (!container) return false;
+      const rect = container.getBoundingClientRect();
+      return (
+        e.clientX >= rect.left &&
+        e.clientX <= rect.right &&
+        e.clientY >= rect.top &&
+        e.clientY <= rect.bottom
+      );
+    };
+
+    const onWindowPointerDown = (e: PointerEvent) => {
+      // Only track mouse and pen (stylus). Ignore touch (handled by touch system).
+      if (e.pointerType === "touch") return;
+      // If pointer is on the canvas, the canvas listener handles it — don't duplicate.
+      if (isPointerOverCanvas(e)) return;
+      // Only care if pointer is within the viewport container background.
+      if (!isPointerOverContainer(e)) return;
+
+      // A stroke is starting off-canvas inside the viewport area.
+      _offCanvasStrokeRef.current = true;
+      _offCanvasPendingPathRef.current = [];
+    };
+
+    const onWindowPointerMove = (e: PointerEvent) => {
+      if (e.pointerType === "touch") return;
+
+      // Hide the software cursor whenever the pointer is outside the canvas.
+      // It is only shown inside onEnter / onMove (canvas-bound handlers).
+      if (!isPointerOverCanvas(e)) {
+        const sc = softwareCursorRef.current;
+        if (sc && sc.style.display !== "none") {
+          sc.style.display = "none";
+        }
+      }
+
+      // Update screen position so off-canvas stroke buffering stays accurate.
+      if (isPointerOverContainer(e)) {
+        p.pointerScreenPosRef.current = { x: e.clientX, y: e.clientY };
+      }
+
+      // If an off-canvas stroke is pending (not yet entered the canvas),
+      // buffer moves so they can be replayed once the pointer enters the canvas.
+      if (_offCanvasStrokeRef.current && !p.isDrawingRef.current) {
+        if (isPointerOverCanvas(e)) {
+          // Pointer just entered the canvas mid-move — the pointerenter event
+          // on the canvas will fire and handle starting the stroke with replay.
+          // Don't push this move to the buffer; let pointerenter take it.
+        } else {
+          // Still off-canvas — buffer the event for potential future replay.
+          // Keep the buffer small (last 16 events) to avoid excess memory use.
+          const buf = _offCanvasPendingPathRef.current;
+          buf.push(e);
+          if (buf.length > 16) buf.shift();
+        }
+      }
+    };
+
+    const onWindowPointerUp = (e: PointerEvent) => {
+      if (e.pointerType === "touch") return;
+      // Clear any off-canvas stroke state regardless of where pointer is.
+      _offCanvasStrokeRef.current = false;
+      _offCanvasPendingPathRef.current = [];
+      // If we were drawing (stroke already started on canvas), let handlePointerUp commit.
+      // The canvas pointerup listener handles it if the pointer is over the canvas,
+      // but if the user releases outside the canvas while drawing, we need to commit here.
+      if (p.isDrawingRef.current && !isPointerOverCanvas(e)) {
+        handlePointerUp(e);
+      }
+    };
+
+    window.addEventListener("pointerdown", onWindowPointerDown, {
+      passive: false,
+    });
+    window.addEventListener("pointermove", onWindowPointerMove, {
+      passive: true,
+    });
+    window.addEventListener("pointerup", onWindowPointerUp, { passive: false });
+
+    return () => {
+      window.removeEventListener("pointerdown", onWindowPointerDown);
+      window.removeEventListener("pointermove", onWindowPointerMove);
+      window.removeEventListener("pointerup", onWindowPointerUp);
+    };
+  }, [handlePointerDown, handlePointerMove, handlePointerUp]);
+
+  return { shiftHeld };
 }

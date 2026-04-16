@@ -1,6 +1,5 @@
 import { Button } from "@/components/ui/button";
 import {
-  BookOpen,
   FolderOpen,
   GraduationCap,
   LogIn,
@@ -20,8 +19,6 @@ interface NewCanvasOptions {
 }
 
 interface SplashScreenProps {
-  /** Whether a local session exists (shows Resume button) */
-  hasLocalSession: boolean;
   /** If logged in, show principal */
   principalId?: string;
   isLoggedIn: boolean;
@@ -29,7 +26,6 @@ interface SplashScreenProps {
   onLogout: () => void;
   onNewCanvas: (opts: NewCanvasOptions) => void;
   onOpenFile: (file: File) => void;
-  onResume: () => void;
 }
 
 const PRESETS: { label: string; w: number; h: number }[] = [
@@ -43,21 +39,19 @@ const PRESETS: { label: string; w: number; h: number }[] = [
 type View = "main" | "new-canvas";
 
 export function SplashScreen({
-  hasLocalSession,
   principalId,
   isLoggedIn,
   onLogin,
   onLogout,
   onNewCanvas,
   onOpenFile,
-  onResume,
 }: SplashScreenProps) {
   const [view, setView] = useState<View>("main");
   const [orientation, setOrientation] = useState<"landscape" | "portrait">(
     "landscape",
   );
-  const [customW, setCustomW] = useState("2560");
-  const [customH, setCustomH] = useState("1440");
+  const [customW, setCustomW] = useState("");
+  const [customH, setCustomH] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const screenPreset = {
@@ -79,16 +73,13 @@ export function SplashScreen({
   };
 
   const handleCustomCreate = () => {
-    const w = Math.max(
-      1,
-      Math.min(16384, Number.parseInt(customW, 10) || 2560),
-    );
-    const h = Math.max(
-      1,
-      Math.min(16384, Number.parseInt(customH, 10) || 1440),
-    );
-    const final = applyOrientation(w, h);
-    onNewCanvas(final);
+    const w = Math.max(1, Math.min(16384, Number.parseInt(customW, 10) || 0));
+    const h = Math.max(1, Math.min(16384, Number.parseInt(customH, 10) || 0));
+    // Require both dimensions to be explicitly entered
+    if (!customW.trim() || !customH.trim() || w <= 0 || h <= 0) return;
+    // Custom sizes: width is always width, height is always height.
+    // Orientation toggle only applies to presets, NOT to custom sizes.
+    onNewCanvas({ width: w, height: h });
   };
 
   const handleOpenFile = () => {
@@ -278,41 +269,6 @@ export function SplashScreen({
               >
                 Start
               </h2>
-
-              {/* Resume */}
-              <button
-                type="button"
-                data-ocid="splash.resume_button"
-                onClick={onResume}
-                disabled={!hasLocalSession}
-                className="flex items-center gap-4 p-4 rounded-xl text-left transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
-                style={{
-                  backgroundColor: "oklch(var(--toolbar))",
-                  border: "1px solid oklch(var(--outline))",
-                  color: "oklch(var(--text))",
-                }}
-              >
-                <div
-                  className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0"
-                  style={{ backgroundColor: "oklch(var(--accent))" }}
-                >
-                  <BookOpen
-                    size={18}
-                    style={{ color: "oklch(var(--accent-text))" }}
-                  />
-                </div>
-                <div>
-                  <div className="font-semibold text-sm">Resume</div>
-                  <div
-                    className="text-xs mt-0.5"
-                    style={{ color: "oklch(var(--muted-text))" }}
-                  >
-                    {hasLocalSession
-                      ? "Continue your last session"
-                      : "No session saved"}
-                  </div>
-                </div>
-              </button>
 
               {/* New Canvas */}
               <button

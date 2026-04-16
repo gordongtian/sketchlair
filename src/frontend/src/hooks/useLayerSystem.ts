@@ -1,10 +1,25 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import type React from "react";
 import type { Layer } from "../components/LayersPanel";
 import type { SelectionSnapshot } from "../selectionTypes";
-import type { LayerNode, RulerFields } from "../types";
-import { generateGroupId, groupNodes, ungroupNodes } from "../utils/layerTree";
+import type {
+  Layer as FlatLayer,
+  GroupHeader,
+  PaintLayer,
+  RulerFields,
+} from "../types";
+import {
+  createGroupPair,
+  generateGroupId,
+  getGroupIdCounter,
+  getGroupSlice,
+  isFlatEndGroup,
+  isFlatGroupHeader,
+  isFlatLayer,
+  setGroupIdCounter,
+} from "../utils/groupUtils";
 import { markCanvasDirty } from "./useCompositing";
+import { useRefState } from "./useRefState";
 
 // Module-level reusable canvas for thumbnail generation in layer ops
 const _layerSysThumbCanvas = document.createElement("canvas");
@@ -13,6 +28,7 @@ _layerSysThumbCanvas.height = 144;
 const _layerSysThumbCtx = _layerSysThumbCanvas.getContext("2d", {
   willReadFrequently: true,
 })!;
+void _layerSysThumbCtx; // referenced for side-effects only
 
 // Pre-computed white thumbnail data URL (avoids per-layer-add canvas allocation)
 const _whiteThumbnailCanvas = document.createElement("canvas");
@@ -24,6 +40,13 @@ _whiteThumbnailCtx.fillRect(0, 0, 144, 144);
 const WHITE_THUMBNAIL = _whiteThumbnailCanvas.toDataURL();
 
 export type RulerState = Omit<RulerFields, "isRuler" | "rulerActive">;
+
+// ── History entry types ───────────────────────────────────────────────────────
+//
+// The canonical history entry for layer-state changes stores full flat-array
+// snapshots.  Individual-property entries (blend-mode, opacity, etc.) are kept
+// for lightweight changes that don't need a full snapshot, but group create/
+// delete/reorder all use layersBefore/layersAfter.
 
 export type UndoEntry =
   | {
@@ -65,9 +88,7 @@ export type UndoEntry =
       belowLayerId: string;
       belowPixelsBefore: ImageData;
       belowPixelsAfter: ImageData;
-      /** isClippingMask value of the below layer before the merge (for undo) */
       belowLayerIsClippingMaskBefore: boolean;
-      /** isClippingMask value of the below layer after the merge (for redo) */
       belowLayerIsClippingMaskAfter: boolean;
     }
   | {
@@ -88,30 +109,26 @@ export type UndoEntry =
       removedLayers: Array<{ layer: Layer; index: number }>;
     }
   | {
+      /** Flat-array snapshot for group create (new architecture). */
       type: "layer-group-create";
-      /** Tree state before grouping (for undo) */
-      treeBefore: LayerNode[];
-      /** Tree state after grouping (for redo) */
-      treeAfter: LayerNode[];
-      /** Flat layers before grouping (for undo) */
       layersBefore: Layer[];
-      /** Flat layers after grouping (for redo) */
       layersAfter: Layer[];
+      counterBefore?: number;
+      counterAfter?: number;
+      // Legacy tree fields kept for useHistory backward compat (unused here)
+      treeBefore?: import("../types").LayerNode[];
+      treeAfter?: import("../types").LayerNode[];
     }
   | {
+      /** Flat-array snapshot for group delete (new architecture). */
       type: "layer-group-delete";
-      /** Tree state before deletion (for undo) */
-      treeBefore: LayerNode[];
-      /** Tree state after deletion (for redo) */
-      treeAfter: LayerNode[];
-      /** Flat layers before deletion (for undo) */
       layersBefore: Layer[];
-      /** Flat layers after deletion (for redo) */
       layersAfter: Layer[];
-      /** Layer canvases that were deleted (only for deleteChildren=true) */
       deletedCanvases: Map<string, ImageData>;
+      // Legacy tree fields kept for useHistory backward compat (unused here)
+      treeBefore?: import("../types").LayerNode[];
+      treeAfter?: import("../types").LayerNode[];
     }
-  // ── New history entry types for layer property changes ────────────────────
   | {
       type: "layer-opacity-change";
       layerId: string;
@@ -150,25 +167,40 @@ export type UndoEntry =
     }
   | {
       type: "layer-reorder";
-      /** Tree state before reorder */
-      treeBefore: LayerNode[];
-      /** Tree state after reorder */
-      treeAfter: LayerNode[];
-      /** Flat layers before reorder */
       layersBefore: Layer[];
-      /** Flat layers after reorder */
       layersAfter: Layer[];
+      // Legacy tree fields kept for useHistory backward compat (unused here)
+      treeBefore?: import("../types").LayerNode[];
+      treeAfter?: import("../types").LayerNode[];
     }
   | {
-      /**
-       * Atomic multi-layer transform commit.
-       * Stores before/after ImageData for every layer involved in a single
-       * move/transform operation so undo/redo can restore ALL layers at once
-       * with a single Ctrl+Z press.
-       */
       type: "multi-layer-pixels";
       layers: Map<string, { before: ImageData; after: ImageData }>;
     };
+
+// ── Entry handler types ───────────────────────────────────────────────────────
+
+type LayerSystemEntry = Extract<
+  UndoEntry,
+  | { type: "blend-mode" }
+  | { type: "layer-opacity-change" }
+  | { type: "group-opacity-change" }
+  | { type: "layer-visibility-change" }
+  | { type: "alpha-lock-change" }
+  | { type: "clipping-mask-change" }
+  | { type: "layer-rename" }
+  | { type: "layer-reorder" }
+  | { type: "layer-group-create" }
+  | { type: "layer-group-delete" }
+>;
+
+export type { LayerSystemEntry };
+
+// ── Prop types ────────────────────────────────────────────────────────────────
+
+// Convenience cast: convert FlatLayer[] (types.ts) → Layer[] (LayersPanel.tsx).
+// These are identical at runtime — only TypeScript sees them as different types.
+const asLegacyLayers = (arr: FlatLayer[]): Layer[] => arr as unknown as Layer[];
 
 interface UseLayerSystemProps {
   layers: Layer[];
@@ -179,7 +211,6 @@ interface UseLayerSystemProps {
   newLayerFn: () => Layer;
   canvasWidth: number;
   canvasHeight: number;
-  // Refs passed directly from PaintingApp (cannot use context — hook is called before provider)
   activeLayerIdRef: React.MutableRefObject<string>;
   layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   undoStackRef: React.MutableRefObject<UndoEntry[]>;
@@ -199,17 +230,22 @@ interface UseLayerSystemProps {
     React.SetStateAction<Record<string, string>>
   >;
   markLayerBitmapDirty: (id: string) => void;
-  /** Stable ref that mirrors selectedLayerIds — updated synchronously here so
-   *  useTransformSystem.extractFloat always reads the current selection even on
-   *  the first render cycle after a selection change. */
   selectedLayerIdsRef?: React.MutableRefObject<Set<string>>;
-  /** Optional: callback for confirming group deletion (set by consumer) */
   onGroupDeleteConfirm?: (groupId: string, deleteChildren: boolean) => void;
+  /**
+   * Canvas integrity utility from PaintingApp — returns a correctly-sized
+   * HTMLCanvasElement for the given layerId, creating or resizing it if needed.
+   * Must be called immediately after any new layer object is inserted into the
+   * layers array so the canvas exists before composite() or flushStrokeBuffer() runs.
+   */
+  getOrCreateLayerCanvas: (layerId: string) => HTMLCanvasElement;
 }
 
+// ── useLayerSystem ────────────────────────────────────────────────────────────
+
 export function useLayerSystem({
-  layers,
-  setLayers,
+  layers: _layers,
+  setLayers: _setLayers,
   setActiveLayerId,
   composite,
   setUndoCount,
@@ -226,22 +262,40 @@ export function useLayerSystem({
   setLayerThumbnails,
   markLayerBitmapDirty,
   selectedLayerIdsRef,
+  getOrCreateLayerCanvas,
 }: UseLayerSystemProps) {
+  // Cast to the new discriminated-union type internally.
+  // At runtime these are the same objects — the legacy Layer type from
+  // LayersPanel simply lacks the `type` discriminant in its TypeScript definition.
+  const layers = _layers as FlatLayer[];
+  // Wrapper that accepts FlatLayer[] and forwards to the original dispatch.
+  // Using a stable ref ensures useCallback deps don't flag this as unstable.
+  const setLayersRef = useRef(_setLayers);
+  setLayersRef.current = _setLayers;
+  const setLayers = useCallback(
+    (arg: FlatLayer[] | Layer[] | ((prev: FlatLayer[]) => FlatLayer[])) => {
+      if (typeof arg === "function") {
+        setLayersRef.current(
+          (prev) => arg(prev as FlatLayer[]) as unknown as Layer[],
+        );
+      } else {
+        setLayersRef.current(arg as unknown as Layer[]);
+      }
+    },
+    [],
+  );
   // ── Multi-select state ────────────────────────────────────────────────────
-  const [selectedLayerIds, setSelectedLayerIds] = useState<Set<string>>(
-    () => new Set<string>(),
-  );
+  const [selectedLayerIds, _selectedLayerIdsRef, setSelectedLayerIds] =
+    useRefState<Set<string>>(new Set<string>());
 
-  // ── Layer tree state ──────────────────────────────────────────────────────
-  // The layer tree represents the full hierarchy (groups + layers).
-  // For backward compat, the flat `layers` array is still the source of truth
-  // for compositing; the tree state is maintained in parallel.
-  const [layerTree, setLayerTree] = useState<LayerNode[]>(() =>
-    layers.map((layer) => ({ kind: "layer" as const, id: layer.id, layer })),
-  );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: _selectedLayerIdsRef is a stable ref object
+  useEffect(() => {
+    if (selectedLayerIdsRef) {
+      selectedLayerIdsRef.current = _selectedLayerIdsRef.current;
+    }
+  }, [selectedLayerIds, selectedLayerIdsRef]);
 
   // ── History helpers ───────────────────────────────────────────────────────
-  /** Push an entry onto the undo stack and clear the redo stack. */
   const pushHistory = useCallback(
     (entry: UndoEntry) => {
       undoStackRef.current.push(entry);
@@ -252,7 +306,175 @@ export function useLayerSystem({
     [undoStackRef, redoStackRef, setUndoCount],
   );
 
+  // ── applyLayerEntry / undoLayerEntry ─────────────────────────────────────
+  // These own undo/redo logic for pure layer-state entry types.
+
+  const undoLayerEntry = useCallback(
+    (entry: LayerSystemEntry) => {
+      switch (entry.type) {
+        case "blend-mode":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, blendMode: entry.before } : l,
+            ),
+          );
+          break;
+
+        case "layer-opacity-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, opacity: entry.before } : l,
+            ),
+          );
+          break;
+
+        case "group-opacity-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.groupId && l.type === "group"
+                ? { ...l, opacity: entry.before }
+                : l,
+            ),
+          );
+          break;
+
+        case "layer-visibility-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, visible: entry.before } : l,
+            ),
+          );
+          break;
+
+        case "alpha-lock-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, alphaLock: entry.before } : l,
+            ),
+          );
+          break;
+
+        case "clipping-mask-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId
+                ? { ...l, isClippingMask: entry.before }
+                : l,
+            ),
+          );
+          break;
+
+        case "layer-rename":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, name: entry.before } : l,
+            ),
+          );
+          break;
+
+        case "layer-reorder":
+          setLayers(entry.layersBefore);
+          break;
+
+        case "layer-group-create":
+          if (entry.counterBefore !== undefined) {
+            setGroupIdCounter(entry.counterBefore);
+          }
+          setLayers(entry.layersBefore);
+          break;
+
+        case "layer-group-delete":
+          setLayers(entry.layersBefore);
+          break;
+      }
+    },
+    [setLayers],
+  );
+
+  const applyLayerEntry = useCallback(
+    (entry: LayerSystemEntry) => {
+      switch (entry.type) {
+        case "blend-mode":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, blendMode: entry.after } : l,
+            ),
+          );
+          break;
+
+        case "layer-opacity-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, opacity: entry.after } : l,
+            ),
+          );
+          break;
+
+        case "group-opacity-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.groupId && l.type === "group"
+                ? { ...l, opacity: entry.after }
+                : l,
+            ),
+          );
+          break;
+
+        case "layer-visibility-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, visible: entry.after } : l,
+            ),
+          );
+          break;
+
+        case "alpha-lock-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, alphaLock: entry.after } : l,
+            ),
+          );
+          break;
+
+        case "clipping-mask-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId
+                ? { ...l, isClippingMask: entry.after }
+                : l,
+            ),
+          );
+          break;
+
+        case "layer-rename":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, name: entry.after } : l,
+            ),
+          );
+          break;
+
+        case "layer-reorder":
+          setLayers(entry.layersAfter);
+          break;
+
+        case "layer-group-create":
+          if (entry.counterAfter !== undefined) {
+            setGroupIdCounter(entry.counterAfter);
+          }
+          setLayers(entry.layersAfter);
+          break;
+
+        case "layer-group-delete":
+          setLayers(entry.layersAfter);
+          break;
+      }
+    },
+    [setLayers],
+  );
+
   // ── Multi-select toggle ───────────────────────────────────────────────────
+  // biome-ignore lint/correctness/useExhaustiveDependencies: setSelectedLayerIds from useRefState is stable
   const handleToggleLayerSelection = useCallback(
     (id: string, shiftHeld: boolean) => {
       if (shiftHeld) {
@@ -263,21 +485,15 @@ export function useLayerSystem({
           } else {
             next.add(id);
           }
-          // FIX: Keep the stable ref in sync synchronously so that
-          // useTransformSystem.extractFloat always reads the current selection
-          // even if it is called in the same event-loop tick as this click
-          // (before the useEffect that mirrors state→ref has a chance to fire).
           if (selectedLayerIdsRef) {
             selectedLayerIdsRef.current = next;
           }
           return next;
         });
       } else {
-        // Single select — also sets active layer
         const next = new Set([id]);
         setSelectedLayerIds(next);
         setActiveLayerId(id);
-        // FIX: sync ref synchronously for single-select as well
         if (selectedLayerIdsRef) {
           selectedLayerIdsRef.current = next;
         }
@@ -295,42 +511,32 @@ export function useLayerSystem({
     }
     const layer = newLayerFn();
     const activeId = activeLayerIdRef.current;
-    // Compute the insertion index synchronously from the current layers array so
-    // the history entry records the correct index. The setLayers updater uses the
-    // same logic against `prev`, which will be the same array in the common case.
     const activeIdx = layers.findIndex((l) => l.id === activeId);
     const insertIdx = activeIdx >= 0 ? activeIdx : 0;
+
+    // FIX 1: Create the canvas BEFORE any React state update so flushStrokeBuffer
+    // and composite() never see this layer as missing.
+    getOrCreateLayerCanvas(layer.id);
+
     setLayers((prev) => {
       const ai = prev.findIndex((l) => l.id === activeId);
-      const ii = ai >= 0 ? ai : 0;
+      // Clamp so we never insert inside an end_group
+      let ii = ai >= 0 ? ai : 0;
+      // Walk backwards past any group headers at this position to stay inside the same group
+      while (ii > 0 && prev[ii]?.type === "end_group") ii--;
       const next = [...prev];
-      next.splice(ii, 0, layer);
+      next.splice(ii, 0, layer as unknown as FlatLayer);
       return next;
     });
+
     setActiveLayerId(layer.id);
     const newLayerSet = new Set([layer.id]);
     setSelectedLayerIds(newLayerSet);
-    // Sync ref synchronously so any code that runs before the next render
-    // (e.g. a tool switch immediately after layer add) reads the correct value.
     if (selectedLayerIdsRef) {
       selectedLayerIdsRef.current = newLayerSet;
     }
     setLayerThumbnails((prev) => ({ ...prev, [layer.id]: WHITE_THUMBNAIL }));
-    // Also update layer tree (insert at same position)
-    setLayerTree((prev) => {
-      const newNode = { kind: "layer" as const, id: layer.id, layer };
-      const next = [...prev];
-      const treeIdx = prev.findIndex(
-        (n) => n.kind === "layer" && n.layer.id === activeId,
-      );
-      const ii = treeIdx >= 0 ? treeIdx : 0;
-      next.splice(ii, 0, newNode);
-      return next;
-    });
-    // Use the synchronously-computed insertIdx so undo/redo restores the layer
-    // at the correct position. Previously this was hardcoded to 0, which caused
-    // redo to insert the layer at the wrong index when the active layer was not
-    // at the top of the stack.
+
     pushHistory({
       type: "layer-add",
       layer,
@@ -345,32 +551,96 @@ export function useLayerSystem({
     activeLayerIdRef,
     pushHistory,
     setLayerThumbnails,
+    getOrCreateLayerCanvas,
   ]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: setSelectedLayerIds from useRefState is stable
   const handleDeleteLayer = useCallback(
     (id: string) => {
-      const layerToDelete = layers.find((l) => l.id === id);
+      // end_group entries cannot be deleted directly
+      const target = layers.find((l) => l.id === id);
+      if (!target || target.type === "end_group") return;
+
+      // If it's a group header, remove the entire slice (header + children + end_group)
+      if (target.type === "group") {
+        const flatLayers = layers as import("../utils/groupUtils").FlatEntry[];
+        const slice = getGroupSlice(flatLayers, id);
+        if (slice) {
+          const layersBefore = layers.slice();
+          // Collect deleted canvases for undo
+          const deletedCanvases = new Map<string, ImageData>();
+          for (const entry of slice.entries) {
+            if (isFlatLayer(entry)) {
+              const lc = layerCanvasesRef.current.get(entry.id);
+              if (lc) {
+                const ctx = lc.getContext("2d", { willReadFrequently: true });
+                if (ctx)
+                  deletedCanvases.set(
+                    entry.id,
+                    ctx.getImageData(0, 0, lc.width, lc.height),
+                  );
+              }
+            }
+          }
+          const layersAfter = [
+            ...layers.slice(0, slice.startIndex),
+            ...layers.slice(slice.endIndex + 1),
+          ];
+          setLayers(layersAfter);
+          setActiveLayerId((prev) => {
+            const remaining = layersAfter.filter(
+              (l) => l.type !== "group" && l.type !== "end_group",
+            );
+            if (remaining.find((l) => l.id === prev)) return prev;
+            return remaining[0]?.id ?? "";
+          });
+          setSelectedLayerIds((prev) => {
+            const next = new Set(prev);
+            next.delete(id);
+            if (selectedLayerIdsRef) selectedLayerIdsRef.current = next;
+            return next;
+          });
+          pushHistory({
+            type: "layer-group-delete",
+            layersBefore: asLegacyLayers(layersBefore),
+            layersAfter: asLegacyLayers(layersAfter),
+            deletedCanvases,
+          });
+          composite();
+          markCanvasDirty();
+        }
+        return;
+      }
+
+      // Regular paint layer
       const indexToDelete = layers.findIndex((l) => l.id === id);
       const lcToDelete = layerCanvasesRef.current.get(id);
-      if (layerToDelete && indexToDelete !== -1 && lcToDelete) {
+      if (target && indexToDelete !== -1 && lcToDelete) {
         const lcCtx = lcToDelete.getContext("2d", { willReadFrequently: true });
         const pixelsToDelete = lcCtx
           ? lcCtx.getImageData(0, 0, lcToDelete.width, lcToDelete.height)
           : new ImageData(canvasWidth, canvasHeight);
         pushHistory({
           type: "layer-delete",
-          layer: layerToDelete,
+          layer: target as Layer,
           pixels: pixelsToDelete,
           index: indexToDelete,
         });
       }
+
       setLayers((prev) => {
-        if (prev.length <= 1) return prev;
+        if (
+          prev.filter((l) => l.type !== "group" && l.type !== "end_group")
+            .length <= 1
+        )
+          return prev;
         return prev.filter((l) => l.id !== id);
       });
       setActiveLayerId((prev) => {
         if (prev === id) {
-          const remaining = layers.filter((l) => l.id !== id);
+          const remaining = layers.filter(
+            (l) => l.id !== id && l.type !== "group" && l.type !== "end_group",
+          );
           return remaining[0]?.id ?? "";
         }
         return prev;
@@ -378,35 +648,14 @@ export function useLayerSystem({
       setSelectedLayerIds((prev) => {
         const next = new Set(prev);
         next.delete(id);
-        // Sync ref synchronously so callers that read the ref in the same tick
-        // (e.g. transform tool) always see the current selection.
         if (selectedLayerIdsRef) {
           selectedLayerIdsRef.current = next;
         }
         return next;
       });
-      // Remove from tree
-      setLayerTree((prev) => {
-        function removeFromTree(nodes: LayerNode[]): LayerNode[] {
-          const result: LayerNode[] = [];
-          for (const node of nodes) {
-            if (node.kind === "layer" && node.layer.id === id) continue;
-            if (node.kind === "group") {
-              result.push({
-                ...node,
-                children: removeFromTree(node.children ?? []),
-              });
-            } else {
-              result.push(node);
-            }
-          }
-          return result;
-        }
-        return removeFromTree(prev);
-      });
       layerCanvasesRef.current.delete(id);
       composite();
-      markCanvasDirty(); // triggers navigator update
+      markCanvasDirty();
     },
     [
       layers,
@@ -424,34 +673,20 @@ export function useLayerSystem({
   const handleToggleVisible = useCallback(
     (id: string) => {
       const layer = layers.find((l) => l.id === id);
-      if (layer) {
-        pushHistory({
-          type: "layer-visibility-change",
-          layerId: id,
-          before: layer.visible !== false,
-          after: !(layer.visible !== false),
-        });
-      }
-      setLayers((prev) =>
-        prev.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)),
-      );
-      setLayerTree((prev) => {
-        function updateTree(nodes: LayerNode[]): LayerNode[] {
-          return nodes.map((node) => {
-            if (node.kind === "layer" && node.layer.id === id) {
-              return {
-                ...node,
-                layer: { ...node.layer, visible: !node.layer.visible },
-              };
-            }
-            if (node.kind === "group") {
-              return { ...node, children: updateTree(node.children ?? []) };
-            }
-            return node;
-          });
-        }
-        return updateTree(prev);
+      if (!layer || layer.type === "end_group") return;
+      const currentVisible =
+        layer.type === "group"
+          ? (layer as GroupHeader).visible
+          : (layer as PaintLayer).visible !== false;
+      pushHistory({
+        type: "layer-visibility-change",
+        layerId: id,
+        before: currentVisible,
+        after: !currentVisible,
       });
+      setLayers((prev) =>
+        prev.map((l) => (l.id === id ? { ...l, visible: !currentVisible } : l)),
+      );
       setTimeout(() => composite(), 0);
     },
     [layers, pushHistory, setLayers, composite],
@@ -460,31 +695,17 @@ export function useLayerSystem({
   const handleRenameLayer = useCallback(
     (id: string, newName: string) => {
       const layer = layers.find((l) => l.id === id);
-      if (layer) {
-        pushHistory({
-          type: "layer-rename",
-          layerId: id,
-          before: layer.name,
-          after: newName,
-        });
-      }
+      if (!layer || layer.type === "end_group") return;
+      const oldName = (layer as PaintLayer | GroupHeader).name;
+      pushHistory({
+        type: "layer-rename",
+        layerId: id,
+        before: oldName,
+        after: newName,
+      });
       setLayers((prev) =>
         prev.map((l) => (l.id === id ? { ...l, name: newName } : l)),
       );
-      setLayerTree((prev) => {
-        function updateTree(nodes: LayerNode[]): LayerNode[] {
-          return nodes.map((node) => {
-            if (node.kind === "layer" && node.layer.id === id) {
-              return { ...node, layer: { ...node.layer, name: newName } };
-            }
-            if (node.kind === "group") {
-              return { ...node, children: updateTree(node.children ?? []) };
-            }
-            return node;
-          });
-        }
-        return updateTree(prev);
-      });
     },
     [layers, pushHistory, setLayers],
   );
@@ -492,34 +713,18 @@ export function useLayerSystem({
   const handleToggleAlphaLock = useCallback(
     (id: string) => {
       const layer = layers.find((l) => l.id === id);
-      if (layer) {
-        pushHistory({
-          type: "alpha-lock-change",
-          layerId: id,
-          before: !!layer.alphaLock,
-          after: !layer.alphaLock,
-        });
-      }
-      setLayers((prev) =>
-        prev.map((l) => (l.id === id ? { ...l, alphaLock: !l.alphaLock } : l)),
-      );
-      setLayerTree((prev) => {
-        function updateTree(nodes: LayerNode[]): LayerNode[] {
-          return nodes.map((node) => {
-            if (node.kind === "layer" && node.layer.id === id) {
-              return {
-                ...node,
-                layer: { ...node.layer, alphaLock: !node.layer.alphaLock },
-              };
-            }
-            if (node.kind === "group") {
-              return { ...node, children: updateTree(node.children ?? []) };
-            }
-            return node;
-          });
-        }
-        return updateTree(prev);
+      if (!layer || layer.type === "group" || layer.type === "end_group")
+        return;
+      const pl = layer as PaintLayer;
+      pushHistory({
+        type: "alpha-lock-change",
+        layerId: id,
+        before: !!pl.alphaLock,
+        after: !pl.alphaLock,
       });
+      setLayers((prev) =>
+        prev.map((l) => (l.id === id ? { ...l, alphaLock: !pl.alphaLock } : l)),
+      );
     },
     [layers, pushHistory, setLayers],
   );
@@ -527,59 +732,102 @@ export function useLayerSystem({
   const handleSetOpacity = useCallback(
     (id: string, opacity: number) => {
       const layer = layers.find((l) => l.id === id);
-      if (layer && layer.opacity !== opacity) {
+      if (!layer || layer.type === "end_group") return;
+      const currentOpacity =
+        layer.type === "group"
+          ? (layer as GroupHeader).opacity
+          : (layer as PaintLayer).opacity;
+      if (currentOpacity !== opacity) {
         pushHistory({
           type: "layer-opacity-change",
           layerId: id,
-          before: layer.opacity,
+          before: currentOpacity,
           after: opacity,
         });
       }
       setLayers((prev) =>
         prev.map((l) => (l.id === id ? { ...l, opacity } : l)),
       );
-      setLayerTree((prev) => {
-        function updateTree(nodes: LayerNode[]): LayerNode[] {
-          return nodes.map((node) => {
-            if (node.kind === "layer" && node.layer.id === id) {
-              return { ...node, layer: { ...node.layer, opacity } };
-            }
-            if (node.kind === "group") {
-              return { ...node, children: updateTree(node.children ?? []) };
-            }
-            return node;
-          });
-        }
-        return updateTree(prev);
-      });
       setTimeout(() => composite(), 0);
     },
     [layers, pushHistory, setLayers, composite],
   );
 
+  /** Live opacity update during drag — updates state and composites but does NOT write history. */
+  const handleSetOpacityLive = useCallback(
+    (id: string, opacity: number) => {
+      setLayers((prev) =>
+        prev.map((l) => (l.id === id ? { ...l, opacity } : l)),
+      );
+      setTimeout(() => composite(), 0);
+    },
+    [setLayers, composite],
+  );
+
+  /** Commit opacity change on pointer-up — writes exactly one history entry with before/after values. */
+  const handleSetOpacityCommit = useCallback(
+    (id: string, beforeOpacity: number, afterOpacity: number) => {
+      if (beforeOpacity !== afterOpacity) {
+        pushHistory({
+          type: "layer-opacity-change",
+          layerId: id,
+          before: beforeOpacity,
+          after: afterOpacity,
+        });
+      }
+      setLayers((prev) =>
+        prev.map((l) => (l.id === id ? { ...l, opacity: afterOpacity } : l)),
+      );
+      setTimeout(() => composite(), 0);
+    },
+    [pushHistory, setLayers, composite],
+  );
+
   const handleMergeLayers = useCallback(() => {
-    // Ruler layers cannot be merged
     const activeLayerCheck = layers.find(
       (l) => l.id === activeLayerIdRef.current,
     );
-    if (activeLayerCheck?.isRuler) return;
+    if (
+      !activeLayerCheck ||
+      activeLayerCheck.type === "group" ||
+      activeLayerCheck.type === "end_group"
+    )
+      return;
+    const activeLayer = activeLayerCheck as PaintLayer;
+    if (activeLayer.isRuler) return;
 
     const activeId = activeLayerIdRef.current;
     const activeIdx = layers.findIndex((l) => l.id === activeId);
     if (activeIdx < 0) return;
-    const belowLayer = layers[activeIdx + 1];
-    if (!belowLayer) return;
 
-    const activeLc = layerCanvasesRef.current.get(activeId);
-    const belowLc = layerCanvasesRef.current.get(belowLayer.id);
-    if (!activeLc || !belowLc) return;
+    // Find the layer below (skipping end_group and group entries)
+    let belowIdx = activeIdx + 1;
+    while (
+      belowIdx < layers.length &&
+      (layers[belowIdx].type === "end_group" ||
+        layers[belowIdx].type === "group")
+    ) {
+      belowIdx++;
+    }
+    const belowLayer = layers[belowIdx] as FlatLayer | undefined;
+    if (
+      !belowLayer ||
+      (belowLayer as FlatLayer).type === "group" ||
+      (belowLayer as FlatLayer).type === "end_group"
+    )
+      return;
+    // Ruler layers cannot be merge destinations — skip silently
+    if ((belowLayer as PaintLayer).isRuler) return;
+
+    // FIX 2d: Validate source canvases before reading from them in the merge.
+    // getOrCreateLayerCanvas ensures both canvases exist and are correctly sized.
+    const activeLc = getOrCreateLayerCanvas(activeId);
+    const belowLc = getOrCreateLayerCanvas(belowLayer.id);
 
     const bCtx = belowLc.getContext("2d", { willReadFrequently: true });
     const aCtx = activeLc.getContext("2d", { willReadFrequently: true });
     if (!bCtx || !aCtx) return;
 
-    // Capture before states for history
-    const activeLayer = layers[activeIdx];
     const activePixels = aCtx.getImageData(0, 0, canvasWidth, canvasHeight);
     const belowPixelsBefore = bCtx.getImageData(
       0,
@@ -589,10 +837,9 @@ export function useLayerSystem({
     );
 
     const activeIsClip = !!activeLayer.isClippingMask;
-    const belowIsClip = !!belowLayer.isClippingMask;
+    const belowIsClip = !!(belowLayer as PaintLayer).isClippingMask;
 
     if (activeIsClip && !belowIsClip) {
-      // Case: clipping mask merging into its base layer.
       const tmpCanvas = document.createElement("canvas");
       tmpCanvas.width = canvasWidth;
       tmpCanvas.height = canvasHeight;
@@ -633,7 +880,6 @@ export function useLayerSystem({
     }
 
     const belowPixelsAfter = bCtx.getImageData(0, 0, canvasWidth, canvasHeight);
-
     const belowLayerIsClippingMaskAfter = activeIsClip && belowIsClip;
 
     if (belowLayerIsClippingMaskAfter !== belowIsClip) {
@@ -648,7 +894,7 @@ export function useLayerSystem({
 
     pushHistory({
       type: "layer-merge",
-      activeLayer,
+      activeLayer: activeLayer as unknown as Layer,
       activeIndex: activeIdx,
       activePixels,
       belowLayerId: belowLayer.id,
@@ -659,30 +905,11 @@ export function useLayerSystem({
     });
 
     markCanvasDirty(belowLayer.id);
-
     setLayers((prev) => prev.filter((l) => l.id !== activeId));
-    setLayerTree((prev) => {
-      function removeFromTree(nodes: LayerNode[]): LayerNode[] {
-        const result: LayerNode[] = [];
-        for (const node of nodes) {
-          if (node.kind === "layer" && node.layer.id === activeId) continue;
-          if (node.kind === "group") {
-            result.push({
-              ...node,
-              children: removeFromTree(node.children ?? []),
-            });
-          } else {
-            result.push(node);
-          }
-        }
-        return result;
-      }
-      return removeFromTree(prev);
-    });
     setActiveLayerId(belowLayer.id);
     layerCanvasesRef.current.delete(activeId);
     setTimeout(() => composite(), 0);
-    markCanvasDirty(); // navigator update
+    markCanvasDirty();
   }, [
     layers,
     setLayers,
@@ -694,6 +921,7 @@ export function useLayerSystem({
     canvasWidth,
     canvasHeight,
     markLayerBitmapDirty,
+    getOrCreateLayerCanvas,
   ]);
 
   const handleMergeLayersRef = useRef(handleMergeLayers);
@@ -704,39 +932,40 @@ export function useLayerSystem({
   const handleToggleClippingMask = useCallback(() => {
     const activeId = activeLayerIdRef.current;
     const layer = layers.find((l) => l.id === activeId);
-    if (layer) {
-      pushHistory({
-        type: "clipping-mask-change",
-        layerId: activeId,
-        before: !!layer.isClippingMask,
-        after: !layer.isClippingMask,
-      });
+    if (!layer || layer.type === "group" || layer.type === "end_group") return;
+    const pl = layer as PaintLayer;
+
+    // Ruler layers cannot be clip sources — block silently
+    if (pl.isRuler) return;
+
+    // If toggling ON, also check that the layer below is not a ruler (cannot be clip target)
+    const isTogglingOn = !pl.isClippingMask;
+    if (isTogglingOn) {
+      const activeIdx = layers.findIndex((l) => l.id === activeId);
+      // Find the next non-end_group, non-group layer below
+      let belowIdx = activeIdx + 1;
+      while (
+        belowIdx < layers.length &&
+        (layers[belowIdx].type === "end_group" ||
+          layers[belowIdx].type === "group")
+      ) {
+        belowIdx++;
+      }
+      const belowLayer = layers[belowIdx] as PaintLayer | undefined;
+      if (belowLayer?.isRuler) return;
     }
+
+    pushHistory({
+      type: "clipping-mask-change",
+      layerId: activeId,
+      before: !!pl.isClippingMask,
+      after: !pl.isClippingMask,
+    });
     setLayers((prev) =>
       prev.map((l) =>
-        l.id === activeId ? { ...l, isClippingMask: !l.isClippingMask } : l,
+        l.id === activeId ? { ...l, isClippingMask: !pl.isClippingMask } : l,
       ),
     );
-    setLayerTree((prev) => {
-      function updateTree(nodes: LayerNode[]): LayerNode[] {
-        return nodes.map((node) => {
-          if (node.kind === "layer" && node.layer.id === activeId) {
-            return {
-              ...node,
-              layer: {
-                ...node.layer,
-                isClippingMask: !node.layer.isClippingMask,
-              },
-            };
-          }
-          if (node.kind === "group") {
-            return { ...node, children: updateTree(node.children ?? []) };
-          }
-          return node;
-        });
-      }
-      return updateTree(prev);
-    });
     setTimeout(() => composite(), 0);
   }, [layers, pushHistory, setLayers, activeLayerIdRef, composite]);
 
@@ -745,7 +974,59 @@ export function useLayerSystem({
     handleToggleClippingMaskRef.current = handleToggleClippingMask;
   }, [handleToggleClippingMask]);
 
+  // ── Reorder ───────────────────────────────────────────────────────────────
+
   const handleReorderLayers = useCallback(
+    (ids: string[]) => {
+      const layersBefore = layers.slice();
+      const map = new Map(layers.map((l) => [l.id, l]));
+      const layersAfter = ids.map((id) => map.get(id)!).filter(Boolean);
+
+      setLayers(layersAfter);
+
+      pushHistory({
+        type: "layer-reorder",
+        layersBefore: asLegacyLayers(layersBefore),
+        layersAfter: asLegacyLayers(layersAfter),
+      });
+
+      setTimeout(() => composite(), 0);
+    },
+    [layers, setLayers, composite, pushHistory],
+  );
+
+  /**
+   * Replace the entire flat layers array (used for drag-and-drop).
+   * The `newTree` parameter name is kept for call-site backward compat;
+   * it is treated as Layer[] in the new architecture.
+   */
+  const handleReorderTree = useCallback(
+    // Accept LayerNode[] for backward compat with LayersPanel which still passes tree arrays.
+    // At runtime, both contain the same flat layer objects.
+    (newLayers: Layer[] | import("../types").LayerNode[]) => {
+      const layersBefore = layers.slice();
+      setLayers(newLayers as Layer[]);
+      pushHistory({
+        type: "layer-reorder",
+        layersBefore: asLegacyLayers(layersBefore),
+        layersAfter: newLayers as Layer[],
+      });
+      setTimeout(() => composite(), 0);
+    },
+    [layers, setLayers, composite, pushHistory],
+  );
+
+  /** Same as handleReorderTree but no history entry (used for live drag-over). */
+  const handleReorderTreeSilent = useCallback(
+    (newLayers: Layer[] | import("../types").LayerNode[]) => {
+      setLayers(newLayers as Layer[]);
+      setTimeout(() => composite(), 0);
+    },
+    [setLayers, composite],
+  );
+
+  /** Same as handleReorderLayers but no history entry. */
+  const handleReorderLayersSilent = useCallback(
     (ids: string[]) => {
       setLayers((prev) => {
         const map = new Map(prev.map((l) => [l.id, l]));
@@ -756,70 +1037,44 @@ export function useLayerSystem({
     [setLayers, composite],
   );
 
-  /** Replace the entire layer tree (used for drag-and-drop reordering with groups) */
-  const handleReorderTree = useCallback(
-    (newTree: LayerNode[]) => {
-      // Capture before state for undo
-      const treeBefore = layerTree;
-      const layersBefore = layers.slice();
-
-      setLayerTree(newTree);
-      // Sync flat layers array from tree
-      const flat: Layer[] = [];
-      function collectLayers(nodes: LayerNode[]) {
-        for (const node of nodes) {
-          if (node.kind === "layer") {
-            flat.push(node.layer);
-          } else {
-            collectLayers(node.children ?? []);
-          }
-        }
-      }
-      collectLayers(newTree);
-      setLayers(flat);
-
+  /**
+   * Push a single reorder history entry with explicit before/after snapshots.
+   * Signature accepts legacy LayerNode[] params but treats them as Layer[] arrays.
+   */
+  const handleCommitReorderHistory = useCallback(
+    (
+      _treeBefore: unknown,
+      _treeAfter: unknown,
+      layersBefore: Layer[],
+      layersAfter: Layer[],
+    ) => {
       pushHistory({
         type: "layer-reorder",
-        treeBefore,
-        treeAfter: newTree,
         layersBefore,
-        layersAfter: flat,
+        layersAfter,
       });
-
-      setTimeout(() => composite(), 0);
     },
-    [layerTree, layers, setLayers, composite, pushHistory],
+    [pushHistory],
   );
+
+  // ── Blend mode ────────────────────────────────────────────────────────────
 
   const handleSetLayerBlendMode = useCallback(
     (id: string, blendMode: string) => {
       const currentLayer = layers.find((l) => l.id === id);
-      if (currentLayer) {
-        const currentBlendMode = currentLayer.blendMode || "source-over";
+      if (currentLayer && currentLayer.type !== "end_group") {
+        const current =
+          (currentLayer as PaintLayer | GroupHeader).blendMode || "source-over";
         pushHistory({
           type: "blend-mode",
           layerId: id,
-          before: currentBlendMode,
+          before: current,
           after: blendMode,
         });
       }
       setLayers((prev) =>
         prev.map((l) => (l.id === id ? { ...l, blendMode } : l)),
       );
-      setLayerTree((prev) => {
-        function updateTree(nodes: LayerNode[]): LayerNode[] {
-          return nodes.map((node) => {
-            if (node.kind === "layer" && node.layer.id === id) {
-              return { ...node, layer: { ...node.layer, blendMode } };
-            }
-            if (node.kind === "group") {
-              return { ...node, children: updateTree(node.children ?? []) };
-            }
-            return node;
-          });
-        }
-        return updateTree(prev);
-      });
       setTimeout(() => composite(), 0);
     },
     [layers, pushHistory, setLayers, composite],
@@ -827,75 +1082,76 @@ export function useLayerSystem({
 
   // ── Group handlers ────────────────────────────────────────────────────────
 
-  /**
-   * Create a layer group from the currently selected layers.
-   * If nothing is selected, creates an empty group at the top.
-   */
+  // biome-ignore lint/correctness/useExhaustiveDependencies: setSelectedLayerIds from useRefState is stable
   const handleCreateGroup = useCallback(() => {
     const selectedIds = Array.from(selectedLayerIds);
-    const groupName = `Group ${Date.now().toString().slice(-4)}`;
-
-    // Capture state before grouping for undo
-    const treeBefore = layerTree;
     const layersBefore = layers.slice();
+    const counterBefore = getGroupIdCounter();
 
-    const { tree, groupId } = groupNodes(layerTree, selectedIds, groupName);
-    setLayerTree(tree);
-    // Sync flat layers
-    const flat: Layer[] = [];
-    function collectLayers(nodes: LayerNode[]) {
-      for (const node of nodes) {
-        if (node.kind === "layer") flat.push(node.layer);
-        else collectLayers(node.children ?? []);
+    // Name uses counterBefore + 1 since createGroupPair increments the counter
+    const groupName = `Layer Group ${counterBefore + 1}`;
+    const [header, endMarker] = createGroupPair(groupName);
+    const counterAfter = getGroupIdCounter();
+    const groupId = header.id;
+
+    let newLayers: FlatLayer[];
+
+    if (selectedIds.length === 0) {
+      // Insert an empty group at the top
+      newLayers = [header, endMarker, ...layers] as FlatLayer[];
+    } else {
+      // Find contiguous range: first and last selected indices in the flat array
+      const selectedSet = new Set(selectedIds);
+      let firstIdx = layers.length;
+      let lastIdx = -1;
+      for (let i = 0; i < layers.length; i++) {
+        if (selectedSet.has(layers[i].id)) {
+          if (i < firstIdx) firstIdx = i;
+          if (i > lastIdx) lastIdx = i;
+        }
+      }
+
+      if (firstIdx > lastIdx) {
+        // No valid selection found — insert empty group at top
+        newLayers = [header, endMarker, ...layers] as FlatLayer[];
+      } else {
+        // Insert header before firstIdx, endMarker after lastIdx
+        newLayers = [
+          ...layers.slice(0, firstIdx),
+          header,
+          ...layers.slice(firstIdx, lastIdx + 1),
+          endMarker,
+          ...layers.slice(lastIdx + 1),
+        ] as FlatLayer[];
       }
     }
-    collectLayers(tree);
-    setLayers(flat);
-    // Select the new group
+
+    setLayers(newLayers as Layer[]);
     setSelectedLayerIds(new Set([groupId]));
 
-    // BUG_1 FIX: Set the active layer to the first paintable child of the new group.
-    // Without this, activeLayerId stays pointing at whatever it was before grouping,
-    // which may be a group ID (no canvas) and will silently break painting tools.
-    function findFirstChildLayer(nodes: LayerNode[]): string | null {
-      for (const node of nodes) {
-        if (node.id === groupId && node.kind === "group") {
-          // Found the group — walk its children to find the first paintable layer
-          function firstLeaf(ns: LayerNode[]): string | null {
-            for (const n of ns) {
-              if (n.kind === "layer") return n.layer.id;
-              const found = firstLeaf(n.children ?? []);
-              if (found) return found;
-            }
-            return null;
-          }
-          return firstLeaf(node.children ?? []);
-        }
-        if (node.kind === "group") {
-          const found = findFirstChildLayer(node.children ?? []);
-          if (found) return found;
-        }
+    // Set active layer to the first paint layer inside the new group (if any)
+    const flatEntries = newLayers as import("../utils/groupUtils").FlatEntry[];
+    const slice = getGroupSlice(flatEntries, groupId);
+    if (slice) {
+      const firstPaintLayer = slice.entries.find(
+        (e) => isFlatLayer(e) && !isFlatGroupHeader(e) && !isFlatEndGroup(e),
+      );
+      if (firstPaintLayer) {
+        setActiveLayerId(firstPaintLayer.id);
       }
-      return null;
-    }
-    const firstChildId = findFirstChildLayer(tree);
-    if (firstChildId) {
-      setActiveLayerId(firstChildId);
     }
 
     setTimeout(() => composite(), 0);
 
-    // Push undo entry
     pushHistory({
       type: "layer-group-create",
-      treeBefore,
-      treeAfter: tree,
-      layersBefore,
-      layersAfter: flat,
+      layersBefore: asLegacyLayers(layersBefore),
+      layersAfter: asLegacyLayers(newLayers),
+      counterBefore,
+      counterAfter,
     });
   }, [
     selectedLayerIds,
-    layerTree,
     layers,
     setLayers,
     setActiveLayerId,
@@ -903,66 +1159,40 @@ export function useLayerSystem({
     pushHistory,
   ]);
 
-  /**
-   * Toggle a group's collapsed state.
-   */
-  const handleToggleGroupCollapse = useCallback((groupId: string) => {
-    setLayerTree((prev) => {
-      function updateTree(nodes: LayerNode[]): LayerNode[] {
-        return nodes.map((node) => {
-          if (node.kind === "group" && node.id === groupId) {
-            return { ...node, collapsed: !node.collapsed };
-          }
-          if (node.kind === "group") {
-            return { ...node, children: updateTree(node.children ?? []) };
-          }
-          return node;
-        });
-      }
-      return updateTree(prev);
-    });
-  }, []);
+  /** Toggle a group's collapsed state (UI-only, no undo). */
+  const handleToggleGroupCollapse = useCallback(
+    (groupId: string) => {
+      setLayers((prev) =>
+        prev.map((l) =>
+          l.id === groupId && l.type === "group"
+            ? { ...l, collapsed: !(l as GroupHeader).collapsed }
+            : l,
+        ),
+      );
+    },
+    [setLayers],
+  );
 
-  /**
-   * Rename a group.
-   */
-  const handleRenameGroup = useCallback((groupId: string, name: string) => {
-    setLayerTree((prev) => {
-      function updateTree(nodes: LayerNode[]): LayerNode[] {
-        return nodes.map((node) => {
-          if (node.kind === "group" && node.id === groupId) {
-            return { ...node, name };
-          }
-          if (node.kind === "group") {
-            return { ...node, children: updateTree(node.children ?? []) };
-          }
-          return node;
-        });
-      }
-      return updateTree(prev);
-    });
-  }, []);
+  /** Rename a group. */
+  const handleRenameGroup = useCallback(
+    (groupId: string, name: string) => {
+      setLayers((prev) =>
+        prev.map((l) =>
+          l.id === groupId && l.type === "group" ? { ...l, name } : l,
+        ),
+      );
+    },
+    [setLayers],
+  );
 
-  /**
-   * Set opacity on a group (cascades to all children during compositing).
-   */
+  /** Set opacity on a group header. */
   const handleSetGroupOpacity = useCallback(
     (groupId: string, opacity: number) => {
-      // Find current group opacity for history
-      function findGroupOpacity(nodes: LayerNode[]): number | null {
-        for (const node of nodes) {
-          if (node.kind === "group" && node.id === groupId) {
-            return node.opacity ?? 1;
-          }
-          if (node.kind === "group") {
-            const found = findGroupOpacity(node.children ?? []);
-            if (found !== null) return found;
-          }
-        }
-        return null;
-      }
-      const prevOpacity = findGroupOpacity(layerTree);
-      if (prevOpacity !== null && prevOpacity !== opacity) {
+      const group = layers.find(
+        (l) => l.id === groupId && l.type === "group",
+      ) as GroupHeader | undefined;
+      const prevOpacity = group?.opacity ?? 1;
+      if (prevOpacity !== opacity) {
         pushHistory({
           type: "group-opacity-change",
           groupId,
@@ -970,213 +1200,157 @@ export function useLayerSystem({
           after: opacity,
         });
       }
-      setLayerTree((prev) => {
-        function updateTree(nodes: LayerNode[]): LayerNode[] {
-          return nodes.map((node) => {
-            if (node.kind === "group" && node.id === groupId) {
-              return { ...node, opacity };
-            }
-            if (node.kind === "group") {
-              return { ...node, children: updateTree(node.children ?? []) };
-            }
-            return node;
-          });
-        }
-        return updateTree(prev);
-      });
+      setLayers((prev) =>
+        prev.map((l) =>
+          l.id === groupId && l.type === "group" ? { ...l, opacity } : l,
+        ),
+      );
       setTimeout(() => composite(), 0);
     },
-    [layerTree, pushHistory, composite],
+    [layers, pushHistory, setLayers, composite],
   );
 
-  /**
-   * Toggle visibility on a group (does NOT change children.visible).
-   */
-  const handleToggleGroupVisible = useCallback(
-    (groupId: string) => {
-      setLayerTree((prev) => {
-        function updateTree(nodes: LayerNode[]): LayerNode[] {
-          return nodes.map((node) => {
-            if (node.kind === "group" && node.id === groupId) {
-              return { ...node, visible: !node.visible };
-            }
-            if (node.kind === "group") {
-              return { ...node, children: updateTree(node.children ?? []) };
-            }
-            return node;
-          });
-        }
-        return updateTree(prev);
-      });
+  /** Live group opacity update during drag — updates state and composites but does NOT write history. */
+  const handleSetGroupOpacityLive = useCallback(
+    (groupId: string, opacity: number) => {
+      setLayers((prev) =>
+        prev.map((l) =>
+          l.id === groupId && l.type === "group" ? { ...l, opacity } : l,
+        ),
+      );
       setTimeout(() => composite(), 0);
     },
-    [composite],
+    [setLayers, composite],
+  );
+
+  /** Commit group opacity change on pointer-up — writes exactly one history entry with before/after values. */
+  const handleSetGroupOpacityCommit = useCallback(
+    (groupId: string, beforeOpacity: number, afterOpacity: number) => {
+      if (beforeOpacity !== afterOpacity) {
+        pushHistory({
+          type: "group-opacity-change",
+          groupId,
+          before: beforeOpacity,
+          after: afterOpacity,
+        });
+      }
+      setLayers((prev) =>
+        prev.map((l) =>
+          l.id === groupId && l.type === "group"
+            ? { ...l, opacity: afterOpacity }
+            : l,
+        ),
+      );
+      setTimeout(() => composite(), 0);
+    },
+    [pushHistory, setLayers, composite],
+  );
+
+  /** Toggle visibility on a group header. */
+  const handleToggleGroupVisible = useCallback(
+    (groupId: string) => {
+      setLayers((prev) =>
+        prev.map((l) =>
+          l.id === groupId && l.type === "group"
+            ? { ...l, visible: !(l as GroupHeader).visible }
+            : l,
+        ),
+      );
+      setTimeout(() => composite(), 0);
+    },
+    [setLayers, composite],
   );
 
   /**
    * Delete a group.
-   * @param deleteChildren — if true, also delete all layer canvases/data inside.
-   *                         if false, release layers from the group (ungroup them).
+   * @param deleteChildren — if true, delete all layers inside; if false, promote them.
    */
+  // biome-ignore lint/correctness/useExhaustiveDependencies: setSelectedLayerIds from useRefState is stable
   const handleDeleteGroup = useCallback(
     (groupId: string, deleteChildren: boolean) => {
-      // Capture before state for undo
-      const treeBefore = layerTree;
       const layersBefore = layers.slice();
+      const flatEntries = layers as import("../utils/groupUtils").FlatEntry[];
+      const slice = getGroupSlice(flatEntries, groupId);
+      if (!slice) return;
 
-      function collectFlat(nodes: LayerNode[]): Layer[] {
-        const flat: Layer[] = [];
-        function recurse(ns: LayerNode[]) {
-          for (const node of ns) {
-            if (node.kind === "layer") flat.push(node.layer);
-            else recurse(node.children ?? []);
-          }
-        }
-        recurse(nodes);
-        return flat;
-      }
-
-      let newTree: LayerNode[];
-      let deletedCanvases: Map<string, ImageData> = new Map();
+      const deletedCanvases = new Map<string, ImageData>();
+      let layersAfter: FlatLayer[];
 
       if (deleteChildren) {
-        // Collect canvas data for deleted layers before removing them
-        function collectGroupLayerIds(nodes: LayerNode[]): string[] {
-          const ids: string[] = [];
-          for (const node of nodes) {
-            if (node.id === groupId && node.kind === "group") {
-              function gatherIds(ns: LayerNode[]) {
-                for (const n of ns) {
-                  if (n.kind === "layer") ids.push(n.layer.id);
-                  else gatherIds(n.children ?? []);
-                }
+        // Collect pixel data for all paint layers inside the slice
+        for (const entry of slice.entries) {
+          if (isFlatLayer(entry)) {
+            const lc = layerCanvasesRef.current.get(entry.id);
+            if (lc) {
+              const ctx = lc.getContext("2d", { willReadFrequently: true });
+              if (ctx) {
+                deletedCanvases.set(
+                  entry.id,
+                  ctx.getImageData(0, 0, lc.width, lc.height),
+                );
               }
-              gatherIds(node.children ?? []);
-            } else if (node.kind === "group") {
-              ids.push(...collectGroupLayerIds(node.children ?? []));
-            }
-          }
-          return ids;
-        }
-        for (const layerId of collectGroupLayerIds(layerTree)) {
-          const lc = layerCanvasesRef.current.get(layerId);
-          if (lc) {
-            const ctx = lc.getContext("2d", { willReadFrequently: true });
-            if (ctx) {
-              deletedCanvases.set(
-                layerId,
-                ctx.getImageData(0, 0, lc.width, lc.height),
-              );
+              layerCanvasesRef.current.delete(entry.id);
             }
           }
         }
-
-        // Remove group and all children
-        function removeGroupAndChildren(nodes: LayerNode[]): LayerNode[] {
-          const result: LayerNode[] = [];
-          for (const node of nodes) {
-            if (node.id === groupId) continue; // skip entire subtree
-            if (node.kind === "group") {
-              result.push({
-                ...node,
-                children: removeGroupAndChildren(node.children ?? []),
-              });
-            } else {
-              result.push(node);
-            }
-          }
-          return result;
-        }
-        newTree = removeGroupAndChildren(layerTree);
+        // Remove the entire slice
+        layersAfter = [
+          ...layers.slice(0, slice.startIndex),
+          ...layers.slice(slice.endIndex + 1),
+        ];
       } else {
-        // Ungroup: release children in place
-        newTree = ungroupNodes(layerTree, groupId);
+        // Promote: remove only the header and end_group, keep children in place
+        layersAfter = layers.filter(
+          (_l, i) => i !== slice.startIndex && i !== slice.endIndex,
+        );
       }
 
-      const layersAfter = collectFlat(newTree);
-
-      setLayerTree(newTree);
       setLayers(layersAfter);
-      setTimeout(() => composite(), 0);
-
       setSelectedLayerIds((prev) => {
         const next = new Set(prev);
         next.delete(groupId);
         return next;
       });
 
-      // Push undo entry
       pushHistory({
         type: "layer-group-delete",
-        treeBefore,
-        treeAfter: newTree,
-        layersBefore,
-        layersAfter,
+        layersBefore: asLegacyLayers(layersBefore),
+        layersAfter: asLegacyLayers(layersAfter),
         deletedCanvases,
       });
+
+      setTimeout(() => composite(), 0);
     },
-    [layerTree, layers, layerCanvasesRef, setLayers, composite, pushHistory],
+    [layers, layerCanvasesRef, setLayers, composite, pushHistory],
   );
 
   /**
-   * Move a node (layer or group) into a target group as its first child.
+   * Move a node (layer or group) into a target group.
+   * Flat-array equivalent: remove the entry from its current position and
+   * insert it just after the target group header.
    */
   const handleMoveNodeIntoGroup = useCallback(
-    (nodeId: string, groupId: string) => {
-      setLayerTree((prev) => {
-        // Find the node being moved
-        function findAndRemove(
-          nodes: LayerNode[],
-        ): [LayerNode | null, LayerNode[]] {
-          let found: LayerNode | null = null;
-          const result: LayerNode[] = [];
-          for (const node of nodes) {
-            if (node.id === nodeId) {
-              found = node;
-              continue;
-            }
-            if (node.kind === "group") {
-              const [f, children] = findAndRemove(node.children ?? []);
-              if (f) found = f;
-              result.push({ ...node, children });
-            } else {
-              result.push(node);
-            }
-          }
-          return [found, result];
-        }
-        const [movingNode, withoutNode] = findAndRemove(prev);
-        if (!movingNode) return prev;
+    (nodeId: string, targetGroupId: string) => {
+      setLayers((prev) => {
+        const srcIdx = prev.findIndex((l) => l.id === nodeId);
+        const tgtIdx = prev.findIndex(
+          (l) => l.id === targetGroupId && l.type === "group",
+        );
+        if (srcIdx === -1 || tgtIdx === -1) return prev;
 
-        function insertIntoGroup(nodes: LayerNode[]): LayerNode[] {
-          return nodes.map((node) => {
-            if (node.kind === "group" && node.id === groupId) {
-              return {
-                ...node,
-                children: [movingNode!, ...(node.children ?? [])],
-              };
-            }
-            if (node.kind === "group") {
-              return {
-                ...node,
-                children: insertIntoGroup(node.children ?? []),
-              };
-            }
-            return node;
-          });
-        }
-        const newTree = insertIntoGroup(withoutNode);
-        // Sync flat layers
-        const flat: Layer[] = [];
-        function collectLayers(nodes: LayerNode[]) {
-          for (const node of nodes) {
-            if (node.kind === "layer") flat.push(node.layer);
-            else collectLayers(node.children ?? []);
-          }
-        }
-        collectLayers(newTree);
-        setLayers(flat);
-        return newTree;
+        const entry = prev[srcIdx];
+        const without = prev.filter((_, i) => i !== srcIdx);
+        // Re-find target after removal
+        const newTgtIdx = without.findIndex(
+          (l) => l.id === targetGroupId && l.type === "group",
+        );
+        if (newTgtIdx === -1) return prev;
+
+        return [
+          ...without.slice(0, newTgtIdx + 1),
+          entry,
+          ...without.slice(newTgtIdx + 1),
+        ];
       });
       setTimeout(() => composite(), 0);
     },
@@ -1186,38 +1360,56 @@ export function useLayerSystem({
   // Keep a stable ref to generateGroupId for external use
   const generateGroupIdFn = useCallback(() => generateGroupId(), []);
 
+  // ── Stub: layerTree (empty — flat array is the only structure now) ─────────
+  // Many consumers destructure `layerTree` and `setLayerTree` from this hook.
+  // Provide empty stubs so those call sites don't break until they're migrated.
+  const _emptyTree: import("../types").LayerNode[] = [];
+  const _setLayerTree = useCallback((..._args: unknown[]) => {
+    // no-op: flat array is the single source of truth
+  }, []);
+
   return {
-    // Existing handlers (backward compat)
+    // Layer CRUD
     handleAddLayer,
     handleDeleteLayer,
     handleToggleVisible,
     handleRenameLayer,
     handleToggleAlphaLock,
     handleSetOpacity,
+    handleSetOpacityLive,
+    handleSetOpacityCommit,
     handleMergeLayers,
     handleMergeLayersRef,
     handleToggleClippingMask,
     handleToggleClippingMaskRef,
     handleReorderLayers,
     handleSetLayerBlendMode,
-    // New tree-aware handlers
+    // Tree-aware handlers (now flat-array)
     handleReorderTree,
+    handleReorderTreeSilent,
+    handleReorderLayersSilent,
+    handleCommitReorderHistory,
     // Group handlers
     handleCreateGroup,
     handleDeleteGroup,
     handleToggleGroupCollapse,
     handleRenameGroup,
     handleSetGroupOpacity,
+    handleSetGroupOpacityLive,
+    handleSetGroupOpacityCommit,
     handleToggleGroupVisible,
     handleMoveNodeIntoGroup,
     // Multi-select
     selectedLayerIds,
     setSelectedLayerIds,
     handleToggleLayerSelection,
-    // Tree state
-    layerTree,
-    setLayerTree,
+    // Legacy tree state stubs (no-op — flat array is single source of truth)
+    layerTree: _emptyTree,
+    setLayerTree: _setLayerTree,
     // Utility
     generateGroupId: generateGroupIdFn,
+    // History entry handlers
+    applyLayerEntry,
+    undoLayerEntry,
   };
 }

@@ -22,6 +22,8 @@ actor {
       var adminAssigned : Bool;
       userRoles : Map__605269027<Principal, UserRole__1054455867>
     };
+  stable brushPresetsMap :
+    {var root : Node__46230540<Principal, Text>; var size : Nat__490723111};
   stable canvasSaveMap :
     {
       var root : Node__46230540<Principal, CanvasSave__864224653>;

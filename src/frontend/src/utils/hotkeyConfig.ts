@@ -302,7 +302,7 @@ export const DEFAULT_HOTKEYS: Record<string, HotkeyAction> = {
     label: "Redo",
     category: "History",
     primary: { key: "z", ctrl: true, shift: true },
-    secondary: null,
+    secondary: { key: "y", ctrl: true },
   },
   // Selection
   selectAll: {

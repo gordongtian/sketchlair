@@ -1,4 +1,9 @@
-// TODO: Wire this hook into PaintingApp.tsx in a separate step after all 4 ruler subtype hooks are created.
+// ============================================================
+// RESERVED FOR FUTURE USE
+// This ruler hook is not yet wired into PaintingApp event handlers.
+// It is intentionally preserved for the upcoming perspective/ellipse
+// ruler feature implementation. Do not delete.
+// ============================================================
 
 /**
  * use1pt2ptPerspectiveRuler — 1-point and 2-point perspective ruler sub-system hook
@@ -1049,9 +1054,10 @@ export function use1pt2ptPerspectiveRuler({
   /**
    * Reproduced from PaintingApp.tsx lines 7751–8151.
    * Handles all active 1pt and 2pt drag ops:
-   *   1pt: VP drag, horizon-angle drag
-   *   2pt: VP1/VP2 drag (with focal-length lock), center translate, rotation,
-   *        grid-B translate, grid-A/C VP drag
+   *   1pt: VP drag (exempt from canvas clamp — VP), horizon-angle drag (clamp)
+   *   2pt: VP1/VP2 drag (exempt — VPs), center translate (clamp), rotation (clamp),
+   *        grid-B translate (clamp), grid-A/C VP drag (clamp)
+   * Non-VP handles are clamped to canvas bounds on every move event.
    */
   const handle1pt2ptRulerPointerMove = useCallback(
     (pos: Point, layer: Layer): boolean => {
@@ -1071,17 +1077,25 @@ export function use1pt2ptPerspectiveRuler({
 
       const upd = makeUpdater(layer.id);
 
-      // ── 1pt: VP drag ────────────────────────────────────────────────────
+      // Canvas-clamped position for non-VP handles
+      const cW = canvasWidthRef.current;
+      const cH = canvasHeightRef.current;
+      const clampedPos: Point = {
+        x: Math.max(0, Math.min(cW, pos.x)),
+        y: Math.max(0, Math.min(cH, pos.y)),
+      };
+
+      // ── 1pt: VP drag — EXEMPT from clamping (vanishing point) ───────────
       if (rulerVPDragRef.current && layer.vpX !== undefined) {
         upd({ vpX: pos.x, vpY: pos.y });
         scheduleRulerOverlay();
         return true;
       }
 
-      // ── 1pt: horizon-angle drag ─────────────────────────────────────────
+      // ── 1pt: horizon-angle drag (non-VP handle H — clamp to canvas) ──────
       if (rulerHorizonDragRef.current && layer.vpX !== undefined) {
-        const dvx = pos.x - layer.vpX;
-        const dvy = pos.y - layer.vpY!;
+        const dvx = clampedPos.x - layer.vpX;
+        const dvy = clampedPos.y - layer.vpY!;
         let angleDeg = (Math.atan2(dvy, dvx) * 180) / Math.PI;
         angleDeg = Math.round(angleDeg / 5) * 5;
         upd({ horizonAngle: angleDeg });
@@ -1089,7 +1103,7 @@ export function use1pt2ptPerspectiveRuler({
         return true;
       }
 
-      // ── 2pt: VP1 / VP2 drag ─────────────────────────────────────────────
+      // ── 2pt: VP1 / VP2 drag — EXEMPT from clamping (vanishing points) ───
       if (rulerVP1DragRef.current || rulerVP2DragRef.current) {
         const pcX2d = layer.horizonCenterX ?? 0;
         const pcY2d = layer.horizonCenterY ?? 0;
@@ -1097,7 +1111,7 @@ export function use1pt2ptPerspectiveRuler({
         const hcx = Math.cos(hRad2d);
         const hcy = Math.sin(hRad2d);
 
-        // Project drag position onto the horizon line through P
+        // Project drag position onto the horizon line through P (use raw pos — VP is exempt)
         const dpxH = pos.x - pcX2d;
         const dpyH = pos.y - pcY2d;
         const d = dpxH * hcx + dpyH * hcy; // signed distance from P
@@ -1178,11 +1192,11 @@ export function use1pt2ptPerspectiveRuler({
         return true;
       }
 
-      // ── 2pt: center translate ────────────────────────────────────────────
+      // ── 2pt: center translate (non-VP — clamp to canvas) ────────────────
       if (ruler2ptCenterDragRef.current) {
         const off2 = ruler2ptCenterDragOffsetRef.current;
-        const newPcX = pos.x - off2.dx;
-        const newPcY = pos.y - off2.dy;
+        const newPcX = Math.max(0, Math.min(cW, clampedPos.x - off2.dx));
+        const newPcY = Math.max(0, Math.min(cH, clampedPos.y - off2.dy));
         const dxShift = newPcX - (layer.horizonCenterX ?? 0);
         const dyShift = newPcY - (layer.horizonCenterY ?? 0);
         upd({
@@ -1210,12 +1224,12 @@ export function use1pt2ptPerspectiveRuler({
         return true;
       }
 
-      // ── 2pt: horizon rotation ────────────────────────────────────────────
+      // ── 2pt: horizon rotation (non-VP handle H — clamp to canvas) ────────
       if (ruler2ptRotDragRef.current) {
         const pcXr = layer.horizonCenterX ?? 0;
         const pcYr = layer.horizonCenterY ?? 0;
-        const dvxr = pos.x - pcXr;
-        const dvyr = pos.y - pcYr;
+        const dvxr = clampedPos.x - pcXr;
+        const dvyr = clampedPos.y - pcYr;
         let newAngleDeg = (Math.atan2(dvyr, dvxr) * 180) / Math.PI;
         newAngleDeg = Math.round(newAngleDeg / 5) * 5;
         const newHRadR = (newAngleDeg * Math.PI) / 180;
@@ -1281,14 +1295,15 @@ export function use1pt2ptPerspectiveRuler({
         return true;
       }
 
-      // ── 2pt: grid-B translate ────────────────────────────────────────────
+      // ── 2pt: grid-B translate (non-VP — clamp to canvas) ────────────────
       if (rulerGridBDragRef.current) {
-        upd({ rulerGridBX: pos.x, rulerGridBY: pos.y });
+        upd({ rulerGridBX: clampedPos.x, rulerGridBY: clampedPos.y });
         scheduleRulerOverlay();
         return true;
       }
 
-      // ── 2pt: grid-A or grid-C (moves VP1 or VP2) ─────────────────────────
+      // ── 2pt: grid-A or grid-C (moves VP1 or VP2 indirectly via A/C position)
+      // A and C handles are non-VP, clamped. VP positions are computed from them.
       if (rulerGridADragRef.current || rulerGridCDragRef.current) {
         const pcX2d = layer.horizonCenterX ?? 0;
         const pcY2d = layer.horizonCenterY ?? 0;
@@ -1321,9 +1336,9 @@ export function use1pt2ptPerspectiveRuler({
         };
 
         if (rulerGridADragRef.current) {
-          // A moves VP1: new VP1 = 2*dragPos - B, projected onto horizon
-          const newVP1x = 2 * pos.x - bGX2;
-          const newVP1y = 2 * pos.y - bGY2;
+          // A moves VP1: new VP1 = 2*clampedPos - B, projected onto horizon
+          const newVP1x = 2 * clampedPos.x - bGX2;
+          const newVP1y = 2 * clampedPos.y - bGY2;
           const dpx1 = newVP1x - pcX2d;
           const dpy1 = newVP1y - pcY2d;
           const proj1 = dpx1 * hcx + dpy1 * hcy;
@@ -1351,9 +1366,9 @@ export function use1pt2ptPerspectiveRuler({
             );
           }
         } else {
-          // C moves VP2: new VP2 = 2*dragPos - B, projected onto horizon
-          const newVP2x = 2 * pos.x - bGX2;
-          const newVP2y = 2 * pos.y - bGY2;
+          // C moves VP2: new VP2 = 2*clampedPos - B, projected onto horizon
+          const newVP2x = 2 * clampedPos.x - bGX2;
+          const newVP2y = 2 * clampedPos.y - bGY2;
           const dpx2 = newVP2x - pcX2d;
           const dpy2 = newVP2y - pcY2d;
           const proj2 = dpx2 * hcx + dpy2 * hcy;
@@ -1387,7 +1402,7 @@ export function use1pt2ptPerspectiveRuler({
 
       return false;
     },
-    [makeUpdater, scheduleRulerOverlay],
+    [makeUpdater, scheduleRulerOverlay, canvasWidthRef, canvasHeightRef],
   );
 
   // ── handle1pt2ptRulerPointerUp ────────────────────────────────────────────
@@ -1410,24 +1425,96 @@ export function use1pt2ptPerspectiveRuler({
 
       if (!any1pt && !any2pt) return false;
 
+      // Fix 2: Clamp non-VP position handles to canvas bounds on pointer-up.
+      const W = canvasWidthRef.current;
+      const H = canvasHeightRef.current;
+      const cx = (v: number | undefined) =>
+        v !== undefined ? Math.max(0, Math.min(W, v)) : v;
+      const cy = (v: number | undefined) =>
+        v !== undefined ? Math.max(0, Math.min(H, v)) : v;
+
       let afterState: Record<string, unknown>;
 
       if (any2pt) {
-        afterState = {
-          horizonCenterX: layer.horizonCenterX,
-          horizonCenterY: layer.horizonCenterY,
-          horizonAngle: layer.horizonAngle ?? 0,
-          vp1X: layer.vp1X,
-          vp1Y: layer.vp1Y,
-          vp2X: layer.vp2X,
-          vp2Y: layer.vp2Y,
-          rulerGridBX: layer.rulerGridBX,
-          rulerGridBY: layer.rulerGridBY,
-          rulerVP3Y: layer.rulerVP3Y,
-          rulerHandleDX: layer.rulerHandleDX,
-          rulerHandleDY: layer.rulerHandleDY,
-        };
+        // Clamp non-VP 2pt handles: center P and grid B.
+        // VP1/VP2 are vanishing points — exempt from clamping.
+        const clampedCenterX =
+          ruler2ptCenterDragRef.current ||
+          rulerGridADragRef.current ||
+          rulerGridBDragRef.current ||
+          rulerGridCDragRef.current
+            ? cx(layer.horizonCenterX)
+            : layer.horizonCenterX;
+        const clampedCenterY =
+          ruler2ptCenterDragRef.current ||
+          rulerGridADragRef.current ||
+          rulerGridBDragRef.current ||
+          rulerGridCDragRef.current
+            ? cy(layer.horizonCenterY)
+            : layer.horizonCenterY;
+        const clampedGridBX =
+          layer.rulerGridBX !== undefined
+            ? cx(layer.rulerGridBX)
+            : layer.rulerGridBX;
+        const clampedGridBY =
+          layer.rulerGridBY !== undefined
+            ? cy(layer.rulerGridBY)
+            : layer.rulerGridBY;
+
+        const needsClamp2pt =
+          clampedCenterX !== layer.horizonCenterX ||
+          clampedCenterY !== layer.horizonCenterY ||
+          clampedGridBX !== layer.rulerGridBX ||
+          clampedGridBY !== layer.rulerGridBY;
+
+        if (needsClamp2pt) {
+          const patch2pt: Partial<Layer> = {};
+          if (clampedCenterX !== undefined)
+            patch2pt.horizonCenterX = clampedCenterX;
+          if (clampedCenterY !== undefined)
+            patch2pt.horizonCenterY = clampedCenterY;
+          if (clampedGridBX !== undefined) patch2pt.rulerGridBX = clampedGridBX;
+          if (clampedGridBY !== undefined) patch2pt.rulerGridBY = clampedGridBY;
+          const fn2pt = (l: Layer) =>
+            l.id === layer.id ? { ...l, ...patch2pt } : l;
+          setLayers((prev) => prev.map(fn2pt));
+          layersRef.current = layersRef.current.map(fn2pt);
+          // Refresh local layer reference for afterState
+          const refreshed2pt =
+            layersRef.current.find((l) => l.id === layer.id) ?? layer;
+          afterState = {
+            horizonCenterX: refreshed2pt.horizonCenterX,
+            horizonCenterY: refreshed2pt.horizonCenterY,
+            horizonAngle: refreshed2pt.horizonAngle ?? 0,
+            vp1X: refreshed2pt.vp1X,
+            vp1Y: refreshed2pt.vp1Y,
+            vp2X: refreshed2pt.vp2X,
+            vp2Y: refreshed2pt.vp2Y,
+            rulerGridBX: refreshed2pt.rulerGridBX,
+            rulerGridBY: refreshed2pt.rulerGridBY,
+            rulerVP3Y: refreshed2pt.rulerVP3Y,
+            rulerHandleDX: refreshed2pt.rulerHandleDX,
+            rulerHandleDY: refreshed2pt.rulerHandleDY,
+          };
+        } else {
+          afterState = {
+            horizonCenterX: layer.horizonCenterX,
+            horizonCenterY: layer.horizonCenterY,
+            horizonAngle: layer.horizonAngle ?? 0,
+            vp1X: layer.vp1X,
+            vp1Y: layer.vp1Y,
+            vp2X: layer.vp2X,
+            vp2Y: layer.vp2Y,
+            rulerGridBX: layer.rulerGridBX,
+            rulerGridBY: layer.rulerGridBY,
+            rulerVP3Y: layer.rulerVP3Y,
+            rulerHandleDX: layer.rulerHandleDX,
+            rulerHandleDY: layer.rulerHandleDY,
+          };
+        }
       } else {
+        // 1pt: horizonAngle is an angle (not a position), VP is exempt.
+        // Nothing to clamp here.
         afterState = {
           vpX: layer.vpX ?? 0,
           vpY: layer.vpY ?? 0,
@@ -1466,7 +1553,15 @@ export function use1pt2ptPerspectiveRuler({
       scheduleRulerOverlay();
       return true;
     },
-    [pushHistory, rulerEditHistoryDepthRef, scheduleRulerOverlay],
+    [
+      canvasWidthRef,
+      canvasHeightRef,
+      layersRef,
+      setLayers,
+      pushHistory,
+      rulerEditHistoryDepthRef,
+      scheduleRulerOverlay,
+    ],
   );
 
   // ── is1pt2ptRulerDragging ─────────────────────────────────────────────────

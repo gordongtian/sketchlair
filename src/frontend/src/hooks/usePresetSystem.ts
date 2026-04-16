@@ -12,6 +12,14 @@ export interface ConflictItem {
   preset: Preset;
 }
 
+/** Shape of the presets payload saved/restored from the cloud. */
+export interface PresetsPayload {
+  brush: Preset[];
+  smudge: Preset[];
+  eraser: Preset[];
+  activePresetIds: Record<string, string | null>;
+}
+
 export interface UsePresetSystemProps {
   /** Current active tool — used in tool-switch effect and preset callbacks */
   activeTool: Tool;
@@ -24,6 +32,14 @@ export interface UsePresetSystemProps {
     React.SetStateAction<{ h: number; s: number; v: number; a: number }>
   >;
   setActiveTool?: (tool: Tool) => void;
+  /**
+   * Called (debounced 500 ms) whenever presets are mutated and the user is
+   * authenticated. Receives the full JSON string to persist to the backend.
+   * When undefined or when the user is not logged in, no save is attempted.
+   */
+  onPresetsMutated?: (json: string) => void;
+  /** When true the debounced save fires; when false/undefined it is suppressed. */
+  isLoggedIn?: boolean;
 }
 
 export interface UsePresetSystemReturn {
@@ -91,6 +107,13 @@ export interface UsePresetSystemReturn {
   ) => void;
   resolveConflict: (action: "overwrite" | "rename" | "skip") => void;
 
+  /**
+   * Bulk-restore presets from a saved payload (e.g. loaded from cloud on login).
+   * Replaces the current presets + activePresetIds with the provided values.
+   * Falls back gracefully if any key is missing.
+   */
+  loadPresets: (payload: PresetsPayload) => void;
+
   // ── Slider change helpers (sync both state and toolRefs) ──────────────────
   handleCanvasBrushSizeChange: (v: number) => void;
   handleCanvasBrushOpacityChange: (v: number) => void;
@@ -104,6 +127,8 @@ export function usePresetSystem({
   setBrushSettings,
   setColor,
   setActiveTool,
+  onPresetsMutated,
+  isLoggedIn,
 }: UsePresetSystemProps): UsePresetSystemReturn {
   // ── State ──────────────────────────────────────────────────────────────────
   const [presets, setPresets] = useState(DEFAULT_PRESETS);
@@ -150,6 +175,15 @@ export function usePresetSystem({
     DEFAULT_PRESETS.brush[0]?.settings ?? ({} as BrushSettings),
   );
 
+  // ── Debounced save refs ─────────────────────────────────────────────────────
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Keep latest callback and login state in refs so the debounce closure
+  // always reads the current values without needing to be recreated.
+  const onPresetsMutatedRef = useRef(onPresetsMutated);
+  const isLoggedInRef = useRef(isLoggedIn);
+  onPresetsMutatedRef.current = onPresetsMutated;
+  isLoggedInRef.current = isLoggedIn;
+
   // Keep refs in sync with state
   useEffect(() => {
     presetsRef.current = presets;
@@ -157,6 +191,47 @@ export function usePresetSystem({
   useEffect(() => {
     activePresetIdsRef.current = activePresetIds;
   }, [activePresetIds]);
+
+  // ── Debounced save helper ───────────────────────────────────────────────────
+  /**
+   * Schedules a debounced save 500 ms after the last mutation.
+   * Only fires if the user is currently logged in and a save callback exists.
+   * Reads presetsRef/activePresetIdsRef so it always uses the latest state.
+   */
+  const scheduleSave = useCallback(() => {
+    if (saveTimerRef.current !== null) {
+      clearTimeout(saveTimerRef.current);
+    }
+    saveTimerRef.current = setTimeout(() => {
+      saveTimerRef.current = null;
+      if (!isLoggedInRef.current) return;
+      if (!onPresetsMutatedRef.current) return;
+      const payload: PresetsPayload = {
+        brush: presetsRef.current.brush,
+        smudge: presetsRef.current.smudge,
+        eraser: presetsRef.current.eraser,
+        activePresetIds: activePresetIdsRef.current,
+      };
+      try {
+        console.log(
+          "[Save] Brush settings: triggering save with payload:",
+          payload,
+        );
+        onPresetsMutatedRef.current(JSON.stringify(payload));
+      } catch {
+        // serialization failure is silent
+      }
+    }, 500);
+  }, []);
+
+  // Clear the timer on unmount to prevent memory leaks / state updates after unmount.
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current !== null) {
+        clearTimeout(saveTimerRef.current);
+      }
+    };
+  }, []);
 
   // ── Tool-switch effect: restore size/opacity/flow from active preset ────────
   useEffect(() => {
@@ -263,6 +338,8 @@ export function usePresetSystem({
           [activeSubpanel]: preset.opacity!,
         };
       }
+      // Selecting a preset is not a mutation that needs cloud-saving —
+      // only structural changes (add/update/delete/reorder/saveCurrentToPreset) are saved.
     },
     [
       activeSubpanel,
@@ -289,8 +366,9 @@ export function usePresetSystem({
       }));
       if (activePresetIds[activeSubpanel] === updated.id)
         setBrushSettings((prev) => ({ ...updated.settings, flow: prev.flow }));
+      scheduleSave();
     },
-    [activeSubpanel, activePresetIds, setBrushSettings],
+    [activeSubpanel, activePresetIds, setBrushSettings, scheduleSave],
   );
 
   const handleAddPreset = useCallback(
@@ -318,8 +396,9 @@ export function usePresetSystem({
       }));
       setActivePresetIds((prev) => ({ ...prev, [activeSubpanel]: newId }));
       setBrushSettings(newPreset.settings);
+      scheduleSave();
     },
-    [activeSubpanel, setBrushSettings],
+    [activeSubpanel, setBrushSettings, scheduleSave],
   );
 
   const handleDeletePreset = useCallback(
@@ -336,8 +415,9 @@ export function usePresetSystem({
       }));
       if (activePresetIds[activeSubpanel] === presetId)
         setActivePresetIds((prev) => ({ ...prev, [activeSubpanel]: null }));
+      scheduleSave();
     },
-    [activeSubpanel, activePresetIds],
+    [activeSubpanel, activePresetIds, scheduleSave],
   );
 
   const handleActivatePreset = useCallback(() => {
@@ -365,8 +445,9 @@ export function usePresetSystem({
         arr.splice(toIndex, 0, moved);
         return { ...prev, [activeSubpanel]: arr };
       });
+      scheduleSave();
     },
-    [activeSubpanel],
+    [activeSubpanel, scheduleSave],
   );
 
   const handleSaveCurrentToPreset = useCallback(
@@ -383,8 +464,9 @@ export function usePresetSystem({
           p.id === presetId ? { ...p, size, opacity } : p,
         ),
       }));
+      scheduleSave();
     },
-    [activeSubpanel],
+    [activeSubpanel, scheduleSave],
   );
 
   // ── Import / Export ─────────────────────────────────────────────────────────
@@ -475,9 +557,10 @@ export function usePresetSystem({
           setBrushSettings(s);
         }
         toast.success("Brushes imported successfully!");
+        scheduleSave();
       }
     },
-    [setBrushSettings],
+    [setBrushSettings, scheduleSave],
   );
 
   const resolveConflict = useCallback(
@@ -521,9 +604,71 @@ export function usePresetSystem({
         setCurrentConflict(null);
         setPendingMerged(null);
         toast.success("Brushes imported successfully!");
+        scheduleSave();
       }
     },
-    [currentConflict, pendingMerged, conflictQueue],
+    [currentConflict, pendingMerged, conflictQueue, scheduleSave],
+  );
+
+  // ── loadPresets (cloud restore on login) ────────────────────────────────────
+
+  const loadPresets = useCallback(
+    (payload: PresetsPayload) => {
+      console.log(
+        "[Load] Raw brush settings from storage (loadPresets called):",
+        payload,
+      );
+      // Validate and fall back per-tool-type if the data is malformed
+      const safeBrush =
+        Array.isArray(payload.brush) && payload.brush.length > 0
+          ? payload.brush
+          : DEFAULT_PRESETS.brush;
+      const safeSmudge =
+        Array.isArray(payload.smudge) && payload.smudge.length > 0
+          ? payload.smudge
+          : DEFAULT_PRESETS.smudge;
+      const safeEraser =
+        Array.isArray(payload.eraser) && payload.eraser.length > 0
+          ? payload.eraser
+          : DEFAULT_PRESETS.eraser;
+      const safeActiveIds =
+        payload.activePresetIds && typeof payload.activePresetIds === "object"
+          ? payload.activePresetIds
+          : {
+              brush: "brush-default",
+              smudge: "smear-default",
+              eraser: "eraser-default",
+            };
+
+      if (
+        !payload ||
+        (!Array.isArray(payload.brush) &&
+          !Array.isArray(payload.smudge) &&
+          !Array.isArray(payload.eraser))
+      ) {
+        console.warn("[Load] Brush settings: null — nothing to load");
+      }
+
+      setPresets({ brush: safeBrush, smudge: safeSmudge, eraser: safeEraser });
+      setActivePresetIds(safeActiveIds);
+      console.log("[Load] Parsed brush settings applied:", {
+        presets: payload,
+        activeIds: safeActiveIds,
+      });
+
+      // Restore brush settings for the currently active brush preset
+      const activeBrushId = safeActiveIds.brush;
+      const activePreset = activeBrushId
+        ? safeBrush.find((p) => p.id === activeBrushId)
+        : null;
+      if (activePreset?.settings) {
+        const s = { ...activePreset.settings };
+        if (activePreset.defaultFlow !== undefined)
+          s.flow = activePreset.defaultFlow;
+        setBrushSettings(s);
+      }
+    },
+    [setBrushSettings],
   );
 
   // ── Slider change helpers ────────────────────────────────────────────────────
@@ -590,6 +735,7 @@ export function usePresetSystem({
     handleImportBrushes,
     processImportAppend,
     resolveConflict,
+    loadPresets,
     handleCanvasBrushSizeChange,
     handleCanvasBrushOpacityChange,
     handleCanvasBrushFlowChange,

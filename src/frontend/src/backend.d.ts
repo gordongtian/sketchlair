@@ -19,12 +19,14 @@ export enum UserRole {
 }
 export interface backendInterface {
     assignCallerUserRole(user: Principal, role: UserRole): Promise<void>;
+    getBrushPresets(): Promise<string | null>;
     getCallerUserProfile(): Promise<UserProfile | null>;
     getCallerUserRole(): Promise<UserRole>;
     getCanvasHash(): Promise<CanvasSave | null>;
     getUserProfile(user: Principal): Promise<UserProfile | null>;
     getUserSettings(): Promise<SettingsSave | null>;
     isCallerAdmin(): Promise<boolean>;
+    saveBrushPresets(data: string): Promise<void>;
     saveCallerUserProfile(profile: UserProfile): Promise<void>;
     saveCanvasHash(canvasHash: CanvasSave): Promise<void>;
     saveUserSettings(settings: SettingsSave): Promise<void>;

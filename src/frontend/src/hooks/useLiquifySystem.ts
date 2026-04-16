@@ -22,6 +22,22 @@ let _liquifyDirtyX1 = 0;
 let _liquifyDirtyY1 = 0;
 let _liquifyOutput: ImageData | null = null;
 
+// ─── Single liquify stroke active flag ───────────────────────────────────────
+// Set to true at liquify pointer-down, false at pointer-up.
+// Any code that would draw pre-warp layer state to the display canvas
+// (compositeWithStrokePreview, scheduleComposite) checks this flag and
+// skips the draw while a liquify stroke is in progress.
+// This is the single authoritative gate — all previous stacked RAF
+// cancellation fixes have been collapsed into this one flag.
+let _liquifyStrokeActive = false;
+
+export function getLiquifyStrokeActive(): boolean {
+  return _liquifyStrokeActive;
+}
+export function setLiquifyStrokeActive(v: boolean): void {
+  _liquifyStrokeActive = v;
+}
+
 // ─── Exported getters/setters for module-level state ─────────────────────────
 // PaintingApp's pointer handlers read/write these during the stroke.
 
@@ -143,20 +159,71 @@ export function updateLiquifyDisplacementField(
   _liquifyDirtyY1 = Math.max(_liquifyDirtyY1, y1);
 }
 
+// ─── Per-frame dirty rect (resets each rAF cycle) ────────────────────────────
+// The cumulative dirty rect grows monotonically for undo/commit correctness.
+// The per-frame dirty rect is reset at the start of each rAF so we only
+// re-render pixels touched in the current frame — prevents pathological cost
+// on long strokes where the cumulative rect spans the full canvas.
+let _liqFrameDirtyX0 = 0;
+let _liqFrameDirtyY0 = 0;
+let _liqFrameDirtyX1 = 0;
+let _liqFrameDirtyY1 = 0;
+let _liqFrameDirtyEmpty = true;
+
+/** Call at the start of each rAF callback before processing events for the frame. */
+export function resetLiquifyFrameDirty(): void {
+  _liqFrameDirtyX0 = 0;
+  _liqFrameDirtyY0 = 0;
+  _liqFrameDirtyX1 = 0;
+  _liqFrameDirtyY1 = 0;
+  _liqFrameDirtyEmpty = true;
+}
+
+/** Expand the per-frame dirty rect to include the stamp area just written. */
+export function expandLiquifyFrameDirty(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+): void {
+  if (_liqFrameDirtyEmpty) {
+    _liqFrameDirtyX0 = x0;
+    _liqFrameDirtyY0 = y0;
+    _liqFrameDirtyX1 = x1;
+    _liqFrameDirtyY1 = y1;
+    _liqFrameDirtyEmpty = false;
+  } else {
+    if (x0 < _liqFrameDirtyX0) _liqFrameDirtyX0 = x0;
+    if (y0 < _liqFrameDirtyY0) _liqFrameDirtyY0 = y0;
+    if (x1 > _liqFrameDirtyX1) _liqFrameDirtyX1 = x1;
+    if (y1 > _liqFrameDirtyY1) _liqFrameDirtyY1 = y1;
+  }
+}
+
 /**
  * Apply the current displacement field to the layer canvas using bilinear
- * interpolation. Always renders the full cumulative dirty rect so that every
- * displaced pixel is redrawn — rendering only the current stamp footprint
- * caused oval/ring artifacts on earlier passes.
+ * interpolation. Renders the per-frame dirty rect (resets each rAF) rather
+ * than the full cumulative rect — this prevents long-stroke cost explosion.
+ *
+ * stride > 1 uses nearest-neighbor fill for skipped pixels (acceptable
+ * quality trade-off for multi-layer mode performance).
  */
-export function renderLiquifyFromSnapshot(ctx: CanvasRenderingContext2D): void {
-  if (!_liquifyDxDy || !_liquifySnapshot) return;
+export function renderLiquifyFromSnapshot(
+  ctx: CanvasRenderingContext2D,
+  snapshot?: ImageData,
+  stride = 1,
+): void {
+  if (!_liquifyDxDy) return;
+  const snap = snapshot ?? _liquifySnapshot;
+  if (!snap) return;
   const W = _liquifySnapW;
   const H = _liquifySnapH;
-  const rx0 = _liquifyDirtyX0;
-  const ry0 = _liquifyDirtyY0;
-  const rx1 = _liquifyDirtyX1;
-  const ry1 = _liquifyDirtyY1;
+
+  // Use per-frame dirty rect; fall back to cumulative if frame rect is empty.
+  const rx0 = _liqFrameDirtyEmpty ? _liquifyDirtyX0 : _liqFrameDirtyX0;
+  const ry0 = _liqFrameDirtyEmpty ? _liquifyDirtyY0 : _liqFrameDirtyY0;
+  const rx1 = _liqFrameDirtyEmpty ? _liquifyDirtyX1 : _liqFrameDirtyX1;
+  const ry1 = _liqFrameDirtyEmpty ? _liquifyDirtyY1 : _liqFrameDirtyY1;
   const rw = rx1 - rx0;
   const rh = ry1 - ry0;
   if (rw <= 0 || rh <= 0) return;
@@ -169,59 +236,109 @@ export function renderLiquifyFromSnapshot(ctx: CanvasRenderingContext2D): void {
     _liquifyOutput = new ImageData(rw, rh);
   }
   const out = _liquifyOutput.data;
-  const src = _liquifySnapshot.data;
+  const src = snap.data;
 
-  for (let py = ry0; py < ry1; py++) {
-    for (let px = rx0; px < rx1; px++) {
+  for (let py = ry0; py < ry1; py += stride) {
+    for (let px = rx0; px < rx1; px += stride) {
       const di = (py * W + px) * 2;
       const srcX = px + _liquifyDxDy[di];
       const srcY = py + _liquifyDxDy[di + 1];
       const oi = ((py - ry0) * rw + (px - rx0)) * 4;
 
+      let r: number;
+      let g: number;
+      let b: number;
+      let a: number;
+
       if (srcX < 0 || srcX >= W - 1 || srcY < 0 || srcY >= H - 1) {
         const cx2 = Math.max(0, Math.min(W - 1, Math.round(srcX)));
         const cy2 = Math.max(0, Math.min(H - 1, Math.round(srcY)));
         const si = (cy2 * W + cx2) * 4;
-        out[oi] = src[si];
-        out[oi + 1] = src[si + 1];
-        out[oi + 2] = src[si + 2];
-        out[oi + 3] = src[si + 3];
-        continue;
+        r = src[si];
+        g = src[si + 1];
+        b = src[si + 2];
+        a = src[si + 3];
+      } else {
+        const sx = Math.floor(srcX);
+        const sy = Math.floor(srcY);
+        const fx = srcX - sx;
+        const fy = srcY - sy;
+        const i00 = (sy * W + sx) * 4;
+        const i10 = (sy * W + sx + 1) * 4;
+        const i01 = ((sy + 1) * W + sx) * 4;
+        const i11 = ((sy + 1) * W + sx + 1) * 4;
+        const w00 = (1 - fx) * (1 - fy);
+        const w10 = fx * (1 - fy);
+        const w01 = (1 - fx) * fy;
+        const w11 = fx * fy;
+        r = src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11;
+        g =
+          src[i00 + 1] * w00 +
+          src[i10 + 1] * w10 +
+          src[i01 + 1] * w01 +
+          src[i11 + 1] * w11;
+        b =
+          src[i00 + 2] * w00 +
+          src[i10 + 2] * w10 +
+          src[i01 + 2] * w01 +
+          src[i11 + 2] * w11;
+        a =
+          src[i00 + 3] * w00 +
+          src[i10 + 3] * w10 +
+          src[i01 + 3] * w01 +
+          src[i11 + 3] * w11;
       }
 
-      const sx = Math.floor(srcX);
-      const sy = Math.floor(srcY);
-      const fx = srcX - sx;
-      const fy = srcY - sy;
-      const i00 = (sy * W + sx) * 4;
-      const i10 = (sy * W + sx + 1) * 4;
-      const i01 = ((sy + 1) * W + sx) * 4;
-      const i11 = ((sy + 1) * W + sx + 1) * 4;
-      const w00 = (1 - fx) * (1 - fy);
-      const w10 = fx * (1 - fy);
-      const w01 = (1 - fx) * fy;
-      const w11 = fx * fy;
-      out[oi] =
-        src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11;
-      out[oi + 1] =
-        src[i00 + 1] * w00 +
-        src[i10 + 1] * w10 +
-        src[i01 + 1] * w01 +
-        src[i11 + 1] * w11;
-      out[oi + 2] =
-        src[i00 + 2] * w00 +
-        src[i10 + 2] * w10 +
-        src[i01 + 2] * w01 +
-        src[i11 + 2] * w11;
-      out[oi + 3] =
-        src[i00 + 3] * w00 +
-        src[i10 + 3] * w10 +
-        src[i01 + 3] * w01 +
-        src[i11 + 3] * w11;
+      out[oi] = r;
+      out[oi + 1] = g;
+      out[oi + 2] = b;
+      out[oi + 3] = a;
+
+      // Nearest-neighbor fill for skipped pixels when stride > 1
+      if (stride > 1) {
+        const pyMax = Math.min(py + stride, ry1);
+        const pxMax = Math.min(px + stride, rx1);
+        for (let sy2 = py; sy2 < pyMax; sy2++) {
+          for (let sx2 = px; sx2 < pxMax; sx2++) {
+            if (sy2 === py && sx2 === px) continue;
+            const oi2 = ((sy2 - ry0) * rw + (sx2 - rx0)) * 4;
+            out[oi2] = r;
+            out[oi2 + 1] = g;
+            out[oi2 + 2] = b;
+            out[oi2 + 3] = a;
+          }
+        }
+      }
     }
   }
 
   ctx.putImageData(_liquifyOutput, rx0, ry0);
+}
+
+/**
+ * Batch multi-layer liquify render — applies the SAME displacement field to
+ * multiple layers in a single pass. Caller provides an array of
+ * (ctx, snapshot) pairs. One composite fires after this returns.
+ *
+ * stride reduces processed pixel count for large layer counts (stride 2 = 4×
+ * fewer pixels processed, stride 3 = 9×).
+ *
+ * Ruler layers are silently skipped — the displacement field is never written
+ * to a layer canvas whose corresponding layer has isRuler === true.
+ */
+export function renderLiquifyMultiLayer(
+  layers: Array<{
+    ctx: CanvasRenderingContext2D;
+    snapshot: ImageData;
+    isRuler?: boolean;
+  }>,
+  stride = 1,
+): void {
+  for (const { ctx, snapshot, isRuler } of layers) {
+    // Ruler layer guard — silently skip; displacement is never written to ruler layers
+    if (isRuler) continue;
+    renderLiquifyFromSnapshot(ctx, snapshot, stride);
+  }
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────

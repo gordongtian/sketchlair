@@ -15,5 +15,8 @@
   },
   "devDependencies": {
     "sharp": "^0.34.4"
+  },
+  "dependencies": {
+    "@caffeineai/core-infrastructure": "^0.2.0"
   }
 }

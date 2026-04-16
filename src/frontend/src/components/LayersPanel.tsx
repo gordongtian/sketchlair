@@ -23,9 +23,20 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import React, { memo, useRef, useState } from "react";
-import type { LayerGroup, LayerNode, RulerFields } from "../types";
-import { findNode, flattenTree, moveNode } from "../utils/layerTree";
+import { memo, useCallback, useRef, useState } from "react";
+import type React from "react";
+import type { GroupHeader, LayerNode, PaintLayer, RulerFields } from "../types";
+import {
+  computeNestingDepths,
+  getGroupSlice,
+  isFlatEndGroup,
+  isFlatGroupHeader,
+} from "../utils/groupUtils";
+import type { FlatEntry } from "../utils/groupUtils";
+
+// ── Legacy Layer interface ────────────────────────────────────────────────────
+// Exported so other files (PaintingApp, RightSidebarArea, etc.) can keep
+// importing `Layer` from this file without changes.
 
 export interface Layer extends RulerFields {
   id: string;
@@ -35,44 +46,60 @@ export interface Layer extends RulerFields {
   blendMode: string;
   isClippingMask: boolean;
   alphaLock: boolean;
+  // Flat-array type discriminant — kept optional for backward compat
+  // GroupHeader and EndGroup objects are cast through this interface at runtime.
+  type?: string;
 }
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const INDENT_SIZE = 16; // px per nesting level
 
 // ── Drag state ────────────────────────────────────────────────────────────────
 
-type DropPosition = "before" | "after" | "inside";
-
 interface DragState {
-  nodeId: string;
-  nodeKind: "layer" | "group";
+  phase: "idle" | "dragging" | "hovering";
+  dragIndex: number;
+  dragEndIndex: number;
+  dropIndex: number;
+  sourceSnapshot: Layer[];
+  pointerStartY: number;
 }
 
-interface DropTarget {
-  targetId: string;
-  position: DropPosition;
-}
+const IDLE_DRAG: DragState = {
+  phase: "idle",
+  dragIndex: -1,
+  dragEndIndex: -1,
+  dropIndex: -1,
+  sourceSnapshot: [],
+  pointerStartY: 0,
+};
 
 // ── LayerRow ──────────────────────────────────────────────────────────────────
 
 interface LayerRowProps {
-  layer: Layer;
+  layer: PaintLayer;
   isActive: boolean;
   isSelected: boolean;
   depth: number;
+  isDragging: boolean;
   thumbnail: string | undefined;
-  dragOverTarget: DropTarget | null;
   renamingId: string | null;
   renameVal: string;
   totalNonRulerLayers: number;
+  dropIndicatorBefore: boolean;
+  dropIndicatorAfter: boolean;
+  shiftHeld: boolean;
   onSetActive: (id: string) => void;
   onToggleVisible: (id: string) => void;
   onSetOpacity: (id: string, opacity: number) => void;
-  onSetBlendMode: (id: string, blendMode: string) => void;
+  onSetOpacityLive: (id: string, opacity: number) => void;
+  onSetOpacityCommit: (id: string, before: number, after: number) => void;
   onDeleteLayer: (id: string) => void;
   onCtrlClickLayer: (id: string) => void;
   onToggleRulerActive: (id: string) => void;
-  onDragStart: (id: string, kind: "layer") => void;
-  onDragOver: (e: React.DragEvent, id: string, kind: "layer" | "group") => void;
-  onDrop: (e: React.DragEvent, id: string, kind: "layer" | "group") => void;
+  onDragHandlePointerDown: (e: React.PointerEvent, index: number) => void;
+  flatIndex: number;
   onStartRename: (id: string, name: string) => void;
   onCommitRename: (id: string) => void;
   onSetRenamingId: (id: string | null) => void;
@@ -85,21 +112,23 @@ const LayerRow = memo(function LayerRow({
   isActive,
   isSelected,
   depth,
+  isDragging,
   thumbnail,
-  dragOverTarget,
   renamingId,
   renameVal,
   totalNonRulerLayers,
+  dropIndicatorBefore,
+  dropIndicatorAfter,
+  shiftHeld,
   onSetActive,
   onToggleVisible,
-  onSetOpacity,
-  onSetBlendMode,
+  onSetOpacityLive,
+  onSetOpacityCommit,
   onDeleteLayer,
   onCtrlClickLayer,
   onToggleRulerActive,
-  onDragStart,
-  onDragOver,
-  onDrop,
+  onDragHandlePointerDown,
+  flatIndex,
   onStartRename,
   onCommitRename,
   onSetRenamingId,
@@ -107,15 +136,15 @@ const LayerRow = memo(function LayerRow({
   onToggleSelection,
 }: LayerRowProps) {
   const isRenaming = renamingId === layer.id;
+  const opacityDragStartRef = useRef<number | null>(null);
 
-  const isDragTarget =
-    dragOverTarget?.targetId === layer.id &&
-    (dragOverTarget.position === "before" ||
-      dragOverTarget.position === "after");
+  // XOR shift to display effective ruler active state without mutating
+  const effectiveRulerActive = layer.isRuler
+    ? (layer.rulerActive ?? true) !== shiftHeld
+    : false;
 
-  const depthPad = depth * 16;
   const extraClipPad = layer.isClippingMask ? 16 : 0;
-  const leftPad = depthPad + extraClipPad + 8; // 8px base
+  const leftPad = depth * INDENT_SIZE + extraClipPad + 8;
 
   let bg = "bg-[oklch(var(--sidebar-item))] hover:brightness-95";
   if (isActive) bg = "bg-[oklch(var(--accent)/0.25)]";
@@ -123,124 +152,101 @@ const LayerRow = memo(function LayerRow({
 
   return (
     <div
-      onDragOver={(e) => onDragOver(e, layer.id, "layer")}
-      onDrop={(e) => onDrop(e, layer.id, "layer")}
-      className={`flex items-center gap-1.5 py-1.5 cursor-pointer border-b border-border/40 ${bg} ${
-        isDragTarget && dragOverTarget?.position === "before"
-          ? "border-t-2 border-primary"
-          : ""
-      } ${
-        isDragTarget && dragOverTarget?.position === "after"
-          ? "border-b-2 border-primary"
-          : ""
-      }`}
-      style={{ paddingLeft: leftPad, paddingRight: 8 }}
-      onClick={(e) => {
-        if (e.shiftKey) {
-          onToggleSelection(layer.id, true);
-        } else {
-          onToggleSelection(layer.id, false);
-          onSetActive(layer.id);
-        }
-      }}
-      onKeyDown={(e) => e.key === "Enter" && onSetActive(layer.id)}
-      onContextMenu={(e) => {
-        e.preventDefault();
-        onCtrlClickLayer(layer.id);
-      }}
+      style={{ opacity: isDragging ? 0.4 : 1, position: "relative" }}
+      data-layer-flat-index={flatIndex}
     >
-      <span
-        draggable
-        onDragStart={(e) => {
-          e.stopPropagation();
-          onDragStart(layer.id, "layer");
-        }}
-        className="shrink-0 cursor-grab active:cursor-grabbing flex items-center"
-      >
-        <GripVertical size={10} className="text-muted-foreground" />
-      </span>
-
-      {/* Thumbnail */}
-      {layer.isRuler ? (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onToggleRulerActive(layer.id);
-          }}
-          className={`w-8 h-8 rounded shrink-0 flex items-center justify-center border border-border text-xs font-bold transition-colors ${
-            layer.rulerActive
-              ? "bg-primary text-primary-foreground"
-              : "bg-muted text-muted-foreground hover:bg-muted/80"
-          }`}
-          data-ocid="layers.ruler_toggle_thumb"
-        >
-          {layer.rulerActive ? "ON" : "OFF"}
-        </button>
-      ) : thumbnail ? (
-        <img
-          src={thumbnail}
-          alt=""
-          className="w-8 h-8 rounded shrink-0 border border-border object-cover"
-          style={{ imageRendering: "pixelated" }}
-        />
-      ) : (
-        <div className="w-8 h-8 rounded shrink-0 bg-white border border-border" />
+      {dropIndicatorBefore && (
+        <div className="absolute top-0 left-0 right-0 h-0.5 bg-primary z-10 pointer-events-none" />
       )}
+      <div
+        className={`flex items-center gap-1.5 py-1.5 cursor-pointer border-b border-border/40 ${bg}`}
+        style={{ paddingLeft: leftPad, paddingRight: 8 }}
+        onClick={(e) => {
+          if (e.shiftKey) {
+            onToggleSelection(layer.id, true);
+          } else {
+            onToggleSelection(layer.id, false);
+            onSetActive(layer.id);
+          }
+        }}
+        onKeyDown={(e) => e.key === "Enter" && onSetActive(layer.id)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onCtrlClickLayer(layer.id);
+        }}
+      >
+        {/* Drag handle */}
+        <span
+          className="self-stretch shrink-0 cursor-grab active:cursor-grabbing flex items-center px-0.5"
+          style={{ minWidth: 16 }}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            onDragHandlePointerDown(e, flatIndex);
+          }}
+        >
+          <GripVertical size={10} className="text-muted-foreground" />
+        </span>
 
-      <div className="flex flex-col flex-1 min-w-0">
-        {isRenaming ? (
-          <input
-            // biome-ignore lint/a11y/noAutofocus: rename UX requires autofocus
-            autoFocus
-            value={renameVal}
-            onChange={(e) => onSetRenameVal(e.target.value)}
-            onBlur={() => onCommitRename(layer.id)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") onCommitRename(layer.id);
-              if (e.key === "Escape") onSetRenamingId(null);
+        {/* Thumbnail / ruler toggle */}
+        {layer.isRuler ? (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleRulerActive(layer.id);
             }}
-            onClick={(e) => e.stopPropagation()}
-            className="text-xs bg-transparent border-b border-primary text-foreground focus:outline-none w-full"
-            data-ocid="layers.rename_input"
+            className={`w-8 h-8 rounded shrink-0 flex items-center justify-center border border-border text-xs font-bold transition-colors ${
+              effectiveRulerActive
+                ? "bg-primary text-primary-foreground"
+                : "bg-muted text-muted-foreground hover:bg-muted/80"
+            }`}
+            data-ocid="layers.ruler_toggle_thumb"
+          >
+            {effectiveRulerActive ? "ON" : "OFF"}
+          </button>
+        ) : thumbnail ? (
+          <img
+            src={thumbnail}
+            alt=""
+            className="w-8 h-8 rounded shrink-0 border border-border object-cover"
+            style={{ imageRendering: "pixelated" }}
           />
         ) : (
-          <div className="flex items-center gap-1 min-w-0">
-            {layer.isRuler ? (
-              <Ruler size={10} className="text-muted-foreground shrink-0" />
-            ) : null}
-            <span
-              className="text-xs truncate text-foreground flex-1"
-              onDoubleClick={(e) => {
-                e.stopPropagation();
-                onStartRename(layer.id, layer.name);
-              }}
-            >
-              {layer.name}
-            </span>
-          </div>
+          <div className="w-8 h-8 rounded shrink-0 bg-white border border-border" />
         )}
-        {!layer.isRuler && (
-          <div className="flex items-center gap-1 mt-0.5">
-            <select
-              value={layer.blendMode}
-              onChange={(e) => {
-                e.stopPropagation();
-                onSetBlendMode(layer.id, e.target.value);
+
+        <div className="flex flex-col flex-1 min-w-0">
+          {isRenaming ? (
+            <input
+              // biome-ignore lint/a11y/noAutofocus: rename UX requires autofocus
+              autoFocus
+              value={renameVal}
+              onChange={(e) => onSetRenameVal(e.target.value)}
+              onBlur={() => onCommitRename(layer.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") onCommitRename(layer.id);
+                if (e.key === "Escape") onSetRenamingId(null);
               }}
-              onMouseDown={(e) => e.stopPropagation()}
-              className="text-[9px] bg-transparent text-muted-foreground border-none focus:outline-none cursor-pointer flex-1 min-w-0 truncate"
-              data-ocid="layers.blend_select"
-            >
-              {BLEND_MODES.map((m) => (
-                <option key={m.value} value={m.value}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
-        {layer.isRuler && (
+              onClick={(e) => e.stopPropagation()}
+              className="text-xs bg-transparent border-b border-primary text-foreground focus:outline-none w-full"
+              data-ocid="layers.rename_input"
+            />
+          ) : (
+            <div className="flex items-center gap-1 min-w-0">
+              {layer.isRuler ? (
+                <Ruler size={10} className="text-muted-foreground shrink-0" />
+              ) : null}
+              <span
+                className="text-xs truncate text-foreground flex-1"
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  onStartRename(layer.id, layer.name);
+                }}
+              >
+                {layer.name}
+              </span>
+            </div>
+          )}
           <div className="flex items-center gap-1 mt-0.5">
             <input
               type="range"
@@ -248,9 +254,24 @@ const LayerRow = memo(function LayerRow({
               max={1}
               step={0.01}
               value={layer.opacity}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                opacityDragStartRef.current = layer.opacity;
+              }}
               onChange={(e) => {
                 e.stopPropagation();
-                onSetOpacity(layer.id, Number(e.target.value));
+                onSetOpacityLive(layer.id, Number(e.target.value));
+              }}
+              onPointerUp={(e) => {
+                e.stopPropagation();
+                if (opacityDragStartRef.current !== null) {
+                  onSetOpacityCommit(
+                    layer.id,
+                    opacityDragStartRef.current,
+                    Number((e.target as HTMLInputElement).value),
+                  );
+                  opacityDragStartRef.current = null;
+                }
               }}
               onClick={(e) => e.stopPropagation()}
               style={
@@ -258,71 +279,74 @@ const LayerRow = memo(function LayerRow({
                   "--fill-pct": `${layer.opacity * 100}%`,
                 } as React.CSSProperties
               }
-              className="flex-1"
-              data-ocid="layers.ruler_opacity_slider"
+              className="flex-1 min-w-0"
+              data-ocid="layers.opacity_slider"
+            />
+            <input
+              type="number"
+              min={0}
+              max={100}
+              value={Math.round(layer.opacity * 100)}
+              onChange={(e) => {
+                e.stopPropagation();
+                const pct = Math.max(0, Math.min(100, Number(e.target.value)));
+                onSetOpacityLive(layer.id, pct / 100);
+              }}
+              onBlur={(e) => {
+                e.stopPropagation();
+                const pct = Math.max(
+                  0,
+                  Math.min(100, Number(e.target.value) || 0),
+                );
+                const before = opacityDragStartRef.current ?? layer.opacity;
+                onSetOpacityCommit(layer.id, before, pct / 100);
+                opacityDragStartRef.current = null;
+              }}
+              onFocus={(e) => {
+                e.stopPropagation();
+                opacityDragStartRef.current = layer.opacity;
+              }}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+              }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-9 shrink-0 bg-muted/60 border border-border/60 rounded text-foreground text-[10px] text-center px-0 py-0 leading-none h-4 focus:outline-none focus:border-primary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+              data-ocid="layers.opacity_input"
             />
           </div>
-        )}
-        {!layer.isRuler && (
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
-            value={layer.opacity}
-            onChange={(e) => {
-              e.stopPropagation();
-              onSetOpacity(layer.id, Number(e.target.value));
-            }}
-            onClick={(e) => e.stopPropagation()}
-            style={
-              { "--fill-pct": `${layer.opacity * 100}%` } as React.CSSProperties
-            }
-            className="w-full mt-0.5"
-            data-ocid="layers.opacity_slider"
-          />
-        )}
-      </div>
+        </div>
 
-      <div className="flex flex-col items-center gap-0.5 shrink-0">
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onToggleVisible(layer.id);
-          }}
-          className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
-          data-ocid="layers.visibility_button"
-        >
-          {layer.visible ? <Eye size={10} /> : <EyeOff size={10} />}
-        </button>
-        {!layer.isRuler && totalNonRulerLayers > 1 && (
+        <div className="flex flex-col items-center gap-0.5 shrink-0">
           <button
             type="button"
             onClick={(e) => {
               e.stopPropagation();
-              onDeleteLayer(layer.id);
+              onToggleVisible(layer.id);
             }}
-            className="p-0.5 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
-            data-ocid="layers.delete_button"
+            className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+            data-ocid="layers.visibility_button"
           >
-            <Trash2 size={10} />
+            {layer.visible ? <Eye size={10} /> : <EyeOff size={10} />}
           </button>
-        )}
-        {layer.isRuler && (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDeleteLayer(layer.id);
-            }}
-            className="p-0.5 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
-            data-ocid="layers.ruler_delete_button"
-          >
-            <Trash2 size={10} />
-          </button>
-        )}
+          {(!layer.isRuler && totalNonRulerLayers > 1) || layer.isRuler ? (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onDeleteLayer(layer.id);
+              }}
+              className="p-0.5 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
+              data-ocid="layers.delete_button"
+            >
+              <Trash2 size={10} />
+            </button>
+          ) : null}
+        </div>
       </div>
+      {dropIndicatorAfter && (
+        <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary z-10 pointer-events-none" />
+      )}
     </div>
   );
 });
@@ -330,19 +354,22 @@ const LayerRow = memo(function LayerRow({
 // ── GroupRow ──────────────────────────────────────────────────────────────────
 
 interface GroupRowProps {
-  node: LayerGroup;
+  group: GroupHeader;
   depth: number;
+  isDragging: boolean;
   isSelected: boolean;
-  dragOverTarget: DropTarget | null;
   renamingId: string | null;
   renameVal: string;
+  dropIndicatorBefore: boolean;
+  dropIndicatorAfter: boolean;
   onToggleCollapse: (id: string) => void;
   onToggleVisible: (id: string) => void;
   onSetOpacity: (id: string, opacity: number) => void;
-  onDeleteGroup: (id: string) => void;
-  onDragStart: (id: string, kind: "group") => void;
-  onDragOver: (e: React.DragEvent, id: string, kind: "layer" | "group") => void;
-  onDrop: (e: React.DragEvent, id: string, kind: "layer" | "group") => void;
+  onSetOpacityLive: (id: string, opacity: number) => void;
+  onSetOpacityCommit: (id: string, before: number, after: number) => void;
+  onOpenDeleteGroup: (id: string) => void;
+  onDragHandlePointerDown: (e: React.PointerEvent, index: number) => void;
+  flatIndex: number;
   onStartRename: (id: string, name: string) => void;
   onCommitRename: (id: string) => void;
   onSetRenamingId: (id: string | null) => void;
@@ -351,184 +378,242 @@ interface GroupRowProps {
 }
 
 const GroupRow = memo(function GroupRow({
-  node,
+  group,
   depth,
+  isDragging,
   isSelected,
-  dragOverTarget,
   renamingId,
   renameVal,
+  dropIndicatorBefore,
+  dropIndicatorAfter,
   onToggleCollapse,
   onToggleVisible,
-  onSetOpacity,
-  onDeleteGroup,
-  onDragStart,
-  onDragOver,
-  onDrop,
+  onSetOpacityLive,
+  onSetOpacityCommit,
+  onOpenDeleteGroup,
+  onDragHandlePointerDown,
+  flatIndex,
   onStartRename,
   onCommitRename,
   onSetRenamingId,
   onSetRenameVal,
   onToggleSelection,
 }: GroupRowProps) {
-  const isRenaming = renamingId === node.id;
-
-  const isDragTarget = dragOverTarget?.targetId === node.id;
-  const isDropInside = isDragTarget && dragOverTarget?.position === "inside";
-  const isDropBefore = isDragTarget && dragOverTarget?.position === "before";
-  const isDropAfter = isDragTarget && dragOverTarget?.position === "after";
-
-  const leftPad = depth * 16 + 8;
+  const isRenaming = renamingId === group.id;
+  const leftPad = depth * INDENT_SIZE + 8;
+  const opacityDragStartRef = useRef<number | null>(null);
 
   const bg = isSelected
     ? "bg-[oklch(var(--accent)/0.2)]"
-    : isDropInside
-      ? "bg-[oklch(var(--accent)/0.12)]"
-      : "bg-[oklch(var(--sidebar-item)/0.6)] hover:brightness-95";
+    : "bg-[oklch(var(--sidebar-item)/0.6)] hover:brightness-95";
 
   return (
     <div
-      onDragOver={(e) => onDragOver(e, node.id, "group")}
-      onDrop={(e) => onDrop(e, node.id, "group")}
-      className={`flex items-center gap-1.5 py-1.5 cursor-pointer border-b border-border/40 ${bg} ${
-        isDropBefore ? "border-t-2 border-primary" : ""
-      } ${isDropAfter ? "border-b-2 border-primary" : ""} ${
-        isDropInside ? "ring-1 ring-inset ring-primary/40" : ""
-      }`}
-      style={{ paddingLeft: leftPad, paddingRight: 8 }}
-      onClick={(e) => {
-        if (e.shiftKey) {
-          onToggleSelection(node.id, true);
-        } else {
-          onToggleSelection(node.id, false);
-        }
-      }}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          onToggleSelection(node.id, e.shiftKey);
-        }
-      }}
-      data-ocid="layers.group_row"
+      style={{ opacity: isDragging ? 0.4 : 1, position: "relative" }}
+      data-layer-flat-index={flatIndex}
     >
-      {/* Drag handle */}
-      <span
-        draggable
-        onDragStart={(e) => {
-          e.stopPropagation();
-          onDragStart(node.id, "group");
-        }}
-        className="shrink-0 cursor-grab active:cursor-grabbing flex items-center"
-      >
-        <GripVertical size={10} className="text-muted-foreground" />
-      </span>
-
-      {/* Collapse toggle */}
-      <button
-        type="button"
+      {dropIndicatorBefore && (
+        <div className="absolute top-0 left-0 right-0 h-0.5 bg-primary z-10 pointer-events-none" />
+      )}
+      <div
+        className={`flex items-center gap-1.5 py-1.5 cursor-pointer border-b border-border/40 ${bg}`}
+        style={{ paddingLeft: leftPad, paddingRight: 8 }}
         onClick={(e) => {
-          e.stopPropagation();
-          onToggleCollapse(node.id);
-        }}
-        className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground shrink-0"
-        data-ocid="layers.group_collapse"
-      >
-        {node.collapsed ? (
-          <ChevronRight size={10} />
-        ) : (
-          <ChevronDown size={10} />
-        )}
-      </button>
-
-      {/* Folder icon */}
-      <span className="shrink-0 text-muted-foreground">
-        {node.collapsed ? <FolderClosed size={12} /> : <FolderOpen size={12} />}
-      </span>
-
-      {/* Name */}
-      <div className="flex flex-col flex-1 min-w-0">
-        {isRenaming ? (
-          <input
-            // biome-ignore lint/a11y/noAutofocus: rename UX requires autofocus
-            autoFocus
-            value={renameVal}
-            onChange={(e) => onSetRenameVal(e.target.value)}
-            onBlur={() => onCommitRename(node.id)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") onCommitRename(node.id);
-              if (e.key === "Escape") onSetRenamingId(null);
-            }}
-            onClick={(e) => e.stopPropagation()}
-            className="text-xs bg-transparent border-b border-primary text-foreground focus:outline-none w-full"
-            data-ocid="layers.group_rename_input"
-          />
-        ) : (
-          <span
-            className="text-xs font-medium truncate text-foreground"
-            onDoubleClick={(e) => {
-              e.stopPropagation();
-              onStartRename(node.id, node.name);
-            }}
-          >
-            {node.name}
-          </span>
-        )}
-        <input
-          type="range"
-          min={0}
-          max={1}
-          step={0.01}
-          value={node.opacity}
-          onChange={(e) => {
-            e.stopPropagation();
-            onSetOpacity(node.id, Number(e.target.value));
-          }}
-          onClick={(e) => e.stopPropagation()}
-          style={
-            { "--fill-pct": `${node.opacity * 100}%` } as React.CSSProperties
+          if (e.shiftKey) {
+            onToggleSelection(group.id, true);
+          } else {
+            onToggleSelection(group.id, false);
           }
-          className="w-full mt-0.5"
-          data-ocid="layers.group_opacity_slider"
-        />
-      </div>
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            onToggleSelection(group.id, e.shiftKey);
+          }
+        }}
+        data-ocid="layers.group_row"
+      >
+        {/* Drag handle */}
+        <span
+          className="self-stretch shrink-0 cursor-grab active:cursor-grabbing flex items-center px-0.5"
+          style={{ minWidth: 16 }}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            onDragHandlePointerDown(e, flatIndex);
+          }}
+        >
+          <GripVertical size={10} className="text-muted-foreground" />
+        </span>
 
-      {/* Controls */}
-      <div className="flex flex-col items-center gap-0.5 shrink-0">
+        {/* Collapse toggle */}
         <button
           type="button"
           onClick={(e) => {
             e.stopPropagation();
-            onToggleVisible(node.id);
+            onToggleCollapse(group.id);
           }}
-          className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
-          data-ocid="layers.group_visibility"
+          className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground shrink-0"
+          data-ocid="layers.group_collapse"
         >
-          {node.visible ? <Eye size={10} /> : <EyeOff size={10} />}
+          {group.collapsed ? (
+            <ChevronRight size={10} />
+          ) : (
+            <ChevronDown size={10} />
+          )}
         </button>
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onDeleteGroup(node.id);
-          }}
-          className="p-0.5 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
-          data-ocid="layers.group_delete"
-        >
-          <Trash2 size={10} />
-        </button>
+
+        {/* Folder icon */}
+        <span className="shrink-0 text-muted-foreground">
+          {group.collapsed ? (
+            <FolderClosed size={12} />
+          ) : (
+            <FolderOpen size={12} />
+          )}
+        </span>
+
+        {/* Name + opacity */}
+        <div className="flex flex-col flex-1 min-w-0">
+          {isRenaming ? (
+            <input
+              // biome-ignore lint/a11y/noAutofocus: rename UX requires autofocus
+              autoFocus
+              value={renameVal}
+              onChange={(e) => onSetRenameVal(e.target.value)}
+              onBlur={() => onCommitRename(group.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") onCommitRename(group.id);
+                if (e.key === "Escape") onSetRenamingId(null);
+              }}
+              onClick={(e) => e.stopPropagation()}
+              className="text-xs bg-transparent border-b border-primary text-foreground focus:outline-none w-full"
+              data-ocid="layers.group_rename_input"
+            />
+          ) : (
+            <span
+              className="text-xs font-medium truncate text-foreground"
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                onStartRename(group.id, group.name);
+              }}
+            >
+              {group.name}
+            </span>
+          )}
+          <div className="flex items-center gap-1 mt-0.5">
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={group.opacity}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                opacityDragStartRef.current = group.opacity;
+              }}
+              onChange={(e) => {
+                e.stopPropagation();
+                onSetOpacityLive(group.id, Number(e.target.value));
+              }}
+              onPointerUp={(e) => {
+                e.stopPropagation();
+                if (opacityDragStartRef.current !== null) {
+                  onSetOpacityCommit(
+                    group.id,
+                    opacityDragStartRef.current,
+                    Number((e.target as HTMLInputElement).value),
+                  );
+                  opacityDragStartRef.current = null;
+                }
+              }}
+              onClick={(e) => e.stopPropagation()}
+              style={
+                {
+                  "--fill-pct": `${group.opacity * 100}%`,
+                } as React.CSSProperties
+              }
+              className="flex-1 min-w-0"
+              data-ocid="layers.group_opacity_slider"
+            />
+            <input
+              type="number"
+              min={0}
+              max={100}
+              value={Math.round(group.opacity * 100)}
+              onChange={(e) => {
+                e.stopPropagation();
+                const pct = Math.max(0, Math.min(100, Number(e.target.value)));
+                onSetOpacityLive(group.id, pct / 100);
+              }}
+              onBlur={(e) => {
+                e.stopPropagation();
+                const pct = Math.max(
+                  0,
+                  Math.min(100, Number(e.target.value) || 0),
+                );
+                const before = opacityDragStartRef.current ?? group.opacity;
+                onSetOpacityCommit(group.id, before, pct / 100);
+                opacityDragStartRef.current = null;
+              }}
+              onFocus={(e) => {
+                e.stopPropagation();
+                opacityDragStartRef.current = group.opacity;
+              }}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+              }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-9 shrink-0 bg-muted/60 border border-border/60 rounded text-foreground text-[10px] text-center px-0 py-0 leading-none h-4 focus:outline-none focus:border-primary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+              data-ocid="layers.group_opacity_input"
+            />
+          </div>
+        </div>
+
+        {/* Controls */}
+        <div className="flex flex-col items-center gap-0.5 shrink-0">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleVisible(group.id);
+            }}
+            className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+            data-ocid="layers.group_visibility"
+          >
+            {group.visible ? <Eye size={10} /> : <EyeOff size={10} />}
+          </button>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenDeleteGroup(group.id);
+            }}
+            className="p-0.5 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
+            data-ocid="layers.group_delete"
+          >
+            <Trash2 size={10} />
+          </button>
+        </div>
       </div>
+      {dropIndicatorAfter && (
+        <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary z-10 pointer-events-none" />
+      )}
     </div>
   );
 });
 
-// ── LayersPanel ───────────────────────────────────────────────────────────────
+// ── LayersPanel props ─────────────────────────────────────────────────────────
 
 interface LayersPanelProps {
   layers: Layer[];
-  layerTree: LayerNode[];
+  /** @deprecated Kept for backward compat — not used in flat-array rendering */
+  layerTree?: LayerNode[];
   activeLayerId: string;
   selectedLayerIds: Set<string>;
   onSetActive: (id: string) => void;
   onToggleVisible: (id: string) => void;
   onSetOpacity: (id: string, opacity: number) => void;
+  onSetOpacityLive: (id: string, opacity: number) => void;
+  onSetOpacityCommit: (id: string, before: number, after: number) => void;
   onSetBlendMode: (id: string, blendMode: string) => void;
   onAddLayer: () => void;
   onDeleteLayer: (id: string) => void;
@@ -544,44 +629,46 @@ interface LayersPanelProps {
   onToggleGroupCollapse: (groupId: string) => void;
   onRenameGroup: (groupId: string, name: string) => void;
   onSetGroupOpacity: (groupId: string, opacity: number) => void;
+  onSetGroupOpacityLive: (groupId: string, opacity: number) => void;
+  onSetGroupOpacityCommit: (
+    groupId: string,
+    before: number,
+    after: number,
+  ) => void;
   onToggleGroupVisible: (groupId: string) => void;
+  /** Called when the user clicks the delete button on a group — opens the confirm dialog */
   onDeleteGroup: (groupId: string) => void;
-  onReorderTree: (newTree: LayerNode[]) => void;
+  onReorderTree: (newTree: Layer[] | LayerNode[]) => void;
+  /** Silent reorder — no history entry */
+  onReorderTreeSilent: (newTree: Layer[] | LayerNode[]) => void;
+  /** Silent flat reorder — no history entry */
+  onReorderLayersSilent: (ids: string[]) => void;
+  onCommitReorderHistory: (
+    treeBefore: LayerNode[],
+    treeAfter: LayerNode[],
+    layersBefore: Layer[],
+    layersAfter: Layer[],
+  ) => void;
   onToggleLayerSelection: (id: string, shiftHeld: boolean) => void;
   onCreateGroup: () => void;
-  /** Optional close handler — renders an X button inline in the header when provided */
   onClose?: () => void;
+  shiftHeld?: boolean;
 }
 
-// ── Tree drag-and-drop helpers ────────────────────────────────────────────────
-
-function computeDropTarget(
-  _tree: LayerNode[],
-  dragId: string,
-  targetId: string,
-  targetKind: "layer" | "group",
-): DropTarget | null {
-  if (dragId === targetId) return null;
-  // Dropping onto a group: place inside
-  if (targetKind === "group") {
-    return { targetId, position: "inside" };
-  }
-  // Dropping onto a layer: place before
-  return { targetId, position: "before" };
-}
+// ── LayersPanel ───────────────────────────────────────────────────────────────
 
 export const LayersPanel = memo(function LayersPanel({
   layers,
-  layerTree,
   activeLayerId,
   selectedLayerIds,
   onSetActive,
   onToggleVisible,
   onSetOpacity,
+  onSetOpacityLive,
+  onSetOpacityCommit,
   onSetBlendMode,
   onAddLayer,
   onDeleteLayer,
-  onReorderLayers,
   onClearLayer,
   onToggleClippingMask,
   onMergeLayers,
@@ -593,180 +680,376 @@ export const LayersPanel = memo(function LayersPanel({
   onToggleGroupCollapse,
   onRenameGroup,
   onSetGroupOpacity,
+  onSetGroupOpacityLive,
+  onSetGroupOpacityCommit,
   onToggleGroupVisible,
   onDeleteGroup,
   onReorderTree,
+  onReorderTreeSilent: _onReorderTreeSilent,
+  onCommitReorderHistory,
   onToggleLayerSelection,
   onCreateGroup,
   onClose,
+  shiftHeld = false,
 }: LayersPanelProps) {
-  const dragState = useRef<DragState | null>(null);
-  const [dragOverTarget, setDragOverTarget] = useState<DropTarget | null>(null);
+  // ── Always-current refs ────────────────────────────────────────────────────
+  const layersRef = useRef<Layer[]>(layers);
+  layersRef.current = layers;
+
+  // ── Drag state ─────────────────────────────────────────────────────────────
+  const dragStateRef = useRef<DragState>({ ...IDLE_DRAG });
+  const [dropIndex, setDropIndex] = useState<number>(-1);
+  const [draggingIndex, setDraggingIndex] = useState<number>(-1);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  // ── Rename state ───────────────────────────────────────────────────────────
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameVal, setRenameVal] = useState("");
 
-  // ── Drag handlers ────────────────────────────────────────────────────────
+  // ── Rename handlers ────────────────────────────────────────────────────────
 
-  const handleDragStart = (id: string, kind: "layer" | "group") => {
-    dragState.current = { nodeId: id, nodeKind: kind };
-  };
-
-  const handleDragOver = (
-    e: React.DragEvent,
-    targetId: string,
-    targetKind: "layer" | "group",
-  ) => {
-    e.preventDefault();
-    const fromId = dragState.current?.nodeId;
-    if (!fromId || fromId === targetId) return;
-    const target = computeDropTarget(layerTree, fromId, targetId, targetKind);
-    setDragOverTarget(target);
-  };
-
-  const handleDrop = (
-    e: React.DragEvent,
-    targetId: string,
-    targetKind: "layer" | "group",
-  ) => {
-    e.preventDefault();
-    const fromId = dragState.current?.nodeId;
-    setDragOverTarget(null);
-    dragState.current = null;
-
-    if (!fromId || fromId === targetId) return;
-
-    const target = computeDropTarget(layerTree, fromId, targetId, targetKind);
-    if (!target) return;
-
-    // For flat-layer reordering (both are root-level layers), use the legacy
-    // onReorderLayers path so the existing compositing code isn't disrupted.
-    const fromLoc = findNode(layerTree, fromId);
-    const toLoc = findNode(layerTree, targetId);
-    if (
-      fromLoc &&
-      toLoc &&
-      fromLoc.parentGroup === null &&
-      toLoc.parentGroup === null &&
-      fromLoc.node.kind === "layer" &&
-      toLoc.node.kind === "layer"
-    ) {
-      const ids = layers.map((l) => l.id);
-      const fromIdx = ids.indexOf(fromId);
-      const toIdx = ids.indexOf(targetId);
-      if (fromIdx !== -1 && toIdx !== -1) {
-        const newIds = [...ids];
-        newIds.splice(fromIdx, 1);
-        newIds.splice(toIdx, 0, fromId);
-        onReorderLayers(newIds);
-        return;
-      }
-    }
-
-    // General tree reorder
-    const newTree = moveNode(layerTree, fromId, targetId, target.position);
-    onReorderTree(newTree);
-  };
-
-  // ── Rename handlers ──────────────────────────────────────────────────────
-
-  const startRename = (id: string, name: string) => {
+  const startRename = useCallback((id: string, name: string) => {
     setRenamingId(id);
     setRenameVal(name);
-  };
+  }, []);
 
-  const commitRename = (id: string) => {
-    if (!renameVal.trim()) {
+  const commitRename = useCallback(
+    (id: string) => {
+      if (!renameVal.trim()) {
+        setRenamingId(null);
+        return;
+      }
+      const entry = layersRef.current.find((l) => l.id === id);
+      if (entry?.type === "group") {
+        onRenameGroup(id, renameVal.trim());
+      } else {
+        onRenameLayer(id, renameVal.trim());
+      }
       setRenamingId(null);
-      return;
+    },
+    [renameVal, onRenameGroup, onRenameLayer],
+  );
+
+  // ── Visibility computation ─────────────────────────────────────────────────
+  // Compute which indices are hidden (inside a collapsed group)
+
+  const computeHidden = useCallback((flatLayers: Layer[]): Set<number> => {
+    const hidden = new Set<number>();
+    const entries = flatLayers as FlatEntry[];
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      if (isFlatGroupHeader(e) && e.collapsed) {
+        const slice = getGroupSlice(entries, e.id);
+        if (slice) {
+          // Hide everything from startIndex+1 (children) through endIndex (end_group)
+          for (let j = slice.startIndex + 1; j <= slice.endIndex; j++) {
+            hidden.add(j);
+          }
+        }
+      }
     }
-    // Check whether this is a group or a layer
-    const loc = findNode(layerTree, id);
-    if (loc?.node.kind === "group") {
-      onRenameGroup(id, renameVal.trim());
-    } else {
-      onRenameLayer(id, renameVal.trim());
+    return hidden;
+  }, []);
+
+  // ── Pointer-based drag-drop ────────────────────────────────────────────────
+
+  /**
+   * Given a clientY coordinate and the list container, determine which flat
+   * array insertion index the pointer is hovering over.
+   */
+  const getDropIndexFromPointer = useCallback((clientY: number): number => {
+    const container = listRef.current;
+    if (!container) return -1;
+
+    const rows = container.querySelectorAll<HTMLElement>(
+      "[data-layer-flat-index]",
+    );
+    if (rows.length === 0) return 0;
+
+    for (const row of rows) {
+      const rect = row.getBoundingClientRect();
+      const mid = rect.top + rect.height / 2;
+      const idx = Number(row.dataset.layerFlatIndex ?? "-1");
+      if (idx === -1) continue;
+      if (clientY < mid) {
+        return idx; // drop before this row
+      }
     }
-    setRenamingId(null);
-  };
+    // Below all rows — drop at the very end
+    const last = rows[rows.length - 1];
+    const lastIdx = Number((last as HTMLElement).dataset.layerFlatIndex ?? "0");
+    return lastIdx + 1;
+  }, []);
 
-  // ── Derived data ─────────────────────────────────────────────────────────
+  const handleDragHandlePointerDown = useCallback(
+    (e: React.PointerEvent, index: number) => {
+      e.preventDefault();
+      e.stopPropagation();
 
-  const activeLayer = layers.find((l) => l.id === activeLayerId);
-  const totalNonRulerLayers = flattenTree(layerTree ?? []).filter(
-    (item) => item?.layer && !item.layer.isRuler,
-  ).length;
+      const currentLayers = layersRef.current;
+      const entry = currentLayers[index] as FlatEntry | undefined;
+      if (!entry) return;
 
-  // ── Recursive render ─────────────────────────────────────────────────────
+      // end_group entries are non-draggable
+      if (isFlatEndGroup(entry)) return;
 
-  function renderNodes(nodes: LayerNode[], depth: number): React.ReactNode {
-    // Guard: nodes may be undefined/non-array when layerTree state and history
-    // are temporarily desynced (e.g. after an undo that touches the tree).
-    if (!nodes || !Array.isArray(nodes)) return null;
-    return nodes.map((node) => {
-      // Guard: skip null/undefined nodes that may arrive from stale or migrated data
-      if (!node) return null;
-
-      if (node.kind === "group") {
-        return (
-          <React.Fragment key={node.id}>
-            <GroupRow
-              node={node}
-              depth={depth}
-              isSelected={selectedLayerIds.has(node.id)}
-              dragOverTarget={dragOverTarget}
-              renamingId={renamingId}
-              renameVal={renameVal}
-              onToggleCollapse={onToggleGroupCollapse}
-              onToggleVisible={onToggleGroupVisible}
-              onSetOpacity={onSetGroupOpacity}
-              onDeleteGroup={onDeleteGroup}
-              onDragStart={handleDragStart}
-              onDragOver={handleDragOver}
-              onDrop={handleDrop}
-              onStartRename={startRename}
-              onCommitRename={commitRename}
-              onSetRenamingId={setRenamingId}
-              onSetRenameVal={setRenameVal}
-              onToggleSelection={onToggleLayerSelection}
-            />
-            {!node.collapsed && renderNodes(node.children ?? [], depth + 1)}
-          </React.Fragment>
-        );
+      // Determine the end index (for groups, drag the full slice)
+      let dragEndIndex = index;
+      if (isFlatGroupHeader(entry)) {
+        const slice = getGroupSlice(currentLayers as FlatEntry[], entry.id);
+        if (slice) {
+          dragEndIndex = slice.endIndex;
+        }
       }
 
-      // Guard: only render LayerRow when kind === "layer" and layer data is present
-      if (node.kind !== "layer" || !node.layer) return null;
+      dragStateRef.current = {
+        phase: "dragging",
+        dragIndex: index,
+        dragEndIndex,
+        dropIndex: index,
+        sourceSnapshot: currentLayers.slice(),
+        pointerStartY: e.clientY,
+      };
 
-      return (
-        <LayerRow
-          key={node.id}
-          layer={node.layer}
-          isActive={node.id === activeLayerId}
-          isSelected={selectedLayerIds.has(node.id)}
+      setDraggingIndex(index);
+      setDropIndex(-1);
+
+      const el = e.currentTarget as HTMLElement;
+      el.setPointerCapture(e.pointerId);
+
+      const onPointerMove = (ev: PointerEvent) => {
+        const ds = dragStateRef.current;
+        if (ds.phase === "idle") return;
+
+        const newDropIdx = getDropIndexFromPointer(ev.clientY);
+        if (newDropIdx === -1) return;
+
+        // Validate with validateDropTarget logic inlined:
+        const { dragIndex, dragEndIndex: dEndIdx } = ds;
+        const isValid = newDropIdx < dragIndex || newDropIdx > dEndIdx + 1;
+
+        if (isValid) {
+          dragStateRef.current.dropIndex = newDropIdx;
+          dragStateRef.current.phase = "hovering";
+          setDropIndex(newDropIdx);
+        }
+      };
+
+      const onPointerUp = () => {
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+
+        const ds = dragStateRef.current;
+
+        if (ds.phase === "hovering" && ds.dropIndex !== -1) {
+          const {
+            dragIndex,
+            dragEndIndex: dEndIdx,
+            dropIndex: dIdx,
+            sourceSnapshot,
+          } = ds;
+          const curr = layersRef.current;
+
+          // Build new flat array
+          const dragSlice = curr.slice(dragIndex, dEndIdx + 1);
+          const without = [
+            ...curr.slice(0, dragIndex),
+            ...curr.slice(dEndIdx + 1),
+          ];
+          // Adjust drop index for removal of slice
+          const adjustedDrop =
+            dIdx > dEndIdx ? dIdx - (dEndIdx - dragIndex + 1) : dIdx;
+
+          const newLayers = [
+            ...without.slice(0, adjustedDrop),
+            ...dragSlice,
+            ...without.slice(adjustedDrop),
+          ];
+
+          // Commit with history
+          onReorderTree(newLayers);
+          // Also push explicit history entry with before/after
+          onCommitReorderHistory([], [], sourceSnapshot, newLayers);
+        }
+
+        // Reset state
+        dragStateRef.current = { ...IDLE_DRAG };
+        setDraggingIndex(-1);
+        setDropIndex(-1);
+      };
+
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
+    },
+    [getDropIndexFromPointer, onReorderTree, onCommitReorderHistory],
+  );
+
+  // ── Derived data ───────────────────────────────────────────────────────────
+
+  const activeLayer = layers.find((l) => l.id === activeLayerId) as
+    | PaintLayer
+    | undefined;
+  const totalNonRulerLayers = layers.filter(
+    (l) =>
+      l.type !== "group" &&
+      l.type !== "end_group" &&
+      !(l as PaintLayer).isRuler,
+  ).length;
+
+  /**
+   * Panel-level blend mode selector value.
+   * - Single active non-ruler layer → show its blend mode
+   * - Multiple selected non-ruler layers with same mode → show that mode
+   * - Multiple selected with different modes → "" (shows ---)
+   * - Ruler layer → null (hide selector)
+   */
+  const panelBlendMode = (() => {
+    if (selectedLayerIds.size === 0) {
+      if ((activeLayer as PaintLayer | undefined)?.isRuler) return null;
+      return activeLayer?.blendMode ?? "source-over";
+    }
+    const nonRulerSelected = layers.filter(
+      (l) =>
+        selectedLayerIds.has(l.id) &&
+        l.type !== "group" &&
+        l.type !== "end_group" &&
+        !(l as PaintLayer).isRuler,
+    );
+    if (nonRulerSelected.length === 0) return null;
+    const first = nonRulerSelected[0].blendMode ?? "source-over";
+    const allSame = nonRulerSelected.every(
+      (l) => (l.blendMode ?? "source-over") === first,
+    );
+    return allSame ? first : "";
+  })();
+
+  const handlePanelBlendModeChange = useCallback(
+    (newMode: string) => {
+      if (newMode === "") return;
+      if (selectedLayerIds.size > 1) {
+        for (const id of selectedLayerIds) {
+          const l = layers.find((x) => x.id === id);
+          if (
+            l &&
+            l.type !== "group" &&
+            l.type !== "end_group" &&
+            !(l as PaintLayer).isRuler
+          ) {
+            onSetBlendMode(id, newMode);
+          }
+        }
+      } else if (activeLayer && !(activeLayer as PaintLayer).isRuler) {
+        onSetBlendMode(activeLayer.id, newMode);
+      }
+    },
+    [selectedLayerIds, layers, activeLayer, onSetBlendMode],
+  );
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+
+  const depths = computeNestingDepths(layers as FlatEntry[]);
+  const hidden = computeHidden(layers);
+
+  const rows: React.ReactNode[] = [];
+
+  for (let i = 0; i < layers.length; i++) {
+    if (hidden.has(i)) continue;
+
+    const entry = layers[i] as FlatEntry;
+    const depth = depths[i];
+
+    // end_group: thin visual gap only — no interaction
+    if (isFlatEndGroup(entry)) {
+      rows.push(
+        <div
+          key={`end_group_${entry.id}_${i}`}
+          style={{ height: 4, marginLeft: Math.max(0, depth) * INDENT_SIZE }}
+          className="border-b border-border/20 bg-muted/10"
+          aria-hidden="true"
+        />,
+      );
+      continue;
+    }
+
+    const isDragging = i === draggingIndex;
+    const dropBefore = dropIndex === i;
+    const dropAfter = dropIndex === i + 1;
+
+    if (isFlatGroupHeader(entry)) {
+      const group = entry as GroupHeader;
+      rows.push(
+        <GroupRow
+          key={group.id}
+          group={group}
           depth={depth}
-          thumbnail={thumbnails[node.layer.id]}
-          dragOverTarget={dragOverTarget}
+          isDragging={isDragging}
+          isSelected={selectedLayerIds.has(group.id)}
           renamingId={renamingId}
           renameVal={renameVal}
-          totalNonRulerLayers={totalNonRulerLayers}
-          onSetActive={onSetActive}
-          onToggleVisible={onToggleVisible}
-          onSetOpacity={onSetOpacity}
-          onSetBlendMode={onSetBlendMode}
-          onDeleteLayer={onDeleteLayer}
-          onCtrlClickLayer={onCtrlClickLayer}
-          onToggleRulerActive={onToggleRulerActive}
-          onDragStart={handleDragStart}
-          onDragOver={handleDragOver}
-          onDrop={handleDrop}
+          dropIndicatorBefore={dropBefore}
+          dropIndicatorAfter={dropAfter && !hidden.has(i + 1)}
+          onToggleCollapse={onToggleGroupCollapse}
+          onToggleVisible={onToggleGroupVisible}
+          onSetOpacity={onSetGroupOpacity}
+          onSetOpacityLive={onSetGroupOpacityLive}
+          onSetOpacityCommit={onSetGroupOpacityCommit}
+          onOpenDeleteGroup={onDeleteGroup}
+          onDragHandlePointerDown={handleDragHandlePointerDown}
+          flatIndex={i}
           onStartRename={startRename}
           onCommitRename={commitRename}
           onSetRenamingId={setRenamingId}
           onSetRenameVal={setRenameVal}
           onToggleSelection={onToggleLayerSelection}
-        />
+        />,
       );
-    });
+      continue;
+    }
+
+    // Regular layer or ruler
+    const layer = entry as PaintLayer;
+    rows.push(
+      <LayerRow
+        key={layer.id}
+        layer={layer}
+        isActive={layer.id === activeLayerId}
+        isSelected={selectedLayerIds.has(layer.id)}
+        depth={depth}
+        isDragging={isDragging}
+        thumbnail={thumbnails[layer.id]}
+        renamingId={renamingId}
+        renameVal={renameVal}
+        totalNonRulerLayers={totalNonRulerLayers}
+        dropIndicatorBefore={dropBefore}
+        dropIndicatorAfter={dropAfter}
+        shiftHeld={layer.isRuler ? shiftHeld : false}
+        onSetActive={onSetActive}
+        onToggleVisible={onToggleVisible}
+        onSetOpacity={onSetOpacity}
+        onSetOpacityLive={onSetOpacityLive}
+        onSetOpacityCommit={onSetOpacityCommit}
+        onDeleteLayer={onDeleteLayer}
+        onCtrlClickLayer={onCtrlClickLayer}
+        onToggleRulerActive={onToggleRulerActive}
+        onDragHandlePointerDown={handleDragHandlePointerDown}
+        flatIndex={i}
+        onStartRename={startRename}
+        onCommitRename={commitRename}
+        onSetRenamingId={setRenamingId}
+        onSetRenameVal={setRenameVal}
+        onToggleSelection={onToggleLayerSelection}
+      />,
+    );
+  }
+
+  // Drop indicator at the very end (after all rows)
+  if (dropIndex === layers.length) {
+    rows.push(
+      <div
+        key="drop-indicator-end"
+        className="h-0.5 bg-primary pointer-events-none"
+      />,
+    );
   }
 
   return (
@@ -774,7 +1057,7 @@ export const LayersPanel = memo(function LayersPanel({
       className="flex flex-col h-full"
       onPointerDown={(e) => e.stopPropagation()}
     >
-      {/* Layer panel top bar */}
+      {/* Top button row */}
       <div className="flex items-center gap-1 px-2 py-1.5 border-b border-border">
         <span className="text-xs font-semibold text-foreground flex-1">
           Layers
@@ -824,7 +1107,9 @@ export const LayersPanel = memo(function LayersPanel({
               <button
                 type="button"
                 onClick={onMergeLayers}
-                disabled={activeLayer?.isRuler === true}
+                disabled={
+                  (activeLayer as PaintLayer | undefined)?.isRuler === true
+                }
                 className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed"
                 data-ocid="layers.merge_button"
               >
@@ -880,9 +1165,36 @@ export const LayersPanel = memo(function LayersPanel({
         </TooltipProvider>
       </div>
 
-      {/* Layer list — recursive tree of memoized GroupRow / LayerRow */}
-      <div className="flex-1 overflow-y-auto">
-        {renderNodes(layerTree ?? [], 0)}
+      {/* Blend mode row */}
+      {panelBlendMode !== null && (
+        <div className="flex items-center gap-1.5 px-2 py-1 border-b border-border/60 bg-muted/20">
+          <span className="text-[9px] text-muted-foreground shrink-0 font-medium">
+            Mode
+          </span>
+          <select
+            value={panelBlendMode}
+            onChange={(e) => handlePanelBlendModeChange(e.target.value)}
+            onMouseDown={(e) => e.stopPropagation()}
+            className="flex-1 text-[9px] bg-transparent text-foreground border border-border/40 rounded px-1 py-0.5 focus:outline-none focus:border-primary cursor-pointer min-w-0 truncate"
+            data-ocid="layers.panel_blend_select"
+          >
+            {panelBlendMode === "" && <option value="">---</option>}
+            {BLEND_MODES.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {/* Layer list */}
+      <div
+        ref={listRef}
+        className="flex-1 overflow-y-auto"
+        style={{ userSelect: "none" }}
+      >
+        {rows}
       </div>
     </div>
   );

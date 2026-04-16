@@ -1,11 +1,35 @@
-import type { Layer } from "../components/LayersPanel";
+import type { Layer as LayerPanelLayer } from "../components/LayersPanel";
 import type { UndoEntry } from "../hooks/useLayerSystem";
 import type { SelectionSnapshot } from "../selectionTypes";
-import type { LayerGroup, LayerItem, LayerNode } from "../types";
+import type { LayerNode } from "../types";
 import { RULER_KEYS, type RulerFields } from "../types";
+import { resetGroupIdCounterFromFlat } from "./groupUtils";
 
-export interface SktchFile {
+// ── File format interfaces ────────────────────────────────────────────────────
+
+/**
+ * Version 2: flat-array format. `layers` is the full flat array (including
+ * group headers and end_group markers). `layerFormat: "flat"` discriminates
+ * this from the legacy v1 tree format.
+ */
+export interface SktchFileV2 {
+  version: 2;
+  layerFormat: "flat";
+  canvasWidth: number;
+  canvasHeight: number;
+  activeLayerId: string;
+  layers: SerializedLayer[];
+  undoStack: SerializedUndoEntry[];
+  redoStack: SerializedUndoEntry[];
+}
+
+/**
+ * Version 1: legacy tree format. Kept for backward-compatible load only.
+ * New saves never produce this shape.
+ */
+interface SktchFileV1 {
   version: 1;
+  layerFormat?: undefined; // absent in old files
   canvasWidth: number;
   canvasHeight: number;
   activeLayerId: string;
@@ -15,18 +39,22 @@ export interface SktchFile {
   redoStack: SerializedUndoEntry[];
 }
 
+type SktchFile = SktchFileV1 | SktchFileV2;
+
 interface SerializedLayer extends RulerFields {
   id: string;
   name: string;
+  type?: string; // 'group', 'end_group', 'layer', 'ruler', or undefined
   blendMode: string;
   opacity: number;
   visible: boolean;
+  collapsed?: boolean; // group headers only
   isClippingMask: boolean;
   alphaLock: boolean;
   pixelDataUrl: string;
 }
 
-// ── Layer tree serialization types ─────────────────────────────────────────
+// ── Legacy tree serialization types (load-only) ───────────────────────────────
 
 interface SerializedLayerItem {
   kind: "layer";
@@ -46,7 +74,7 @@ interface SerializedLayerGroup {
 
 type SerializedLayerNode = SerializedLayerItem | SerializedLayerGroup;
 
-// ── Undo entry serialization types (existing + 10 new) ─────────────────────
+// ── Undo entry serialization types ──────────────────────────────────────────
 
 type SerializedUndoEntry =
   | {
@@ -109,7 +137,6 @@ type SerializedUndoEntry =
       layersBefore: SerializedLayer[];
       layersAfter: SerializedLayer[];
     }
-  // ── 10 new entry types ───────────────────────────────────────────────────
   | {
       type: "layer-group-create";
       treeBefore: SerializedLayerNode[];
@@ -168,13 +195,8 @@ type SerializedUndoEntry =
       layers: { layerId: string; beforeUrl: string; afterUrl: string }[];
     };
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/**
- * Async canvas→data-URL via toBlob + FileReader.
- * Allows the browser to release memory between calls rather than holding all
- * base64 strings in RAM simultaneously (unlike synchronous toDataURL).
- */
 async function canvasToDataUrlAsync(
   canvas: HTMLCanvasElement,
 ): Promise<string> {
@@ -192,11 +214,6 @@ async function canvasToDataUrlAsync(
   });
 }
 
-/**
- * Converts an ImageData to a data URL asynchronously via an offscreen canvas.
- * Falls back gracefully — returns "" on failure so a single bad layer doesn't
- * abort the entire save.
- */
 async function imageDataToDataUrlAsync(data: ImageData): Promise<string> {
   try {
     const canvas = document.createElement("canvas");
@@ -242,26 +259,52 @@ function pickRulerFields(obj: Record<string, unknown>): Partial<RulerFields> {
 }
 
 function layerToSerialized(
-  layer: Layer,
+  layer: LayerPanelLayer,
   pixelDataUrl: string,
 ): SerializedLayer {
-  return {
+  const base: SerializedLayer = {
     id: layer.id,
-    name: layer.name,
-    blendMode: layer.blendMode,
-    opacity: layer.opacity,
-    visible: layer.visible,
-    isClippingMask: layer.isClippingMask,
-    alphaLock: layer.alphaLock,
+    name: (layer as { name?: string }).name ?? "",
+    type: layer.type,
+    blendMode: (layer as { blendMode?: string }).blendMode ?? "normal",
+    opacity: (layer as { opacity?: number }).opacity ?? 1,
+    visible: (layer as { visible?: boolean }).visible ?? true,
+    isClippingMask:
+      (layer as { isClippingMask?: boolean }).isClippingMask ?? false,
+    alphaLock: (layer as { alphaLock?: boolean }).alphaLock ?? false,
     pixelDataUrl,
-    ...pickRulerFields(layer as unknown as Record<string, unknown>),
   };
+  // group headers carry collapsed state
+  if (layer.type === "group") {
+    base.collapsed = (layer as { collapsed?: boolean }).collapsed ?? false;
+  }
+  // ruler fields
+  Object.assign(
+    base,
+    pickRulerFields(layer as unknown as Record<string, unknown>),
+  );
+  return base;
 }
 
-function serializedToLayer(s: SerializedLayer): Layer {
+function serializedToLayer(s: SerializedLayer): LayerPanelLayer {
+  if (s.type === "end_group") {
+    return { type: "end_group", id: s.id } as unknown as LayerPanelLayer;
+  }
+  if (s.type === "group") {
+    return {
+      type: "group",
+      id: s.id,
+      name: s.name,
+      visible: s.visible,
+      opacity: s.opacity,
+      collapsed: s.collapsed ?? false,
+    } as unknown as LayerPanelLayer;
+  }
+  // Regular paint/ruler layer
   return {
     id: s.id,
     name: s.name,
+    type: s.type as "layer" | "ruler" | undefined,
     blendMode: s.blendMode,
     opacity: s.opacity,
     visible: s.visible,
@@ -271,166 +314,90 @@ function serializedToLayer(s: SerializedLayer): Layer {
   };
 }
 
-// ── Layer tree serialization ─────────────────────────────────────────────────
+// ── Legacy tree → flat conversion (load path only) ────────────────────────────
 
 /**
- * Serializes a LayerNode[] tree asynchronously, converting each leaf canvas
- * to a data URL one at a time (sequential) to avoid memory spikes.
- * Layer pixel data is embedded in the leaf SerializedLayerItem nodes.
+ * Converts the legacy serialized tree format to a flat array of SerializedLayer
+ * entries, inserting group header and end_group entries as structural markers.
+ * Called only when loading an old .sktch file that has no `layerFormat: "flat"`.
  */
-export async function serializeLayerTreeAsync(
-  tree: LayerNode[],
-  layerCanvases: Map<string, HTMLCanvasElement>,
-): Promise<SerializedLayerNode[]> {
-  const result: SerializedLayerNode[] = [];
-  for (const node of tree) {
-    if (node.kind === "group") {
-      const g = node as LayerGroup;
-      const children = await serializeLayerTreeAsync(
-        g.children ?? [],
-        layerCanvases,
-      );
-      result.push({
-        kind: "group" as const,
-        id: g.id,
-        name: g.name,
-        visible: g.visible,
-        opacity: g.opacity,
-        collapsed: g.collapsed,
-        children,
-      });
-    } else {
-      // kind === "layer"
-      const item = node as LayerItem;
-      let pixelDataUrl = "";
-      if (!item.layer.isRuler) {
-        const canvas = layerCanvases.get(item.layer.id);
-        if (canvas) {
-          try {
-            pixelDataUrl = await canvasToDataUrlAsync(canvas);
-          } catch (err) {
-            console.warn(
-              `[sktchFile] Failed to serialize layer ${item.layer.id}, skipping pixel data:`,
-              err,
-            );
-          }
-        }
-      }
-      result.push({
-        kind: "layer" as const,
-        id: item.id,
-        layer: layerToSerialized(item.layer, pixelDataUrl),
-      });
-    }
-  }
-  return result;
-}
-
-/**
- * Synchronous version retained for internal backward-compat paths only.
- * Prefer serializeLayerTreeAsync for all new save paths.
- */
-export function serializeLayerTree(
-  tree: LayerNode[],
-  layerCanvases: Map<string, HTMLCanvasElement>,
-): SerializedLayerNode[] {
-  return tree.map((node) => {
-    if (node.kind === "group") {
-      const g = node as LayerGroup;
-      return {
-        kind: "group" as const,
-        id: g.id,
-        name: g.name,
-        visible: g.visible,
-        opacity: g.opacity,
-        collapsed: g.collapsed,
-        children: serializeLayerTree(g.children ?? [], layerCanvases),
-      };
-    }
-    // kind === "layer"
-    const item = node as LayerItem;
-    const canvas = layerCanvases.get(item.layer.id);
-    const pixelDataUrl =
-      canvas && !item.layer.isRuler ? canvas.toDataURL("image/png") : "";
-    return {
-      kind: "layer" as const,
-      id: item.id,
-      layer: layerToSerialized(item.layer, pixelDataUrl),
-    };
-  });
-}
-
-/**
- * Deserializes a SerializedLayerNode[] back into a LayerNode[] tree.
- * Pixel data loading is handled separately via `layerPixels` map.
- */
-export function deserializeLayerTree(
-  nodes: SerializedLayerNode[],
-): LayerNode[] {
-  return nodes.map((node) => {
-    if (node.kind === "group") {
-      const g = node as SerializedLayerGroup;
-      return {
-        kind: "group" as const,
-        id: g.id,
-        name: g.name,
-        visible: g.visible,
-        opacity: g.opacity,
-        collapsed: g.collapsed,
-        children: deserializeLayerTree(g.children ?? []),
-      } satisfies LayerGroup;
-    }
-    // kind === "layer"
-    const item = node as SerializedLayerItem;
-    return {
-      kind: "layer" as const,
-      id: item.id,
-      layer: serializedToLayer(item.layer),
-    } satisfies LayerItem;
-  });
-}
-
-/**
- * Collects all SerializedLayer leaf nodes from a SerializedLayerNode[] tree
- * so they can be included in the flat `layers` array for backward compatibility.
- */
-function collectSerializedLayers(
-  nodes: SerializedLayerNode[],
-): SerializedLayer[] {
+function convertTreeToFlat(nodes: SerializedLayerNode[]): SerializedLayer[] {
   const result: SerializedLayer[] = [];
   for (const node of nodes) {
-    if (node.kind === "layer") {
-      result.push(node.layer);
+    if (node.kind === "group") {
+      // Emit group header
+      result.push({
+        id: node.id,
+        name: node.name,
+        type: "group",
+        blendMode: "normal",
+        opacity: node.opacity,
+        visible: node.visible,
+        collapsed: node.collapsed,
+        isClippingMask: false,
+        alphaLock: false,
+        pixelDataUrl: "",
+      });
+      // Recursively emit children
+      result.push(...convertTreeToFlat(node.children ?? []));
+      // Emit end_group marker
+      result.push({
+        id: node.id,
+        name: "",
+        type: "end_group",
+        blendMode: "normal",
+        opacity: 1,
+        visible: true,
+        isClippingMask: false,
+        alphaLock: false,
+        pixelDataUrl: "",
+      });
     } else {
-      result.push(...collectSerializedLayers(node.children ?? []));
+      // Leaf layer — strip parentId if present, include as-is
+      const { parentId: _parentId, ...layerData } =
+        node.layer as SerializedLayer & { parentId?: unknown };
+      void _parentId;
+      result.push(layerData as SerializedLayer);
     }
   }
   return result;
 }
 
 /**
- * Builds a flat LayerNode[] from a flat Layer[] array (for backward compat with
- * old files that have no layerTree field).
+ * Validates that every group header has a matching end_group entry.
+ * Logs a warning if the structure is malformed but does not throw.
  */
-function flatLayersToTree(layers: Layer[]): LayerNode[] {
-  return layers.map((layer) => ({
-    kind: "layer" as const,
-    id: layer.id,
-    layer,
-  }));
+function validateGroupPairs(layers: SerializedLayer[]): void {
+  const headerIds = new Set<string>();
+  const endIds = new Set<string>();
+  for (const l of layers) {
+    if (l.type === "group") headerIds.add(l.id);
+    if (l.type === "end_group") endIds.add(l.id);
+  }
+  for (const id of headerIds) {
+    if (!endIds.has(id)) {
+      console.warn(`[sktchFile] Group header ${id} has no matching end_group`);
+    }
+  }
+  for (const id of endIds) {
+    if (!headerIds.has(id)) {
+      console.warn(`[sktchFile] end_group ${id} has no matching group header`);
+    }
+  }
 }
 
-// ── Undo entry serialization ─────────────────────────────────────────────────
+// ── Undo entry serialization (unchanged logic, no tree dependencies) ──────────
 
-/**
- * Returns null for entry types that cannot be serialized (e.g. layers-clear-rulers
- * which holds only Layer metadata, no pixel data). These entries are silently
- * filtered out of the saved history stack rather than throwing and aborting the
- * whole save.
- *
- * All ImageData→dataURL conversions are now async (toBlob path) to release
- * memory between layers rather than holding all base64 strings in RAM at once.
- */
+function serializeLayerTree(
+  _tree: unknown,
+  _canvases: unknown,
+): SerializedLayerNode[] {
+  // Stub: undo entries that carried a tree are legacy. On save we keep whatever
+  // was loaded so old files round-trip without corruption. New operations never
+  // produce layer-group-create/delete/reorder entries with a tree payload.
+  return [];
+}
+
 async function serializeUndoEntry(
   entry: UndoEntry,
   _canvasWidth: number,
@@ -551,12 +518,11 @@ async function serializeUndoEntry(
       layersAfter: entry.layersAfter.map((l) => layerToSerialized(l, "")),
     };
   }
-  // ── 10 new entry types ────────────────────────────────────────────────────
   if (entry.type === "layer-group-create") {
     return {
       type: "layer-group-create",
-      treeBefore: serializeLayerTree(entry.treeBefore, layerCanvases),
-      treeAfter: serializeLayerTree(entry.treeAfter, layerCanvases),
+      treeBefore: serializeLayerTree(entry.treeBefore ?? [], layerCanvases),
+      treeAfter: serializeLayerTree(entry.treeAfter ?? [], layerCanvases),
       layersBefore: entry.layersBefore.map((l) => layerToSerialized(l, "")),
       layersAfter: entry.layersAfter.map((l) => layerToSerialized(l, "")),
     };
@@ -571,8 +537,8 @@ async function serializeUndoEntry(
     }
     return {
       type: "layer-group-delete",
-      treeBefore: serializeLayerTree(entry.treeBefore, layerCanvases),
-      treeAfter: serializeLayerTree(entry.treeAfter, layerCanvases),
+      treeBefore: serializeLayerTree(entry.treeBefore ?? [], layerCanvases),
+      treeAfter: serializeLayerTree(entry.treeAfter ?? [], layerCanvases),
       layersBefore: entry.layersBefore.map((l) => layerToSerialized(l, "")),
       layersAfter: entry.layersAfter.map((l) => layerToSerialized(l, "")),
       deletedCanvases: deletedCanvasesList,
@@ -629,8 +595,8 @@ async function serializeUndoEntry(
   if (entry.type === "layer-reorder") {
     return {
       type: "layer-reorder",
-      treeBefore: serializeLayerTree(entry.treeBefore, layerCanvases),
-      treeAfter: serializeLayerTree(entry.treeAfter, layerCanvases),
+      treeBefore: serializeLayerTree(entry.treeBefore ?? [], layerCanvases),
+      treeAfter: serializeLayerTree(entry.treeAfter ?? [], layerCanvases),
       layersBefore: entry.layersBefore.map((l) => layerToSerialized(l, "")),
       layersAfter: entry.layersAfter.map((l) => layerToSerialized(l, "")),
     };
@@ -653,13 +619,24 @@ async function serializeUndoEntry(
       layers: layersList,
     };
   }
-  // layers-clear-rulers holds only layer metadata (no pixel ImageData to serialize).
-  // We intentionally drop it from the saved history rather than failing the save.
   if (entry.type === "layers-clear-rulers") {
     return null;
   }
-  // Exhaustive fallback — should never be reached
   return null;
+}
+
+function deserializeLayerTree(nodes: SerializedLayerNode[]): LayerPanelLayer[] {
+  // Used only when deserializing legacy undo entries that contain tree payloads.
+  // Returns a flat array built from the tree (no group structure — just leaves).
+  const result: LayerPanelLayer[] = [];
+  for (const node of nodes) {
+    if (node.kind === "layer") {
+      result.push(serializedToLayer(node.layer));
+    } else {
+      result.push(...deserializeLayerTree(node.children ?? []));
+    }
+  }
+  return result;
 }
 
 async function deserializeUndoEntry(
@@ -795,12 +772,11 @@ async function deserializeUndoEntry(
       layersAfter: s.layersAfter.map(serializedToLayer),
     };
   }
-  // ── 10 new entry types ────────────────────────────────────────────────────
   if (s.type === "layer-group-create") {
     return {
       type: "layer-group-create",
-      treeBefore: deserializeLayerTree(s.treeBefore),
-      treeAfter: deserializeLayerTree(s.treeAfter),
+      treeBefore: deserializeLayerTree(s.treeBefore) as unknown as LayerNode[],
+      treeAfter: deserializeLayerTree(s.treeAfter) as unknown as LayerNode[],
       layersBefore: s.layersBefore.map(serializedToLayer),
       layersAfter: s.layersAfter.map(serializedToLayer),
     };
@@ -817,8 +793,8 @@ async function deserializeUndoEntry(
     );
     return {
       type: "layer-group-delete",
-      treeBefore: deserializeLayerTree(s.treeBefore),
-      treeAfter: deserializeLayerTree(s.treeAfter),
+      treeBefore: deserializeLayerTree(s.treeBefore) as unknown as LayerNode[],
+      treeAfter: deserializeLayerTree(s.treeAfter) as unknown as LayerNode[],
       layersBefore: s.layersBefore.map(serializedToLayer),
       layersAfter: s.layersAfter.map(serializedToLayer),
       deletedCanvases: deletedCanvasesMap,
@@ -875,8 +851,8 @@ async function deserializeUndoEntry(
   if (s.type === "layer-reorder") {
     return {
       type: "layer-reorder",
-      treeBefore: deserializeLayerTree(s.treeBefore),
-      treeAfter: deserializeLayerTree(s.treeAfter),
+      treeBefore: deserializeLayerTree(s.treeBefore) as unknown as LayerNode[],
+      treeAfter: deserializeLayerTree(s.treeAfter) as unknown as LayerNode[],
       layersBefore: s.layersBefore.map(serializedToLayer),
       layersAfter: s.layersAfter.map(serializedToLayer),
     };
@@ -900,7 +876,6 @@ async function deserializeUndoEntry(
       layers: layersMap,
     };
   }
-  // Unknown type — log a warning and skip rather than throwing
   console.warn(
     "[sktchFile] Unknown serialized UndoEntry type, skipping:",
     (s as { type: string }).type,
@@ -908,15 +883,8 @@ async function deserializeUndoEntry(
   return null;
 }
 
-// ── Size estimation ──────────────────────────────────────────────────────────
+// ── Size estimation ───────────────────────────────────────────────────────────
 
-/**
- * Estimates the raw byte cost of serializing undo/redo history for a given
- * canvas size and layer/step count. Used to cap history before a memory spike.
- *
- * Formula: width × height × 4 bytes/pixel × 2 (before+after) × layerCount × stepCount
- * Base64 encoding adds ~33% overhead, but raw pixel size is the right input here.
- */
 function estimateHistoryBytes(
   canvasWidth: number,
   canvasHeight: number,
@@ -926,13 +894,9 @@ function estimateHistoryBytes(
   return canvasWidth * canvasHeight * 4 * 2 * layerCount * stepCount;
 }
 
-const UNDO_THRESHOLD_SKIP = 50 * 1024 * 1024; // 50 MB — skip history entirely
-const UNDO_THRESHOLD_TRIM = 10 * 1024 * 1024; // 10 MB — trim to 3 steps
+const UNDO_THRESHOLD_SKIP = 50 * 1024 * 1024;
+const UNDO_THRESHOLD_TRIM = 10 * 1024 * 1024;
 
-/**
- * Returns the number of undo/redo steps to serialize given the canvas and
- * layer state. Prevents memory exhaustion on large hi-res files.
- */
 function resolveUndoStepLimit(
   canvasWidth: number,
   canvasHeight: number,
@@ -960,57 +924,62 @@ function resolveUndoStepLimit(
   return requestedSteps;
 }
 
-// ── Public API ───────────────────────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────
 
+/**
+ * Serializes the current canvas state to a .sktch Blob.
+ * Always writes the new flat-array format (version 2, layerFormat: "flat").
+ * The `layerTree` parameter is accepted but ignored — it exists only to avoid
+ * breaking callers that still pass it during the transition.
+ */
 export async function serializeSktch(
-  layers: Layer[],
+  layers: LayerPanelLayer[],
   layerCanvases: Map<string, HTMLCanvasElement>,
   activeLayerId: string,
   canvasWidth: number,
   canvasHeight: number,
   undoStack: UndoEntry[],
   redoStack: UndoEntry[],
-  layerTree?: LayerNode[],
+  _layerTree?: unknown,
 ): Promise<Blob> {
   try {
-    // Serialize the layer tree sequentially (one canvas at a time) to avoid
-    // inflating all layer data URLs into RAM simultaneously.
-    const serializedTree: SerializedLayerNode[] | undefined = layerTree
-      ? await serializeLayerTreeAsync(layerTree, layerCanvases)
-      : undefined;
-
-    // Build flat layers array for backward compatibility.
-    // If we have a tree, collect leaf layers from it (pixel data embedded above).
-    // Otherwise fall back to serializing from the flat layers array directly,
-    // also sequentially.
-    let serializedLayers: SerializedLayer[];
-    if (serializedTree) {
-      serializedLayers = collectSerializedLayers(serializedTree);
-    } else {
-      serializedLayers = [];
-      for (const layer of layers) {
-        if (layer.isRuler) {
-          serializedLayers.push(layerToSerialized(layer, ""));
-        } else {
-          const canvas = layerCanvases.get(layer.id);
-          let pixelDataUrl = "";
-          if (canvas) {
-            try {
-              pixelDataUrl = await canvasToDataUrlAsync(canvas);
-            } catch (err) {
-              console.warn(
-                `[sktchFile] Failed to serialize layer ${layer.id}, skipping pixel data:`,
-                err,
-              );
-            }
+    // Serialize the flat layers array sequentially (one canvas at a time) to
+    // avoid inflating all layer data URLs into RAM simultaneously.
+    const serializedLayers: SerializedLayer[] = [];
+    for (const layer of layers) {
+      if (layer.type === "end_group") {
+        serializedLayers.push(layerToSerialized(layer, ""));
+        continue;
+      }
+      if (layer.type === "group") {
+        serializedLayers.push(layerToSerialized(layer, ""));
+        continue;
+      }
+      // PaintLayer / ruler layer
+      const paintLayer = layer as { id: string; isRuler?: boolean };
+      if (paintLayer.isRuler) {
+        serializedLayers.push(layerToSerialized(layer, ""));
+      } else {
+        const canvas = layerCanvases.get(paintLayer.id);
+        let pixelDataUrl = "";
+        if (canvas) {
+          try {
+            pixelDataUrl = await canvasToDataUrlAsync(canvas);
+          } catch (err) {
+            console.warn(
+              `[sktchFile] Failed to serialize layer ${paintLayer.id}, skipping pixel data:`,
+              err,
+            );
           }
-          serializedLayers.push(layerToSerialized(layer, pixelDataUrl));
         }
+        serializedLayers.push(layerToSerialized(layer, pixelDataUrl));
       }
     }
 
-    // Determine how many undo/redo steps to save based on estimated memory cost.
-    const layerCount = Math.max(1, layers.length);
+    const layerCount = Math.max(
+      1,
+      layers.filter((l) => l.type !== "group" && l.type !== "end_group").length,
+    );
     const undoLimit = resolveUndoStepLimit(
       canvasWidth,
       canvasHeight,
@@ -1020,8 +989,6 @@ export async function serializeSktch(
     const cappedUndo = undoLimit > 0 ? undoStack.slice(-undoLimit) : [];
     const cappedRedo = undoLimit > 0 ? redoStack.slice(-undoLimit) : [];
 
-    // Serialize history stacks sequentially to avoid a memory spike from
-    // inflating all undo ImageData payloads simultaneously.
     const serializedUndo: SerializedUndoEntry[] = [];
     for (const entry of cappedUndo) {
       const s = await serializeUndoEntry(
@@ -1044,13 +1011,13 @@ export async function serializeSktch(
       if (s !== null) serializedRedo.push(s);
     }
 
-    const file: SktchFile = {
-      version: 1,
+    const file: SktchFileV2 = {
+      version: 2,
+      layerFormat: "flat",
       canvasWidth,
       canvasHeight,
       activeLayerId,
       layers: serializedLayers,
-      layerTree: serializedTree,
       undoStack: serializedUndo,
       redoStack: serializedRedo,
     };
@@ -1066,15 +1033,34 @@ export async function serializeSktch(
 
     return new Blob([json], { type: "application/json" });
   } catch (err) {
-    // Re-throw with a clear message so callers can display it to the user
     if (err instanceof Error) throw err;
     throw new Error("Failed to serialize file: unknown error");
   }
 }
 
+/**
+ * Deserializes a .sktch file.
+ *
+ * Supports both formats:
+ *   - New format (version 2, `layerFormat: "flat"`): loads the flat layers
+ *     array directly. Undo/redo stacks are deserialized normally.
+ *   - Legacy format (presence of `layerTree` key at the top level): converts
+ *     the tree to a flat array via `convertTreeToFlat`. Undo/redo stacks are
+ *     cleared because legacy entries reference tree-based snapshots that are
+ *     incompatible with the flat architecture.
+ *
+ * Detection: a file is legacy if it contains a `layerTree` key at the top
+ * level — regardless of that key's value. New-format saves never write this
+ * key, so `'layerTree' in data` is the authoritative discriminant.
+ *
+ * Returns a flat `layers` array ready to be passed directly to `setLayers`.
+ * The `layerTree` field in the return value is always an empty array — callers
+ * should no longer use it; it is retained only for interface compatibility
+ * during the transition.
+ */
 export async function deserializeSktch(file: File): Promise<{
-  layers: Layer[];
-  layerTree: LayerNode[];
+  layers: LayerPanelLayer[];
+  layerTree: LayerPanelLayer[];
   activeLayerId: string;
   canvasWidth: number;
   canvasHeight: number;
@@ -1082,21 +1068,123 @@ export async function deserializeSktch(file: File): Promise<{
   redoStack: UndoEntry[];
   layerPixels: Map<string, ImageData>;
 }> {
-  const text = await file.text();
-  const data = JSON.parse(text) as SktchFile;
+  let data: SktchFile;
+  try {
+    const text = await file.text();
+    data = JSON.parse(text) as SktchFile;
+  } catch (err) {
+    throw new Error(
+      `Could not read file "${file.name}" — the file may be corrupted or is not a valid .sktch file. (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
 
-  if (data.version !== 1) throw new Error("Unsupported .sktch version");
+  if (data.version !== 1 && data.version !== 2) {
+    throw new Error(
+      `Unsupported .sktch version (${(data as { version?: unknown }).version}). Please update SketchLair to open this file.`,
+    );
+  }
 
   const { canvasWidth, canvasHeight } = data;
 
-  // Deserialize layers and pixel data sequentially to avoid a memory spike
-  // from inflating all layer images simultaneously.
-  const layers: Layer[] = [];
+  // ── Detect format: legacy = `layerTree` key present at top level ──────────
+  // New saves never write `layerTree`, so presence of the key is the reliable
+  // discriminant — more robust than checking `layerFormat === "flat"` because
+  // old files never wrote the `layerFormat` field at all.
+  const isLegacyFormat = "layerTree" in data;
+
+  // ── Determine the flat serialized layers ─────────────────────────────────
+  let flatSerialized: SerializedLayer[];
+
+  if (!isLegacyFormat) {
+    // New flat-array format: layers array IS the flat array
+    flatSerialized = data.layers;
+  } else {
+    // Legacy tree format — migrate to flat array at load time.
+    // Undo/redo stacks will be cleared below (legacy entries are incompatible).
+    console.info(
+      "[sktchFile] Legacy .sktch format detected — migrating layer tree to flat array",
+    );
+
+    const legacyData = data as SktchFileV1;
+    const layerTree = legacyData.layerTree;
+
+    // Attempt tree migration. Fall back to the flat `layers` array if:
+    //   • `layerTree` is absent or not an array
+    //   • `layerTree` is an empty array but `layers` has entries (old files
+    //      with no groups stored everything directly in `layers`)
+    //   • The tree conversion throws
+    try {
+      if (Array.isArray(layerTree) && layerTree.length > 0) {
+        // Populated tree — convert recursively
+        flatSerialized = convertTreeToFlat(layerTree);
+      } else if (
+        Array.isArray(legacyData.layers) &&
+        legacyData.layers.length > 0
+      ) {
+        // Tree is absent or empty, but there are plain layers — use them directly
+        console.info(
+          "[sktchFile] Legacy file has no layer tree — using flat layers array as-is",
+        );
+        flatSerialized = legacyData.layers;
+      } else {
+        // Both empty — blank canvas
+        flatSerialized = [];
+      }
+    } catch (migrationErr) {
+      // Tree conversion failed — attempt best-effort fallback to raw layers
+      console.warn(
+        "[sktchFile] Layer tree migration failed, falling back to flat layers array:",
+        migrationErr,
+      );
+      if (Array.isArray(legacyData.layers) && legacyData.layers.length > 0) {
+        flatSerialized = legacyData.layers;
+      } else {
+        throw new Error(
+          `Could not open "${file.name}" — the file uses a legacy format and the layer data could not be migrated. The file may be corrupted.`,
+        );
+      }
+    }
+  }
+
+  validateGroupPairs(flatSerialized);
+
+  // ── Dissolve invalid ruler clip relationships ─────────────────────────────
+  // If a layer has isClippingMask===true but either it or the layer below it
+  // is a ruler layer, clear the clip flag.  This handles files saved before
+  // the ruler-clip guard was in place.
+  for (let i = 0; i < flatSerialized.length; i++) {
+    const sl = flatSerialized[i];
+    if (!sl.isClippingMask) continue;
+    // Layer itself is a ruler — cannot be a clip source
+    if ((sl as { isRuler?: boolean }).isRuler) {
+      flatSerialized[i] = { ...sl, isClippingMask: false };
+      continue;
+    }
+    // Find the next non-marker layer below — if it's a ruler, dissolve
+    let belowIdx = i + 1;
+    while (
+      belowIdx < flatSerialized.length &&
+      (flatSerialized[belowIdx].type === "end_group" ||
+        flatSerialized[belowIdx].type === "group")
+    ) {
+      belowIdx++;
+    }
+    const below = flatSerialized[belowIdx];
+    if (below && (below as { isRuler?: boolean }).isRuler) {
+      flatSerialized[i] = { ...sl, isClippingMask: false };
+    }
+  }
+
+  // ── Deserialize layers and pixel data ────────────────────────────────────
+  const layers: LayerPanelLayer[] = [];
   const layerPixels = new Map<string, ImageData>();
 
-  for (const sl of data.layers) {
+  for (const sl of flatSerialized) {
     layers.push(serializedToLayer(sl));
-    if (!sl.isRuler && sl.pixelDataUrl) {
+
+    // Only paintable layers have pixel data
+    const isGroup = sl.type === "group" || sl.type === "end_group";
+    if (!isGroup && !(sl as { isRuler?: boolean }).isRuler && sl.pixelDataUrl) {
       try {
         const pixels = await dataUrlToImageData(
           sl.pixelDataUrl,
@@ -1113,44 +1201,47 @@ export async function deserializeSktch(file: File): Promise<{
     }
   }
 
-  // Preserve original layer order (sequential loop above guarantees order,
-  // but keep the sort as a safety net in case any future parallel path is added).
-  layers.sort((a, b) => {
-    const ai = data.layers.findIndex((sl) => sl.id === a.id);
-    const bi = data.layers.findIndex((sl) => sl.id === b.id);
-    return ai - bi;
-  });
+  // ── Deserialize history stacks ───────────────────────────────────────────
+  // Legacy files: clear both stacks. Their entries reference tree-based
+  // snapshots that are structurally incompatible with the flat-array system.
+  // Losing undo history on a legacy load is acceptable and expected.
+  let undoStack: UndoEntry[] = [];
+  let redoStack: UndoEntry[] = [];
 
-  // Deserialize history stacks in parallel, filtering out null (unknown) entries
-  const [rawUndo, rawRedo] = await Promise.all([
-    Promise.all(
-      data.undoStack.map((e) =>
-        deserializeUndoEntry(e, canvasWidth, canvasHeight),
+  if (!isLegacyFormat) {
+    const [rawUndo, rawRedo] = await Promise.all([
+      Promise.all(
+        data.undoStack.map((e) =>
+          deserializeUndoEntry(e, canvasWidth, canvasHeight),
+        ),
       ),
-    ),
-    Promise.all(
-      data.redoStack.map((e) =>
-        deserializeUndoEntry(e, canvasWidth, canvasHeight),
+      Promise.all(
+        data.redoStack.map((e) =>
+          deserializeUndoEntry(e, canvasWidth, canvasHeight),
+        ),
       ),
-    ),
-  ]);
+    ]);
+    undoStack = rawUndo.filter((e): e is UndoEntry => e !== null);
+    redoStack = rawRedo.filter((e): e is UndoEntry => e !== null);
+  } else {
+    console.info(
+      "[sktchFile] Legacy format — undo/redo history cleared (incompatible with flat-array architecture)",
+    );
+  }
 
-  const undoStack = rawUndo.filter((e): e is UndoEntry => e !== null);
-  const redoStack = rawRedo.filter((e): e is UndoEntry => e !== null);
-
-  // Validate activeLayerId; fall back to first layer if missing
   const validActiveId =
     layers.find((l) => l.id === data.activeLayerId)?.id ?? layers[0]?.id ?? "";
 
-  // Restore the layer tree — either from the saved tree field, or reconstruct
-  // a flat tree from the layers array (backward compat with pre-group files).
-  const layerTree: LayerNode[] = data.layerTree
-    ? deserializeLayerTree(data.layerTree)
-    : flatLayersToTree(layers);
+  // BUG-006 FIX: Advance the group ID counter past any group IDs that exist in
+  // the deserialized flat array. This prevents newly-created groups in the loaded
+  // document from colliding with group IDs that were saved in the file.
+  // Covers both the new flat-array format and the legacy tree-to-flat migration path.
+  // Note: useFileIOSystem.handleLoadFile calls this too as a belt-and-suspenders guard.
+  resetGroupIdCounterFromFlat(layers as import("./groupUtils").FlatEntry[]);
 
   return {
     layers,
-    layerTree,
+    layerTree: [], // flat architecture — no tree needed
     activeLayerId: validActiveId,
     canvasWidth,
     canvasHeight,

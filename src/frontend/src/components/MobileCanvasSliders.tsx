@@ -19,6 +19,12 @@ interface MobileCanvasSlidersProps {
   onBrushOpacityChange: (v: number) => void;
   onBrushFlowChange: (v: number) => void;
   leftHanded?: boolean;
+  // Liquify-specific props — only used when activeTool === 'liquify'
+  activeTool?: string;
+  liquifySize?: number;
+  liquifyStrength?: number;
+  onLiquifySizeChange?: (v: number) => void;
+  onLiquifyStrengthChange?: (v: number) => void;
 }
 
 export function MobileCanvasSliders({
@@ -29,34 +35,76 @@ export function MobileCanvasSliders({
   onBrushOpacityChange,
   onBrushFlowChange,
   leftHanded = false,
+  activeTool,
+  liquifySize = 80,
+  liquifyStrength = 1.0,
+  onLiquifySizeChange,
+  onLiquifyStrengthChange,
 }: MobileCanvasSlidersProps) {
-  const sliders = [
-    {
-      label: "F",
-      title: "Flow",
-      value: brushFlow,
-      min: 0.01,
-      max: 1,
-      onChange: (norm: number) => onBrushFlowChange(Math.max(0.01, norm)),
-    },
-    {
-      label: "O",
-      title: "Opacity",
-      value: brushOpacity,
-      min: 0.01,
-      max: 1,
-      onChange: (norm: number) => onBrushOpacityChange(Math.max(0.01, norm)),
-    },
-    {
-      label: "S",
-      title: "Size",
-      value: sizeToSlider(brushSize) / 100,
-      min: 0,
-      max: 1,
-      onChange: (norm: number) =>
-        onBrushSizeChange(Math.round(sliderToSize(norm * 100))),
-    },
-  ];
+  const isLiquify = activeTool === "liquify";
+
+  // When liquify is active, remap the two sliders to Size and Strength.
+  // Strength is stored as 0.01–1.0 but the slider value (0–1) maps linearly
+  // to 1–100 displayed as a percentage; we store it divided by 100.
+  const sliders = isLiquify
+    ? [
+        {
+          label: "Sz",
+          title: "Size",
+          // Liquify size range: 5–500 px, linear
+          value: Math.max(0, Math.min(1, (liquifySize - 5) / (500 - 5))),
+          min: 0,
+          max: 1,
+          onChange: (norm: number) => {
+            const px = Math.round(5 + norm * (500 - 5));
+            onLiquifySizeChange?.(px);
+          },
+          tooltipFn: (norm: number) => `${Math.round(5 + norm * (500 - 5))}px`,
+        },
+        {
+          label: "St",
+          title: "Strength",
+          // Strength stored 0.01–1.0; slider is linear percentage
+          value: Math.max(0, Math.min(1, liquifyStrength)),
+          min: 0,
+          max: 1,
+          onChange: (norm: number) => {
+            onLiquifyStrengthChange?.(Math.max(0.01, norm));
+          },
+          tooltipFn: (norm: number) => `${Math.round(norm * 100)}%`,
+        },
+      ]
+    : [
+        {
+          label: "F",
+          title: "Flow",
+          value: brushFlow,
+          min: 0.01,
+          max: 1,
+          onChange: (norm: number) => onBrushFlowChange(Math.max(0.01, norm)),
+          tooltipFn: undefined as ((norm: number) => string) | undefined,
+        },
+        {
+          label: "O",
+          title: "Opacity",
+          value: brushOpacity,
+          min: 0.01,
+          max: 1,
+          onChange: (norm: number) =>
+            onBrushOpacityChange(Math.max(0.01, norm)),
+          tooltipFn: undefined as ((norm: number) => string) | undefined,
+        },
+        {
+          label: "S",
+          title: "Size",
+          value: sizeToSlider(brushSize) / 100,
+          min: 0,
+          max: 1,
+          onChange: (norm: number) =>
+            onBrushSizeChange(Math.round(sliderToSize(norm * 100))),
+          tooltipFn: undefined as ((norm: number) => string) | undefined,
+        },
+      ];
 
   return (
     <div
@@ -92,6 +140,7 @@ function SliderItem({
   min,
   max,
   onChange,
+  tooltipFn,
 }: {
   label: string;
   title: string;
@@ -99,6 +148,7 @@ function SliderItem({
   min: number;
   max: number;
   onChange: (norm: number) => void;
+  tooltipFn?: (norm: number) => string;
 }) {
   const draggingRef = useRef(false);
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -117,6 +167,7 @@ function SliderItem({
   };
 
   const getTooltipText = (val: number): string => {
+    if (tooltipFn) return tooltipFn(val);
     if (label === "S") {
       return `${Math.round(sliderToSize(val * 100))}px`;
     }
