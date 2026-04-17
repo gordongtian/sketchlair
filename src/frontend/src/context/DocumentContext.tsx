@@ -25,6 +25,13 @@ export interface DocumentContextValue {
   registerSwapFn: (
     fn: (fromDoc: DocumentState, toDoc: DocumentState) => void,
   ) => void;
+  /**
+   * Register a synchronous flush callback so DocumentManager can call it before discarding a document.
+   * fn(doc, isActiveDoc): clears the doc's layerCanvases, display canvas (if active), and WebGL FBOs.
+   */
+  registerDiscardFlushFn: (
+    fn: (doc: DocumentState, isActiveDoc: boolean) => void,
+  ) => void;
   /** Create a blank document with exact dimensions, add it, and queue a swap into it. */
   createDocument: (width: number, height: number, filename?: string) => string;
   /** Register PaintingApp's loadFile function (called after swap when opening a file). */
@@ -76,6 +83,7 @@ export function DocumentProvider({
     setDirty: manager.setDirty,
     getNextUntitledIndex: manager.getNextUntitledIndex,
     registerSwapFn: manager.registerSwapFn,
+    registerDiscardFlushFn: manager.registerDiscardFlushFn,
     createDocument: manager.createDocument,
     registerLoadFileFn: manager.registerLoadFileFn,
     openFileAsDocument: manager.openFileAsDocument,

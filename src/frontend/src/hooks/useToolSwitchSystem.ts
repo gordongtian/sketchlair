@@ -18,6 +18,7 @@ export interface ToolSwitchSystemParams {
   selectionActionsRef: React.MutableRefObject<SelectionActions>;
   lastToolBeforeTransformRef: React.MutableRefObject<Tool | null>;
   selectionBoundaryPathRef: React.MutableRefObject<SelectionBoundaryPath>;
+  selectionActiveRef: React.MutableRefObject<boolean>;
   prevToolRef: React.MutableRefObject<Tool>;
   layersRef: React.MutableRefObject<Layer[]>;
   lastPaintToolRef2: React.MutableRefObject<Tool>;
@@ -52,6 +53,7 @@ export function useToolSwitchSystem({
   selectionActionsRef,
   lastToolBeforeTransformRef,
   selectionBoundaryPathRef,
+  selectionActiveRef,
   prevToolRef,
   layersRef,
   lastPaintToolRef2,
@@ -98,6 +100,12 @@ export function useToolSwitchSystem({
         selectionBoundaryPathRef.current.chains = [];
         selectionBoundaryPathRef.current.segments = [];
         selectionBoundaryPathRef.current.dirty = true;
+        // Immediately compute and display the bounding box at tool activation —
+        // no pointer interaction required. fromToolActivation=true ensures an
+        // empty layer produces no box instead of a degenerate fallback.
+        selectionActionsRef.current.extractFloat(selectionActiveRef.current, {
+          fromToolActivation: true,
+        });
       }
       if (tool === "adjustments") {
         // Don't change activeTool — just show adjustments panel

@@ -29,7 +29,7 @@ interface GradientSliderProps {
   ocid?: string;
 }
 
-function GradientSlider({
+export function GradientSlider({
   value,
   min,
   max,

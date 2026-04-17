@@ -92,7 +92,11 @@ export interface LineRulerHandles {
    * Draw the line ruler overlay onto `ctx`.
    * ctx is in canvas-space (already transformed by the caller).
    */
-  drawLineRulerOverlay: (ctx: CanvasRenderingContext2D, layer: Layer) => void;
+  drawLineRulerOverlay: (
+    ctx: CanvasRenderingContext2D,
+    layer: Layer,
+    zoom?: number,
+  ) => void;
 
   /**
    * Returns the snapped canvas-space point for "line" or "parallel" snap
@@ -175,7 +179,7 @@ export function useLineRuler({
   // ── drawLineRulerOverlay ─────────────────────────────────────────────────
 
   const drawLineRulerOverlay = useCallback(
-    (ctx: CanvasRenderingContext2D, layer: Layer) => {
+    (ctx: CanvasRenderingContext2D, layer: Layer, zoom = 1) => {
       const x1 = layer.lineX1;
       const y1 = layer.lineY1;
       const x2 = layer.lineX2;
@@ -221,12 +225,13 @@ export function useLineRuler({
       ctx.stroke();
 
       // Draw endpoint handles
+      const handleRadius = Math.max(4, 6 / zoom);
       ctx.fillStyle = color;
       ctx.beginPath();
-      ctx.arc(x1, y1, 5, 0, Math.PI * 2);
+      ctx.arc(x1, y1, handleRadius, 0, Math.PI * 2);
       ctx.fill();
       ctx.beginPath();
-      ctx.arc(x2, y2, 5, 0, Math.PI * 2);
+      ctx.arc(x2, y2, handleRadius, 0, Math.PI * 2);
       ctx.fill();
 
       // Draw midpoint handle (diamond shape) — only when ruler tool is active
@@ -237,7 +242,7 @@ export function useLineRuler({
         ctx.fillStyle = "rgba(0,0,0,0.6)";
         ctx.strokeStyle = color;
         ctx.lineWidth = 1.5;
-        const s = 5;
+        const s = handleRadius;
         ctx.beginPath();
         ctx.rect(-s, -s, s * 2, s * 2);
         ctx.fill();
@@ -486,37 +491,12 @@ export function useLineRuler({
         return false;
       }
 
-      // Fix 2: Clamp all non-VP handles to canvas bounds on pointer-up.
-      const W = canvasWidthRef.current;
-      const H = canvasHeightRef.current;
-      const clampX = (v: number | undefined) =>
-        v !== undefined ? Math.max(0, Math.min(W, v)) : v;
-      const clampY = (v: number | undefined) =>
-        v !== undefined ? Math.max(0, Math.min(H, v)) : v;
-
-      const x1 = clampX(layer.lineX1);
-      const y1 = clampY(layer.lineY1);
-      const x2 = clampX(layer.lineX2);
-      const y2 = clampY(layer.lineY2);
-
-      const needsClamp =
-        x1 !== layer.lineX1 ||
-        y1 !== layer.lineY1 ||
-        x2 !== layer.lineX2 ||
-        y2 !== layer.lineY2;
-
-      if (needsClamp) {
-        const patch = { lineX1: x1, lineY1: y1, lineX2: x2, lineY2: y2 };
-        const fn = (l: Layer) => (l.id === layer.id ? { ...l, ...patch } : l);
-        setLayers((prev) => prev.map(fn));
-        layersRef.current = layersRef.current.map(fn);
-      }
-
+      // Capture current positions — fully unconstrained, no clamping
       const afterState: Record<string, unknown> = {
-        lineX1: needsClamp ? x1 : layer.lineX1,
-        lineY1: needsClamp ? y1 : layer.lineY1,
-        lineX2: needsClamp ? x2 : layer.lineX2,
-        lineY2: needsClamp ? y2 : layer.lineY2,
+        lineX1: layer.lineX1,
+        lineY1: layer.lineY1,
+        lineX2: layer.lineX2,
+        lineY2: layer.lineY2,
       };
 
       const preState = rulerLineDragPreStateRef.current;
@@ -539,15 +519,7 @@ export function useLineRuler({
       scheduleRulerOverlay();
       return true;
     },
-    [
-      canvasWidthRef,
-      canvasHeightRef,
-      layersRef,
-      setLayers,
-      pushHistory,
-      rulerEditHistoryDepthRef,
-      scheduleRulerOverlay,
-    ],
+    [pushHistory, rulerEditHistoryDepthRef, scheduleRulerOverlay],
   );
 
   // ── isLineRulerDragging ──────────────────────────────────────────────────

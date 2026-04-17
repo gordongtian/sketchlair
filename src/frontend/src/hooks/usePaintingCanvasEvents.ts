@@ -398,7 +398,10 @@ export interface PaintingCanvasEventsParams {
     commitFloat: (opts?: { keepSelection?: boolean }) => void;
     revertTransform: () => void;
     rasterizeSelectionMask: () => void;
-    extractFloat: (fromSel: boolean) => void;
+    extractFloat: (
+      fromSel: boolean,
+      opts?: { fromToolActivation?: boolean },
+    ) => void;
   }>;
   isDrawingSelectionRef: React.MutableRefObject<boolean>;
   selectionPolyClosingRef: React.MutableRefObject<boolean>;
@@ -547,7 +550,10 @@ export interface PaintingCanvasEventsParams {
   } | null>;
   transformActionsRef: React.MutableRefObject<{
     hitTestTransformHandle: (x: number, y: number) => string | null;
-    extractFloat: (fromSel: boolean) => void;
+    extractFloat: (
+      fromSel: boolean,
+      opts?: { fromToolActivation?: boolean },
+    ) => void;
     commitFloat: (opts?: { keepSelection?: boolean }) => void;
     revertTransform: () => void;
   }>;
@@ -753,6 +759,32 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
   // Buffered pointermove events accumulated while the stroke is still off-canvas,
   // to be replayed when the pointer enters the canvas for a seamless carry-on.
   const _offCanvasPendingPathRef = useRef<PointerEvent[]>([]);
+
+  // ── Palm rejection refs (three-layer system) ─────────────────────────────
+  const PEN_GRACE_PERIOD_MS = 500;
+  // true = pen is currently touching OR grace period is still active
+  const penActiveRef = useRef(false);
+  const penLiftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // true once any 'pen' pointerType event has been received in this session.
+  // When false, touch events fall through normally (non-iPad device graceful degradation).
+  const penEverSeenRef = useRef(false);
+  // Active pointer tracking map for Layer 3 rollback
+  const activePointersRef = useRef(
+    new Map<
+      number,
+      {
+        type: string;
+        hasActiveStroke: boolean;
+        preStrokeSnapshot: {
+          x: number;
+          y: number;
+          width: number;
+          height: number;
+          data: ImageData;
+        } | null;
+      }
+    >(),
+  );
 
   // ── 1. Global hotkey handler ─────────────────────────────────────────────
   // biome-ignore lint/correctness/useExhaustiveDependencies: all mutable state accessed via stable refs / callbacksRef
@@ -1076,6 +1108,15 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
                 }
                 callbacksRef.current.setActiveTool("move");
                 callbacksRef.current.setActiveSubpanel(null);
+                // Immediately compute and display the bounding box — no pointer
+                // interaction required. fromToolActivation=true ensures an empty
+                // layer produces no box instead of a degenerate fallback.
+                if (!transformActiveRef.current) {
+                  p.selectionActionsRef.current.extractFloat(
+                    p.selectionActiveRef.current,
+                    { fromToolActivation: true },
+                  );
+                }
               } else {
                 callbacksRef.current.handleToolChange(springTool);
               }
@@ -1932,6 +1973,26 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
   // from PaintingApp.tsx. They use stable refs from `p` and callbacks from
   // `callbacksRef.current` so they never go stale with [] deps.
 
+  // ── Palm rejection helpers ───────────────────────────────────────────────
+  // onPenLift: called on pen pointerup or pointercancel. Starts the 500ms
+  // grace period that blocks touch events after the pen lifts, closing the
+  // window where a resting palm could register as a stroke.
+  function onPenLift(e: PointerEvent) {
+    if (e.pointerType !== "pen") return;
+    p.penDownCountRef.current = Math.max(0, p.penDownCountRef.current - 1);
+    penActiveRef.current = false;
+    console.log("[PalmRejection] pen lift — grace period started (500ms)");
+    if (penLiftTimerRef.current) {
+      clearTimeout(penLiftTimerRef.current);
+    }
+    penLiftTimerRef.current = setTimeout(() => {
+      penLiftTimerRef.current = null;
+      console.log(
+        "[PalmRejection] grace period elapsed — touch gestures re-enabled",
+      );
+    }, PEN_GRACE_PERIOD_MS);
+  }
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: uses refs intentionally
   const handlePointerDown = useCallback((e: PointerEvent) => {
     const display = p.displayCanvasRef.current;
@@ -1942,11 +2003,81 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     const isIPad = p.isIPadRef.current;
     p.currentPointerTypeRef.current = e.pointerType;
     p.pointerScreenPosRef.current = { x: e.clientX, y: e.clientY };
+    // ── LAYER 1 + 2: Palm rejection gate ─────────────────────────────────────
     if (e.pointerType === "pen") {
+      // Mark that a pen has been seen in this session — enables the lock
+      penEverSeenRef.current = true;
+      penActiveRef.current = true;
+      // Cancel any pending grace period timer
+      if (penLiftTimerRef.current) {
+        clearTimeout(penLiftTimerRef.current);
+        penLiftTimerRef.current = null;
+      }
+      console.log("[PalmRejection] pen down — lock active");
+      // Keep penDownCountRef for compatibility with touch gesture guards
       p.penDownCountRef.current += 1;
     } else if (e.pointerType === "touch") {
+      // Only gate if a pen has ever been seen (degrade gracefully on non-pen devices)
+      if (penEverSeenRef.current) {
+        if (penActiveRef.current || penLiftTimerRef.current !== null) {
+          const reason = penActiveRef.current
+            ? "pen-active lock"
+            : "grace period";
+          console.log(
+            `[PalmRejection] touch rejected during ${reason}: pointerId`,
+            e.pointerId,
+          );
+          return;
+        }
+        // pen-active lock fully inactive — touch gestures use touchstart/touchmove (separate path)
+        return;
+      }
+      // No pen ever seen this session — apply legacy size filter and fall through
       if (p.penDownCountRef.current > 0 || e.width > 200 || e.height > 200) {
         return;
+      }
+    }
+    // ── End palm rejection gate ───────────────────────────────────────────────
+
+    // Track this pointer for Layer 3 rollback
+    activePointersRef.current.set(e.pointerId, {
+      type: e.pointerType,
+      hasActiveStroke: false,
+      preStrokeSnapshot: null,
+    });
+    // Capture pre-stroke snapshot for Layer 3 rollback
+    {
+      const entry = activePointersRef.current.get(e.pointerId);
+      if (entry && p.displayCanvasRef.current) {
+        const ctx = p.displayCanvasRef.current.getContext("2d");
+        if (ctx) {
+          const snapshotSize = 400;
+          const snapX = Math.max(0, Math.round(e.clientX) - snapshotSize / 2);
+          const snapY = Math.max(0, Math.round(e.clientY) - snapshotSize / 2);
+          const snapW = Math.min(
+            snapshotSize,
+            p.displayCanvasRef.current.width - snapX,
+          );
+          const snapH = Math.min(
+            snapshotSize,
+            p.displayCanvasRef.current.height - snapY,
+          );
+          if (snapW > 0 && snapH > 0) {
+            try {
+              const imageData = ctx.getImageData(snapX, snapY, snapW, snapH);
+              entry.preStrokeSnapshot = {
+                x: snapX,
+                y: snapY,
+                width: snapW,
+                height: snapH,
+                data: imageData,
+              };
+              entry.hasActiveStroke = true;
+            } catch (_err) {
+              // getImageData can throw on cross-origin — silently ignore
+            }
+          }
+        }
       }
     }
 
@@ -2883,6 +3014,12 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: uses refs intentionally
   const handlePointerMove = useCallback((e: PointerEvent) => {
+    // ── Layer 1 + 2: Palm rejection — block touch moves during pen-active lock ──
+    if (e.pointerType === "touch" && penEverSeenRef.current) {
+      if (penActiveRef.current || penLiftTimerRef.current !== null) {
+        return;
+      }
+    }
     const isIPad = p.isIPadRef.current;
     p.currentPointerTypeRef.current = e.pointerType;
     p.pointerScreenPosRef.current = { x: e.clientX, y: e.clientY };
@@ -2994,6 +3131,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         panX: newPanX,
         panY: newPanY,
       });
+      // Fix 2: update ruler overlay live during camera zoom drag
+      cb.scheduleRulerOverlay();
       return;
     }
     if (p.isPanningRef.current) {
@@ -3004,6 +3143,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         panX: p.panOriginRef.current.x + dx,
         panY: p.panOriginRef.current.y + dy,
       });
+      // Fix 2: update ruler overlay live during camera pan drag
+      cb.scheduleRulerOverlay();
       return;
     }
     if (p.isRotatingRef.current) {
@@ -3036,6 +3177,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         panX: cx - rotX,
         panY: cy - rotY,
       });
+      // Fix 2: update ruler overlay live during camera rotation drag
+      cb.scheduleRulerOverlay();
       return;
     }
 
@@ -4107,13 +4250,54 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     if (!p.isDrawingRef.current) cb.scheduleComposite();
   }, []);
 
+  // ── Layer 3: pointercancel rollback ─────────────────────────────────────
+  // Called when the browser's heuristics identify a touch as accidental.
+  // Restores the canvas to its pre-stroke state and clears stroke tracking.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: uses refs intentionally
+  const handlePointerCancel = useCallback((e: PointerEvent) => {
+    if (e.pointerType === "touch") {
+      const entry = activePointersRef.current.get(e.pointerId);
+      if (entry?.hasActiveStroke) {
+        console.log(
+          "[PalmRejection] pointercancel rollback fired for touch pointerId",
+          e.pointerId,
+        );
+        // Restore the pre-stroke snapshot if available
+        if (entry.preStrokeSnapshot && p.displayCanvasRef.current) {
+          const ctx = p.displayCanvasRef.current.getContext("2d");
+          if (ctx && entry.preStrokeSnapshot.data) {
+            ctx.putImageData(
+              entry.preStrokeSnapshot.data,
+              entry.preStrokeSnapshot.x,
+              entry.preStrokeSnapshot.y,
+            );
+          }
+        }
+        // Cancel any in-progress stroke state
+        if (p.isDrawingRef) p.isDrawingRef.current = false;
+        if (p.lastPosRef) p.lastPosRef.current = null;
+      }
+      activePointersRef.current.delete(e.pointerId);
+    }
+    if (e.pointerType === "pen") {
+      // Pen cancelled by system (incoming call, system gesture etc.) — treat as pen lift
+      onPenLift(e);
+      activePointersRef.current.delete(e.pointerId);
+      // Commit current stroke gracefully via the normal up path
+      handlePointerUp(e);
+    }
+  }, []);
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: uses refs/snapshotSelection intentionally
   const handlePointerUp = useCallback((e?: PointerEvent) => {
     const isIPad = p.isIPadRef.current;
     if (e) p.currentPointerTypeRef.current = e.pointerType;
     if (e && e.pointerType === "pen") {
-      p.penDownCountRef.current = Math.max(0, p.penDownCountRef.current - 1);
+      // Layer 2: Pen lift starts grace period (onPenLift also decrements penDownCountRef)
+      onPenLift(e);
     }
+    // Clean up active pointer tracking (Layer 3)
+    if (e) activePointersRef.current.delete(e.pointerId);
     if (p.strokePreviewRafRef.current !== null) {
       cancelAnimationFrame(p.strokePreviewRafRef.current);
       p.strokePreviewRafRef.current = null;
@@ -5087,15 +5271,29 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     canvas.addEventListener("pointerup", handlePointerUp as EventListener, {
       passive: false,
     });
+    canvas.addEventListener(
+      "pointercancel",
+      handlePointerCancel as EventListener,
+      { passive: false },
+    );
     canvas.addEventListener("pointerleave", onLeave, { passive: false });
     return () => {
       canvas.removeEventListener("pointerenter", onEnter);
       canvas.removeEventListener("pointerdown", handlePointerDown);
       canvas.removeEventListener("pointermove", handlePointerMove);
       canvas.removeEventListener("pointerup", handlePointerUp as EventListener);
+      canvas.removeEventListener(
+        "pointercancel",
+        handlePointerCancel as EventListener,
+      );
       canvas.removeEventListener("pointerleave", onLeave);
     };
-  }, [handlePointerDown, handlePointerMove, handlePointerUp]);
+  }, [
+    handlePointerDown,
+    handlePointerMove,
+    handlePointerUp,
+    handlePointerCancel,
+  ]);
 
   // ── 7. Window-level listeners for off-canvas stroke start & cursor ────────
   // These allow strokes that begin outside the canvas element to carry onto
@@ -5203,6 +5401,211 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       window.removeEventListener("pointerdown", onWindowPointerDown);
       window.removeEventListener("pointermove", onWindowPointerMove);
       window.removeEventListener("pointerup", onWindowPointerUp);
+    };
+  }, [handlePointerDown, handlePointerMove, handlePointerUp]);
+
+  // ── 8. Window-level ruler pointer listeners (Fix 1) ──────────────────────
+  // When the ruler tool is active, ruler handles may be positioned anywhere in
+  // the viewport — including outside the canvas element's bounds. The canvas-
+  // level pointer listeners only fire within the canvas rect, so off-canvas
+  // handles are unreachable via those. This effect attaches window-level
+  // listeners that handle ruler pointer events wherever they occur.
+  //
+  // These listeners are ONLY active when the ruler tool is selected. For every
+  // other tool, the canvas-level listeners remain the sole handlers.
+  //
+  // Coordinate mapping: pointer client coords → canvas-space via the same
+  // _getCanvasPosTransformed helper used by handlePointerDown/Move.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all mutable state accessed via stable refs
+  useEffect(() => {
+    const onWindowRulerPointerDown = (e: PointerEvent) => {
+      // Only handle ruler tool
+      if (p.activeToolRef.current !== "ruler") return;
+      // Touch is handled by the touch system
+      if (e.pointerType === "touch") return;
+
+      const display = p.displayCanvasRef.current;
+      const container = p.containerRef.current;
+      if (!display || !container) return;
+
+      // Check whether the pointer is over the canvas element itself.
+      // If it is, the canvas-level pointerdown already fired (or is about to),
+      // so we must not duplicate the event.
+      const canvasRect = display.getBoundingClientRect();
+      const overCanvas =
+        e.clientX >= canvasRect.left &&
+        e.clientX <= canvasRect.right &&
+        e.clientY >= canvasRect.top &&
+        e.clientY <= canvasRect.bottom;
+      if (overCanvas) return;
+
+      // Check whether the pointer is within the viewport container
+      const containerRect = container.getBoundingClientRect();
+      const overContainer =
+        e.clientX >= containerRect.left &&
+        e.clientX <= containerRect.right &&
+        e.clientY >= containerRect.top &&
+        e.clientY <= containerRect.bottom;
+      if (!overContainer) return;
+
+      e.preventDefault();
+
+      const pos = _getCanvasPosTransformed(
+        e.clientX,
+        e.clientY,
+        container,
+        display,
+        p.viewTransformRef.current,
+        p.isFlippedRef.current,
+      );
+
+      const rulerLayer = p.layersRef.current.find((l) => l.isRuler);
+      if (!rulerLayer) return;
+
+      const cb = callbacksRef.current;
+      const rh = cb.rulerHandlers;
+      const handleRadius = Math.max(12, 24 / p.viewTransformRef.current.zoom);
+      const layerPresetType = rulerLayer.rulerPresetType ?? "perspective-1pt";
+
+      let consumed = false;
+      if (layerPresetType === "line") {
+        consumed = rh.handleLineRulerPointerDown(pos, rulerLayer, handleRadius);
+      } else if (layerPresetType === "perspective-1pt") {
+        consumed = rh.handle1ptRulerPointerDown(pos, rulerLayer, handleRadius);
+      } else if (layerPresetType === "perspective-2pt") {
+        consumed = rh.handle2ptRulerPointerDown(pos, rulerLayer, handleRadius);
+      } else if (layerPresetType === "perspective-3pt") {
+        consumed = rh.handle3ptRulerPointerDown(
+          pos,
+          rulerLayer,
+          handleRadius,
+          p.shiftHeldRef.current,
+        );
+      } else if (layerPresetType === "perspective-5pt") {
+        consumed = rh.handle5ptRulerPointerDown(
+          pos,
+          rulerLayer,
+          handleRadius,
+          p.shiftHeldRef.current,
+        );
+      } else if (layerPresetType === "oval") {
+        consumed = rh.handleOvalRulerPointerDown(pos, rulerLayer, handleRadius);
+      } else if (layerPresetType === "grid") {
+        consumed = rh.handleGridRulerPointerDown(pos, rulerLayer, handleRadius);
+      }
+      void consumed;
+      cb.scheduleRulerOverlay();
+    };
+
+    const onWindowRulerPointerMove = (e: PointerEvent) => {
+      // Only handle ruler tool when a ruler drag is in progress
+      if (p.activeToolRef.current !== "ruler") return;
+      if (e.pointerType === "touch") return;
+
+      const cb = callbacksRef.current;
+      const rh = cb.rulerHandlers;
+
+      // Only take over if a ruler drag is actually active
+      if (
+        !rh.isLineRulerDragging() &&
+        !rh.is1pt2ptRulerDragging() &&
+        !rh.is3ptExclusiveDragging() &&
+        !rh.is5ptDragging() &&
+        !rh.isOvalDragging() &&
+        !rh.isGridDragging()
+      ) {
+        return;
+      }
+
+      const display = p.displayCanvasRef.current;
+      const container = p.containerRef.current;
+      if (!display || !container) return;
+
+      // If the pointer is over the canvas, the canvas-level listener will handle it
+      const canvasRect = display.getBoundingClientRect();
+      const overCanvas =
+        e.clientX >= canvasRect.left &&
+        e.clientX <= canvasRect.right &&
+        e.clientY >= canvasRect.top &&
+        e.clientY <= canvasRect.bottom;
+      if (overCanvas) return;
+
+      const pos = _getCanvasPosTransformed(
+        e.clientX,
+        e.clientY,
+        container,
+        display,
+        p.viewTransformRef.current,
+        p.isFlippedRef.current,
+      );
+
+      const rulerLayer = p.layersRef.current.find((l) => l.isRuler);
+      if (!rulerLayer) return;
+
+      rh.handleLineRulerPointerMove(pos, rulerLayer);
+      rh.handle1pt2ptRulerPointerMove(pos, rulerLayer);
+      rh.handle3ptExclusivePointerMove(pos, rulerLayer);
+      rh.handle5ptRulerPointerMove(pos, rulerLayer);
+      rh.handleOvalRulerPointerMove(pos, rulerLayer);
+      rh.handleGridRulerPointerMove(pos, rulerLayer);
+      cb.scheduleRulerOverlay();
+    };
+
+    const onWindowRulerPointerUp = (e: PointerEvent) => {
+      // Only handle ruler tool
+      if (p.activeToolRef.current !== "ruler") return;
+      if (e.pointerType === "touch") return;
+
+      const cb = callbacksRef.current;
+      const rh = cb.rulerHandlers;
+
+      if (
+        !rh.isLineRulerDragging() &&
+        !rh.is1pt2ptRulerDragging() &&
+        !rh.is3ptExclusiveDragging() &&
+        !rh.is5ptDragging() &&
+        !rh.isOvalDragging() &&
+        !rh.isGridDragging()
+      ) {
+        return;
+      }
+
+      const display = p.displayCanvasRef.current;
+      const container = p.containerRef.current;
+      if (!display || !container) return;
+
+      // If the pointer is over the canvas, the canvas-level pointerup will handle it
+      const canvasRect = display.getBoundingClientRect();
+      const overCanvas =
+        e.clientX >= canvasRect.left &&
+        e.clientX <= canvasRect.right &&
+        e.clientY >= canvasRect.top &&
+        e.clientY <= canvasRect.bottom;
+      if (overCanvas) return;
+
+      const rulerLayer = p.layersRef.current.find((l) => l.isRuler);
+      if (!rulerLayer) return;
+
+      rh.handleLineRulerPointerUp(rulerLayer);
+      rh.handle1pt2ptRulerPointerUp(rulerLayer);
+      rh.handle3pt5ptRulerPointerUp(rulerLayer);
+      rh.handleEllipseGridRulerPointerUp(rulerLayer);
+    };
+
+    window.addEventListener("pointerdown", onWindowRulerPointerDown, {
+      passive: false,
+    });
+    window.addEventListener("pointermove", onWindowRulerPointerMove, {
+      passive: true,
+    });
+    window.addEventListener("pointerup", onWindowRulerPointerUp, {
+      passive: false,
+    });
+
+    return () => {
+      window.removeEventListener("pointerdown", onWindowRulerPointerDown);
+      window.removeEventListener("pointermove", onWindowRulerPointerMove);
+      window.removeEventListener("pointerup", onWindowRulerPointerUp);
     };
   }, [handlePointerDown, handlePointerMove, handlePointerUp]);
 

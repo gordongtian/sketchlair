@@ -47,7 +47,8 @@ export type Tool =
 
 export type LassoMode = "rect" | "ellipse" | "free" | "poly" | "wand" | "mask";
 
-const PAINT_TOOLS: {
+// Group 1: paint tools
+const GROUP1_TOOLS: {
   id: Tool;
   icon: React.ReactNode;
   mobileIcon: React.ReactNode;
@@ -87,22 +88,36 @@ const PAINT_TOOLS: {
     shortcut: "W",
     ocid: "toolbar.liquify_button",
   },
-  {
-    id: "fill",
-    icon: <PaintBucket size={20} />,
-    mobileIcon: <PaintBucket size={17} />,
-    label: "Fill",
-    shortcut: "F",
-    ocid: "toolbar.fill_button",
-  },
-  {
-    id: "eyedropper",
-    icon: <Pipette size={20} />,
-    mobileIcon: <Pipette size={17} />,
-    label: "Eyedropper",
-    shortcut: "I / Alt",
-    ocid: "toolbar.eyedropper_button",
-  },
+];
+
+// Group 2: selection/utility tools (fill, lasso, eyedropper — lasso is rendered inline)
+const GROUP2_FILL_TOOL = {
+  id: "fill" as Tool,
+  icon: <PaintBucket size={20} />,
+  mobileIcon: <PaintBucket size={17} />,
+  label: "Fill",
+  shortcut: "F",
+  ocid: "toolbar.fill_button",
+};
+
+const GROUP2_EYEDROPPER_TOOL = {
+  id: "eyedropper" as Tool,
+  icon: <Pipette size={20} />,
+  mobileIcon: <Pipette size={17} />,
+  label: "Eyedropper",
+  shortcut: "I / Alt",
+  ocid: "toolbar.eyedropper_button",
+};
+
+// Group 3: canvas tools (ruler, adjustments, crop)
+const GROUP3_CANVAS_TOOLS: {
+  id: Tool;
+  icon: React.ReactNode;
+  mobileIcon: React.ReactNode;
+  label: string;
+  shortcut: string;
+  ocid: string;
+}[] = [
   {
     id: "crop",
     icon: <Crop size={20} />,
@@ -221,7 +236,8 @@ export function Toolbar({
             scrollbarWidth: "none" as React.CSSProperties["scrollbarWidth"],
           }}
         >
-          {PAINT_TOOLS.map((tool) => (
+          {/* ── Group 1: Paint tools ── */}
+          {GROUP1_TOOLS.map((tool) => (
             <Tooltip key={tool.id}>
               <TooltipTrigger asChild>
                 <button
@@ -255,6 +271,37 @@ export function Toolbar({
           {/* Divider */}
           <div className="w-6 border-t border-border my-1" />
 
+          {/* ── Group 2: Selection / utility ── */}
+          {/* Fill */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                data-ocid={GROUP2_FILL_TOOL.ocid}
+                onClick={() => {
+                  if (activeTool === GROUP2_FILL_TOOL.id) {
+                    onToolReselect(GROUP2_FILL_TOOL.id);
+                  } else {
+                    onToolChange(GROUP2_FILL_TOOL.id);
+                  }
+                }}
+                className={`${btnCls} ${
+                  activeTool === GROUP2_FILL_TOOL.id
+                    ? "bg-primary text-primary-foreground shadow-md"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                }`}
+              >
+                {isMobile ? GROUP2_FILL_TOOL.mobileIcon : GROUP2_FILL_TOOL.icon}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right" className="flex items-center gap-2">
+              <span>{GROUP2_FILL_TOOL.label}</span>
+              <kbd className="text-xs bg-muted px-1 rounded">
+                {GROUP2_FILL_TOOL.shortcut}
+              </kbd>
+            </TooltipContent>
+          </Tooltip>
+
           {/* Lasso selection tool */}
           <Tooltip>
             <TooltipTrigger asChild>
@@ -275,13 +322,13 @@ export function Toolbar({
                 }`}
               >
                 {isMobile
-                  ? LASSO_ICONS_MOBILE[activeLassoMode]
-                  : LASSO_ICONS[activeLassoMode]}
+                  ? (LASSO_ICONS_MOBILE[activeLassoMode] ?? <Lasso size={17} />)
+                  : (LASSO_ICONS[activeLassoMode] ?? <Lasso size={20} />)}
               </button>
             </TooltipTrigger>
             <TooltipContent side="right" className="flex flex-col gap-0.5">
               <span className="font-medium">
-                {LASSO_LABELS[activeLassoMode]}
+                {LASSO_LABELS[activeLassoMode] ?? "Selection"}
               </span>
               <span className="text-xs text-muted-foreground">
                 L to cycle modes
@@ -289,25 +336,63 @@ export function Toolbar({
             </TooltipContent>
           </Tooltip>
 
-          {/* Move/Transform tool (unified) */}
+          {/* Eyedropper */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
-                data-ocid="toolbar.move_button"
-                onClick={() => onToolChange("move")}
+                data-ocid={GROUP2_EYEDROPPER_TOOL.ocid}
+                onClick={() => {
+                  if (activeTool === GROUP2_EYEDROPPER_TOOL.id) {
+                    onToolReselect(GROUP2_EYEDROPPER_TOOL.id);
+                  } else {
+                    onToolChange(GROUP2_EYEDROPPER_TOOL.id);
+                  }
+                }}
                 className={`${btnCls} ${
-                  activeTool === "move" || activeTool === "transform"
+                  activeTool === GROUP2_EYEDROPPER_TOOL.id
                     ? "bg-primary text-primary-foreground shadow-md"
                     : "text-muted-foreground hover:text-foreground hover:bg-muted"
                 }`}
               >
-                <Maximize2 size={isMobile ? 17 : 20} />
+                {isMobile
+                  ? GROUP2_EYEDROPPER_TOOL.mobileIcon
+                  : GROUP2_EYEDROPPER_TOOL.icon}
               </button>
             </TooltipTrigger>
             <TooltipContent side="right" className="flex items-center gap-2">
-              <span>Move / Transform</span>
-              <kbd className="text-xs bg-muted px-1 rounded">V</kbd>
+              <span>{GROUP2_EYEDROPPER_TOOL.label}</span>
+              <kbd className="text-xs bg-muted px-1 rounded">
+                {GROUP2_EYEDROPPER_TOOL.shortcut}
+              </kbd>
+            </TooltipContent>
+          </Tooltip>
+
+          {/* Eyedropper — already in GROUP2_TOOLS, but lasso is inserted between fill and eyedropper */}
+
+          {/* Divider */}
+          <div className="w-6 border-t border-border my-1" />
+
+          {/* ── Group 3: Canvas tools (ruler, adjustments, crop) ── */}
+          {/* Ruler tool */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                data-ocid="toolbar.ruler_button"
+                onClick={() => onToolChange("ruler")}
+                className={`${btnCls} ${
+                  activeTool === "ruler" || activeSubpanel === "ruler"
+                    ? "bg-primary text-primary-foreground shadow-md"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                }`}
+              >
+                <Ruler size={isMobile ? 17 : 20} />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right" className="flex items-center gap-2">
+              <span>Ruler</span>
+              <kbd className="text-xs bg-muted px-1 rounded">G</kbd>
             </TooltipContent>
           </Tooltip>
 
@@ -333,94 +418,43 @@ export function Toolbar({
             </TooltipContent>
           </Tooltip>
 
-          {/* Ruler tool */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                data-ocid="toolbar.ruler_button"
-                onClick={() => onToolChange("ruler")}
-                className={`${btnCls} ${
-                  activeTool === "ruler" || activeSubpanel === "ruler"
-                    ? "bg-primary text-primary-foreground shadow-md"
-                    : "text-muted-foreground hover:text-foreground hover:bg-muted"
-                }`}
-              >
-                <Ruler size={isMobile ? 17 : 20} />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right" className="flex items-center gap-2">
-              <span>Ruler</span>
-              <kbd className="text-xs bg-muted px-1 rounded">G</kbd>
-            </TooltipContent>
-          </Tooltip>
+          {/* Crop tool */}
+          {GROUP3_CANVAS_TOOLS.map((tool) => (
+            <Tooltip key={tool.id}>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  data-ocid={tool.ocid}
+                  onClick={() => {
+                    if (activeTool === tool.id) {
+                      onToolReselect(tool.id);
+                    } else {
+                      onToolChange(tool.id);
+                    }
+                  }}
+                  className={`${btnCls} ${
+                    activeTool === tool.id
+                      ? "bg-primary text-primary-foreground shadow-md"
+                      : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                  }`}
+                >
+                  {isMobile ? tool.mobileIcon : tool.icon}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="right" className="flex items-center gap-2">
+                <span>{tool.label}</span>
+                <kbd className="text-xs bg-muted px-1 rounded">
+                  {tool.shortcut}
+                </kbd>
+              </TooltipContent>
+            </Tooltip>
+          ))}
 
           {/* Divider */}
           <div className="w-6 border-t border-border my-1" />
 
-          {/* Zoom lock button — hidden on mobile (use pinch gesture instead) */}
-          {!isMobile && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  data-ocid="toolbar.zoom_button"
-                  onClick={() => {
-                    onZoomLockToggle();
-                    onToolChange("zoom");
-                  }}
-                  className={`${btnCls} ${
-                    activeTool === "zoom"
-                      ? "bg-primary text-primary-foreground shadow-md"
-                      : "text-muted-foreground hover:text-foreground hover:bg-muted"
-                  }`}
-                >
-                  <ZoomIn size={20} />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent
-                side="right"
-                className="flex flex-col gap-0.5 max-w-[160px]"
-              >
-                <span className="font-medium">Zoom</span>
-                <span className="text-xs text-muted-foreground">
-                  Ctrl+Space drag or scroll
-                </span>
-              </TooltipContent>
-            </Tooltip>
-          )}
-
-          {/* Rotate lock button — hidden on mobile (use two-finger rotate gesture) */}
-          {!isMobile && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  data-ocid="toolbar.rotate_button"
-                  onClick={() => {
-                    onRotateLockToggle();
-                    onToolChange("rotate");
-                  }}
-                  className={`${btnCls} ${
-                    activeTool === "rotate"
-                      ? "bg-primary text-primary-foreground shadow-md"
-                      : "text-muted-foreground hover:text-foreground hover:bg-muted"
-                  }`}
-                >
-                  <RotateCcw size={20} />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent
-                side="right"
-                className="flex flex-col gap-0.5 max-w-[160px]"
-              >
-                <span className="font-medium">Rotate</span>
-                <span className="text-xs text-muted-foreground">R + drag</span>
-              </TooltipContent>
-            </Tooltip>
-          )}
-
-          {/* Pan lock button — hidden on mobile (use two-finger drag) */}
+          {/* ── Group 4: Navigation ── */}
+          {/* Pan — hidden on mobile (use two-finger drag) */}
           {!isMobile && (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -452,6 +486,90 @@ export function Toolbar({
             </Tooltip>
           )}
 
+          {/* Zoom — hidden on mobile (use pinch gesture instead) */}
+          {!isMobile && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  data-ocid="toolbar.zoom_button"
+                  onClick={() => {
+                    onZoomLockToggle();
+                    onToolChange("zoom");
+                  }}
+                  className={`${btnCls} ${
+                    activeTool === "zoom"
+                      ? "bg-primary text-primary-foreground shadow-md"
+                      : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                  }`}
+                >
+                  <ZoomIn size={20} />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent
+                side="right"
+                className="flex flex-col gap-0.5 max-w-[160px]"
+              >
+                <span className="font-medium">Zoom</span>
+                <span className="text-xs text-muted-foreground">
+                  Ctrl+Space drag or scroll
+                </span>
+              </TooltipContent>
+            </Tooltip>
+          )}
+
+          {/* Rotate — hidden on mobile (use two-finger rotate gesture) */}
+          {!isMobile && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  data-ocid="toolbar.rotate_button"
+                  onClick={() => {
+                    onRotateLockToggle();
+                    onToolChange("rotate");
+                  }}
+                  className={`${btnCls} ${
+                    activeTool === "rotate"
+                      ? "bg-primary text-primary-foreground shadow-md"
+                      : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                  }`}
+                >
+                  <RotateCcw size={20} />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent
+                side="right"
+                className="flex flex-col gap-0.5 max-w-[160px]"
+              >
+                <span className="font-medium">Rotate</span>
+                <span className="text-xs text-muted-foreground">R + drag</span>
+              </TooltipContent>
+            </Tooltip>
+          )}
+
+          {/* Move / Transform */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                data-ocid="toolbar.move_button"
+                onClick={() => onToolChange("move")}
+                className={`${btnCls} ${
+                  activeTool === "move" || activeTool === "transform"
+                    ? "bg-primary text-primary-foreground shadow-md"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                }`}
+              >
+                <Maximize2 size={isMobile ? 17 : 20} />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right" className="flex items-center gap-2">
+              <span>Move / Transform</span>
+              <kbd className="text-xs bg-muted px-1 rounded">V</kbd>
+            </TooltipContent>
+          </Tooltip>
+
           {/* Flip horizontal button — always visible */}
           <Tooltip>
             <TooltipTrigger asChild>
@@ -480,7 +598,7 @@ export function Toolbar({
           </Tooltip>
         </div>
 
-        {/* Bottom group — always visible, not scrolled */}
+        {/* Bottom group (Group 5): save / load / settings — always visible, not scrolled */}
         <div
           style={{
             flexShrink: 0,
@@ -493,7 +611,7 @@ export function Toolbar({
             borderTop: "1px solid oklch(var(--border))",
           }}
         >
-          {/* Save file button — always visible */}
+          {/* Save file button */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -514,7 +632,7 @@ export function Toolbar({
             </TooltipContent>
           </Tooltip>
 
-          {/* Open file button — always visible */}
+          {/* Open file button */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -532,7 +650,7 @@ export function Toolbar({
             </TooltipContent>
           </Tooltip>
 
-          {/* Settings — always visible */}
+          {/* Settings */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button

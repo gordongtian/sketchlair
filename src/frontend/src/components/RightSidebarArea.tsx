@@ -76,6 +76,8 @@ export interface RightSidebarAreaProps {
   onCreateGroup: () => void;
   /** Whether the Shift key is currently held — drives ruler On/Off indicator XOR display */
   shiftHeld: boolean;
+  /** When true: hides the navigator and layers panel (brush tip editor mode) */
+  brushTipEditorActive?: boolean;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -128,6 +130,7 @@ export function RightSidebarArea({
   onToggleLayerSelection,
   onCreateGroup,
   shiftHeld,
+  brushTipEditorActive = false,
 }: RightSidebarAreaProps) {
   return (
     <div
@@ -262,7 +265,7 @@ export function RightSidebarArea({
               window.addEventListener("pointerup", onUp);
             }}
           />
-          {!isMobile && (
+          {!isMobile && !brushTipEditorActive && (
             <>
               {/* Navigator: capped at 25% of sidebar height so portrait canvases don't dominate */}
               <div
@@ -291,56 +294,59 @@ export function RightSidebarArea({
             </>
           )}
           {/* Layers panel: fills remaining space and scrolls internally */}
-          <div
-            style={{
-              flex: 1,
-              minHeight: 0,
-              overflow: "hidden",
-              display: "flex",
-              flexDirection: "column",
-            }}
-          >
-            <LayersPanel
-              layers={layers}
-              layerTree={layerTree}
-              activeLayerId={activeLayerId}
-              selectedLayerIds={selectedLayerIds}
-              onSetActive={onSetActive}
-              onToggleVisible={onToggleVisible}
-              onSetOpacity={onSetOpacity}
-              onSetOpacityLive={onSetOpacityLive}
-              onSetOpacityCommit={onSetOpacityCommit}
-              onSetBlendMode={onSetBlendMode}
-              onAddLayer={onAddLayer}
-              onDeleteLayer={onDeleteLayer}
-              onReorderLayers={onReorderLayers}
-              onClearLayer={onClearLayer}
-              onToggleClippingMask={onToggleClippingMask}
-              onMergeLayers={onMergeLayers}
-              onRenameLayer={onRenameLayer}
-              onToggleAlphaLock={onToggleAlphaLock}
-              thumbnails={layerThumbnails}
-              onCtrlClickLayer={onCtrlClickLayer}
-              onToggleRulerActive={onToggleRulerActive}
-              onToggleGroupCollapse={onToggleGroupCollapse}
-              onRenameGroup={onRenameGroup}
-              onSetGroupOpacity={onSetGroupOpacity}
-              onSetGroupOpacityLive={onSetGroupOpacityLive}
-              onSetGroupOpacityCommit={onSetGroupOpacityCommit}
-              onToggleGroupVisible={onToggleGroupVisible}
-              onDeleteGroup={onOpenDeleteGroup}
-              onReorderTree={onReorderTree}
-              onReorderTreeSilent={onReorderTreeSilent}
-              onReorderLayersSilent={onReorderLayersSilent}
-              onCommitReorderHistory={onCommitReorderHistory}
-              onToggleLayerSelection={onToggleLayerSelection}
-              onCreateGroup={onCreateGroup}
-              shiftHeld={shiftHeld}
-              onClose={
-                isMobile ? () => setRightSidebarCollapsed(true) : undefined
-              }
-            />
-          </div>
+          {/* Hidden entirely in brush tip editor mode */}
+          {!brushTipEditorActive && (
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                overflow: "hidden",
+                display: "flex",
+                flexDirection: "column",
+              }}
+            >
+              <LayersPanel
+                layers={layers}
+                layerTree={layerTree}
+                activeLayerId={activeLayerId}
+                selectedLayerIds={selectedLayerIds}
+                onSetActive={onSetActive}
+                onToggleVisible={onToggleVisible}
+                onSetOpacity={onSetOpacity}
+                onSetOpacityLive={onSetOpacityLive}
+                onSetOpacityCommit={onSetOpacityCommit}
+                onSetBlendMode={onSetBlendMode}
+                onAddLayer={onAddLayer}
+                onDeleteLayer={onDeleteLayer}
+                onReorderLayers={onReorderLayers}
+                onClearLayer={onClearLayer}
+                onToggleClippingMask={onToggleClippingMask}
+                onMergeLayers={onMergeLayers}
+                onRenameLayer={onRenameLayer}
+                onToggleAlphaLock={onToggleAlphaLock}
+                thumbnails={layerThumbnails}
+                onCtrlClickLayer={onCtrlClickLayer}
+                onToggleRulerActive={onToggleRulerActive}
+                onToggleGroupCollapse={onToggleGroupCollapse}
+                onRenameGroup={onRenameGroup}
+                onSetGroupOpacity={onSetGroupOpacity}
+                onSetGroupOpacityLive={onSetGroupOpacityLive}
+                onSetGroupOpacityCommit={onSetGroupOpacityCommit}
+                onToggleGroupVisible={onToggleGroupVisible}
+                onDeleteGroup={onOpenDeleteGroup}
+                onReorderTree={onReorderTree}
+                onReorderTreeSilent={onReorderTreeSilent}
+                onReorderLayersSilent={onReorderLayersSilent}
+                onCommitReorderHistory={onCommitReorderHistory}
+                onToggleLayerSelection={onToggleLayerSelection}
+                onCreateGroup={onCreateGroup}
+                shiftHeld={shiftHeld}
+                onClose={
+                  isMobile ? () => setRightSidebarCollapsed(true) : undefined
+                }
+              />
+            </div>
+          )}
         </>
       )}
       {/* Desktop collapse toggle — hidden on mobile */}

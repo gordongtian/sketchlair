@@ -3,7 +3,7 @@ import type { Preset } from "@/utils/toolPresets";
 import type React from "react";
 import { AdjustmentsPresetsPanel } from "./AdjustmentsPresetsPanel";
 import type { BrushSettings } from "./BrushSettingsPanel";
-import { ColorPickerPanel } from "./ColorPickerPanel";
+import { ColorPickerPanel, GradientSlider } from "./ColorPickerPanel";
 import { EyedropperSettingsPanel } from "./EyedropperSettingsPanel";
 import { FillPresetsPanel } from "./FillPresetsPanel";
 import type { FillMode, FillSettings } from "./FillPresetsPanel";
@@ -109,6 +109,16 @@ export interface LeftSidebarAreaProps {
   >;
   eyedropperSampleSize: 1 | 3 | 5;
   setEyedropperSampleSize: React.Dispatch<React.SetStateAction<1 | 3 | 5>>;
+
+  /** Called when the user clicks "Draw New" / "Draw Tip" — opens inline workspace brush tip editor */
+  onEnterBrushTipEditor?: (onAccept: (dataUrl: string) => void) => void;
+
+  /** When true: replaces the color panel with a grayscale slider (brush tip editor mode) */
+  brushTipEditorActive?: boolean;
+  /** Current gray level 0–255 for brush tip editor (only relevant when brushTipEditorActive=true) */
+  grayLevel?: number;
+  /** Called when the gray slider changes value */
+  onGrayLevelChange?: (gv: number) => void;
 }
 
 export function LeftSidebarArea({
@@ -180,6 +190,10 @@ export function LeftSidebarArea({
   setEyedropperSampleSource,
   eyedropperSampleSize,
   setEyedropperSampleSize,
+  onEnterBrushTipEditor,
+  brushTipEditorActive = false,
+  grayLevel = 0,
+  onGrayLevelChange,
 }: LeftSidebarAreaProps) {
   // Build the deduplicated tips list for ToolPresetsPanel
   const availableTips = (() => {
@@ -247,14 +261,55 @@ export function LeftSidebarArea({
       )}
       {!leftSidebarCollapsed && (
         <div className="flex flex-col flex-1" style={{ overflowX: "hidden" }}>
-          {/* Color Picker Panel */}
+          {/* Color Picker Panel — replaced by Grayscale Slider in brush tip editor mode */}
           <div onPointerDown={(e) => e.stopPropagation()} className="shrink-0">
-            <ColorPickerPanel
-              color={color}
-              onColorChange={setColor}
-              recentColors={recentColors}
-              onRecentColorClick={onRecentColorClick}
-            />
+            {brushTipEditorActive ? (
+              /* ── Grayscale Color Bar (brush tip editor) — uses HSV-style GradientSlider ── */
+              <div
+                className="flex flex-col gap-2 p-3"
+                style={{ borderBottom: "1px solid oklch(var(--border))" }}
+              >
+                <div
+                  className="text-[10px] font-semibold uppercase tracking-wider"
+                  style={{ color: "oklch(var(--accent))" }}
+                >
+                  Gray Value
+                </div>
+                {/* Swatch + color bar row */}
+                <div className="flex items-center gap-2">
+                  {/* Current gray swatch */}
+                  <div
+                    className="w-7 h-7 rounded border border-border shrink-0"
+                    style={{
+                      background: `rgb(${grayLevel},${grayLevel},${grayLevel})`,
+                    }}
+                    title={`Gray: ${grayLevel}`}
+                  />
+                  {/* HSV-style gradient color bar: black → white */}
+                  <GradientSlider
+                    value={grayLevel}
+                    min={0}
+                    max={255}
+                    gradient="linear-gradient(to right, #000000, #ffffff)"
+                    onChange={(gv) => onGrayLevelChange?.(gv)}
+                    ocid="brush_tip_editor.gray_slider"
+                  />
+                </div>
+                {/* Black / White labels */}
+                <div className="flex justify-between text-[9px] text-muted-foreground select-none">
+                  <span>Black (0)</span>
+                  <span>{grayLevel}</span>
+                  <span>White (255)</span>
+                </div>
+              </div>
+            ) : (
+              <ColorPickerPanel
+                color={color}
+                onColorChange={setColor}
+                recentColors={recentColors}
+                onRecentColorClick={onRecentColorClick}
+              />
+            )}
           </div>
 
           {/* Divider */}
@@ -284,6 +339,7 @@ export function LeftSidebarArea({
                 currentSize={currentBrushSize}
                 currentOpacity={color.a}
                 onSaveCurrentToPreset={onSaveCurrentToPreset}
+                onEnterBrushTipEditor={onEnterBrushTipEditor}
               />
             ) : activeSubpanel === "lasso" ? (
               <LassoPresetsPanel

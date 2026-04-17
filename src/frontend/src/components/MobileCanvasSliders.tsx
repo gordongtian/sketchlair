@@ -115,7 +115,7 @@ export function MobileCanvasSliders({
         top: "50%",
         transform: "translateY(-50%)",
         maxHeight: "min(90dvh, 100%)",
-        width: 44,
+        width: 30,
         height: "min(90dvh, 100%)",
         display: "flex",
         flexDirection: "column",
@@ -260,7 +260,7 @@ function SliderItem({
         onPointerUp={handlePointerUp}
         style={{
           flex: 1,
-          width: 40,
+          width: 28,
           position: "relative",
           background: "oklch(var(--slider-bg, var(--muted)))",
           borderRadius: 0,

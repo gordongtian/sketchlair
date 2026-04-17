@@ -89,14 +89,40 @@ export class ExternalBlob {
         return this;
     }
 }
+export interface AppSettings {
+    uiScale: number;
+    theme: string;
+    canvasBackground: string;
+    modifiedAt: bigint;
+    otherSettings: string;
+}
+export interface UserPreferences {
+    brushes: Array<BrushPreset>;
+    hotkeys: HotkeyAssignments;
+    lastModified: bigint;
+    settings: AppSettings;
+    schemaVersion: bigint;
+}
 export type SettingsSave = string;
-export type CanvasSave = string;
 export interface _ImmutableObjectStorageRefillInformation {
     proposed_top_up_amount?: bigint;
+}
+export interface HotkeyAssignments {
+    assignments: string;
+    modifiedAt: bigint;
 }
 export interface _ImmutableObjectStorageCreateCertificateResult {
     method: string;
     blob_hash: string;
+}
+export type CanvasSave = string;
+export interface BrushPreset {
+    id: string;
+    modifiedAt: bigint;
+    name: string;
+    createdAt: bigint;
+    settings: string;
+    isDefault: boolean;
 }
 export interface UserProfile {
     name: string;
@@ -119,19 +145,42 @@ export interface backendInterface {
     _immutableObjectStorageUpdateGatewayPrincipals(): Promise<void>;
     _initializeAccessControl(): Promise<void>;
     assignCallerUserRole(user: Principal, role: UserRole): Promise<void>;
+    /**
+     * / Removes a single brush by id. No-op if the caller has no record or the
+     * / brush id is not found.
+     */
+    deleteBrush(id: string): Promise<void>;
     getBrushPresets(): Promise<string | null>;
     getCallerUserProfile(): Promise<UserProfile | null>;
     getCallerUserRole(): Promise<UserRole>;
     getCanvasHash(): Promise<CanvasSave | null>;
+    /**
+     * / Returns all stored preferences for the caller, or null if none saved yet.
+     */
+    getPreferences(): Promise<UserPreferences | null>;
+    /**
+     * / Returns the schema version stored for the caller, or 0 if no record exists.
+     */
+    getSchemaVersion(): Promise<bigint>;
     getUserProfile(user: Principal): Promise<UserProfile | null>;
     getUserSettings(): Promise<SettingsSave | null>;
     isCallerAdmin(): Promise<boolean>;
+    /**
+     * / Upserts a single brush by id. Creates a default preferences record first
+     * / if the caller has no existing record.
+     */
+    saveBrush(brush: BrushPreset): Promise<void>;
     saveBrushPresets(data: string): Promise<void>;
     saveCallerUserProfile(profile: UserProfile): Promise<void>;
     saveCanvasHash(canvasHash: CanvasSave): Promise<void>;
+    /**
+     * / Atomically replaces all preferences for the caller.
+     * / Always overwrites lastModified with the current canister time.
+     */
+    savePreferences(prefs: UserPreferences): Promise<void>;
     saveUserSettings(settings: SettingsSave): Promise<void>;
 }
-import type { CanvasSave as _CanvasSave, SettingsSave as _SettingsSave, UserProfile as _UserProfile, UserRole as _UserRole, _ImmutableObjectStorageRefillInformation as __ImmutableObjectStorageRefillInformation, _ImmutableObjectStorageRefillResult as __ImmutableObjectStorageRefillResult } from "./declarations/backend.did.d.ts";
+import type { CanvasSave as _CanvasSave, SettingsSave as _SettingsSave, UserPreferences as _UserPreferences, UserProfile as _UserProfile, UserRole as _UserRole, _ImmutableObjectStorageRefillInformation as __ImmutableObjectStorageRefillInformation, _ImmutableObjectStorageRefillResult as __ImmutableObjectStorageRefillResult } from "./declarations/backend.did.d.ts";
 export class Backend implements backendInterface {
     constructor(private actor: ActorSubclass<_SERVICE>, private _uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, private _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, private processError?: (error: unknown) => never){}
     async _immutableObjectStorageBlobsAreLive(arg0: Array<Uint8Array>): Promise<Array<boolean>> {
@@ -246,6 +295,20 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async deleteBrush(arg0: string): Promise<void> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.deleteBrush(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.deleteBrush(arg0);
+            return result;
+        }
+    }
     async getBrushPresets(): Promise<string | null> {
         if (this.processError) {
             try {
@@ -302,6 +365,34 @@ export class Backend implements backendInterface {
             return from_candid_opt_n14(this._uploadFile, this._downloadFile, result);
         }
     }
+    async getPreferences(): Promise<UserPreferences | null> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getPreferences();
+                return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getPreferences();
+            return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getSchemaVersion(): Promise<bigint> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getSchemaVersion();
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getSchemaVersion();
+            return result;
+        }
+    }
     async getUserProfile(arg0: Principal): Promise<UserProfile | null> {
         if (this.processError) {
             try {
@@ -320,14 +411,14 @@ export class Backend implements backendInterface {
         if (this.processError) {
             try {
                 const result = await this.actor.getUserSettings();
-                return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
+                return from_candid_opt_n16(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.getUserSettings();
-            return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
+            return from_candid_opt_n16(this._uploadFile, this._downloadFile, result);
         }
     }
     async isCallerAdmin(): Promise<boolean> {
@@ -341,6 +432,20 @@ export class Backend implements backendInterface {
             }
         } else {
             const result = await this.actor.isCallerAdmin();
+            return result;
+        }
+    }
+    async saveBrush(arg0: BrushPreset): Promise<void> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.saveBrush(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.saveBrush(arg0);
             return result;
         }
     }
@@ -386,6 +491,20 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async savePreferences(arg0: UserPreferences): Promise<void> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.savePreferences(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.savePreferences(arg0);
+            return result;
+        }
+    }
     async saveUserSettings(arg0: SettingsSave): Promise<void> {
         if (this.processError) {
             try {
@@ -416,7 +535,10 @@ function from_candid_opt_n11(_uploadFile: (file: ExternalBlob) => Promise<Uint8A
 function from_candid_opt_n14(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_CanvasSave]): CanvasSave | null {
     return value.length === 0 ? null : value[0];
 }
-function from_candid_opt_n15(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_SettingsSave]): SettingsSave | null {
+function from_candid_opt_n15(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_UserPreferences]): UserPreferences | null {
+    return value.length === 0 ? null : value[0];
+}
+function from_candid_opt_n16(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_SettingsSave]): SettingsSave | null {
     return value.length === 0 ? null : value[0];
 }
 function from_candid_opt_n6(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [boolean]): boolean | null {

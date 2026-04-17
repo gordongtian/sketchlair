@@ -1,8 +1,5 @@
 import type { BrushSettings } from "@/components/BrushSettingsPanel";
-import {
-  BrushSettingsPanel,
-  ScratchpadDialog,
-} from "@/components/BrushSettingsPanel";
+import { BrushSettingsPanel } from "@/components/BrushSettingsPanel";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -55,6 +52,8 @@ interface ToolPresetsPanelProps {
   ) => void;
   currentSize?: number;
   currentOpacity?: number;
+  /** Called when the user clicks "Draw New" — opens the inline workspace brush tip editor */
+  onEnterBrushTipEditor?: (onAccept: (dataUrl: string) => void) => void;
 }
 
 const TOOL_LABELS: Record<"brush" | "smudge" | "eraser", string> = {
@@ -67,10 +66,12 @@ function BrushTipPickerDialog({
   availableTips,
   onPick,
   onCancel,
+  onEnterBrushTipEditor,
 }: {
   availableTips: { id: string; name: string; tipImageData?: string }[];
   onPick: (tipImageData?: string) => void;
   onCancel: () => void;
+  onEnterBrushTipEditor?: (onAccept: (dataUrl: string) => void) => void;
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -152,21 +153,22 @@ function BrushTipPickerDialog({
             <ImagePlus size={13} />
             Upload Image
           </Button>
-          <ScratchpadDialog
-            onSave={(dataUrl) => onPick(dataUrl)}
-            trigger={
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                data-ocid="brush.tip_picker.draw_button"
-                className="flex-1 text-xs gap-1.5"
-              >
-                <Pencil size={13} />
-                Draw New
-              </Button>
-            }
-          />
+          {onEnterBrushTipEditor ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-ocid="brush.tip_picker.draw_button"
+              className="flex-1 text-xs gap-1.5"
+              onClick={() => {
+                onCancel(); // close the picker dialog first
+                onEnterBrushTipEditor((dataUrl) => onPick(dataUrl));
+              }}
+            >
+              <Pencil size={13} />
+              Draw New
+            </Button>
+          ) : null}
         </div>
 
         <Button
@@ -211,6 +213,7 @@ export function ToolPresetsPanel({
   onClose: _onClose,
   onDeletePreset,
   onReorderPresets,
+  onEnterBrushTipEditor,
 }: ToolPresetsPanelProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
@@ -455,6 +458,7 @@ export function ToolPresetsPanel({
                             tipImageData: p.settings.tipImageData,
                           }))
                         }
+                        onEnterBrushTipEditor={onEnterBrushTipEditor}
                       />
                     </div>
 
@@ -644,6 +648,7 @@ export function ToolPresetsPanel({
                 }
                 onPick={handlePickTip}
                 onCancel={() => setTipPickerOpen(false)}
+                onEnterBrushTipEditor={onEnterBrushTipEditor}
               />
             </Dialog>
           </div>

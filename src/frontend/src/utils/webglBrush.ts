@@ -49,6 +49,7 @@ export interface WebGLBrushContext {
     dualSize2Scale?: number,
     dualAngle2?: number,
     capAlpha?: number,
+    minOpacity?: number,
   ): void;
   flushDisplay(opacityCap: number): void;
   clearMask(): void;
@@ -113,7 +114,8 @@ void main() {
   // The image encodes its own falloff — we only apply a hard boundary clip,
   // NOT a soft smoothstep, to avoid double-softening the gradient.
   vec2 scaledUv = (uv - 0.5) * u_sizeScale + 0.5;
-  vec3 tipRGB = texture2D(u_tip, scaledUv).rgb;
+  vec2 flippedUv = vec2(scaledUv.x, 1.0 - scaledUv.y);
+  vec3 tipRGB = texture2D(u_tip, flippedUv).rgb;
   float lum = dot(tipRGB, vec3(0.299, 0.587, 0.114));
   float tipAlpha = 1.0 - lum; // dark = opaque, light = transparent
 
@@ -153,7 +155,8 @@ void main() {
   float upper_d = 1.0 + halfAA_d;
 
   vec2 scaledUv = (uv - 0.5) * u_sizeScale + 0.5;
-  vec3 tipRGB1 = texture2D(u_tip1, scaledUv).rgb;
+  vec2 flippedUv1 = vec2(scaledUv.x, 1.0 - scaledUv.y);
+  vec3 tipRGB1 = texture2D(u_tip1, flippedUv1).rgb;
   float lum1 = dot(tipRGB1, vec3(0.299, 0.587, 0.114));
   float a1 = 1.0 - lum1;
 
@@ -173,7 +176,8 @@ void main() {
   // Previous code multiplied (wrong direction), this divides (correct)
   vec2 tip2_uv = tip2_rotated / max(u_size2scale, 0.01) + 0.5;
   tip2_uv = clamp(tip2_uv, 0.0, 1.0);
-  vec3 tipRGB2 = texture2D(u_tip2, tip2_uv).rgb;
+  vec2 tip2_flipped = vec2(tip2_uv.x, 1.0 - tip2_uv.y);
+  vec3 tipRGB2 = texture2D(u_tip2, tip2_flipped).rgb;
   float lum2 = dot(tipRGB2, vec3(0.299, 0.587, 0.114));
   float a2 = 1.0 - lum2;
 
@@ -219,6 +223,7 @@ const MASK_STAMP_FRAG = `
 precision highp float;
 uniform sampler2D u_tip;
 uniform float u_capAlpha;
+uniform float u_minOpacity;
 uniform float u_sizeScale;
 uniform float u_renderSize;
 varying vec2 v_texCoord;
@@ -236,40 +241,49 @@ void main() {
 
   // Image tip: perceptual luminance drives alpha (dark = opaque)
   vec2 scaledUv = (uv - 0.5) * u_sizeScale + 0.5;
-  vec3 tipRGB = texture2D(u_tip, scaledUv).rgb;
+  vec2 flippedUv = vec2(scaledUv.x, 1.0 - scaledUv.y);
+  vec3 tipRGB = texture2D(u_tip, flippedUv).rgb;
   float lum = dot(tipRGB, vec3(0.299, 0.587, 0.114));
   float tipAlpha = (1.0 - lum) * edgeFactor;
 
-  float maskVal = tipAlpha * u_capAlpha;
+  // BUG 1 FIX: apply minOpacity as a floor on capAlpha so that even at zero
+  // pressure the stamp contributes at least minOpacity to the MAX-blended ceiling.
+  // At minOpacity=0: max(0, capAlpha) = capAlpha — identical to previous behavior.
+  // At minOpacity=1: every stamp writes full opacity regardless of pressure.
+  float effectiveCapAlpha = max(u_minOpacity, u_capAlpha);
+  float maskVal = tipAlpha * effectiveCapAlpha;
   gl_FragColor = vec4(maskVal, maskVal, maskVal, maskVal);
 }
 `;
 
-// Flush-with-mask shader: stroke × mask multiply for pressure→opacity mode.
-// strokeFBO provides the accumulated color (premultiplied RGB from stamps, MAX blend).
+// Flush-with-mask shader: flow × mask composite for pressure→opacity mode (Option D).
+// flowFBO provides the source-over accumulated color (premultiplied RGB, actual flow rate).
 // pressureMaskFBO provides the pressure envelope (alpha ceiling, MAX blend).
-// finalAlpha = min(strokeAlpha, maskAlpha) — stroke is clamped to the pressure mask ceiling.
-// Per-stamp color jitter is preserved: RGB is read from strokeFBO (not a flat uniform).
+// strokeFBO is still written per-stamp (unchanged) but is no longer read here.
+// finalAlpha = min(flowAlpha, maskAlpha) — flow buildup is clamped to the pressure ceiling.
+// Per-stamp color jitter is preserved: RGB is read from flowFBO (same STAMP_FRAG output).
 // Dithering applied to break up 8-bit alpha quantization at stroke edges.
 const FLUSH_MASK_FRAG = `
 precision highp float;
 uniform sampler2D u_stroke;
 uniform sampler2D u_mask;
+uniform sampler2D u_flow;
 uniform float u_dither;
 uniform float u_opacityCap;
 varying vec2 v_uv;
 void main() {
-  // Dual-MAX path: both strokeFBO and pressureMaskFBO fill their spatial envelopes
-  // at the same rate (both using MAX blend per-stamp). min() of two smooth MAX
-  // envelopes is itself smooth — no per-stamp dips, no ribbing.
-  // strokeSample: premultiplied RGBA where RGB encodes per-stamp jittered color, A encodes coverage.
-  // maskAlpha: pressure ceiling.
-  vec4 strokeSample = texture2D(u_stroke, v_uv);
-  float strokeAlpha = strokeSample.a;
+  // Option D path: flowFBO (source-over, actual flow rate) provides the buildup alpha.
+  // pressureMaskFBO (MAX blend) provides the pressure ceiling.
+  // min() clamps the flow buildup to the pressure envelope — pressure sets the max,
+  // flow controls how quickly the stroke builds toward it.
+  // flowSample: premultiplied RGBA where RGB encodes per-stamp color, A encodes flow coverage.
+  // maskAlpha: pressure ceiling (highest pressure seen at each pixel across the stroke).
+  vec4 flowSample = texture2D(u_flow, v_uv);
+  float flowAlpha = flowSample.a;
   float maskAlpha = texture2D(u_mask, v_uv).r;
 
   // min: stroke can never exceed pressure ceiling; hard slider cap applied after.
-  float finalAlpha = min(strokeAlpha, maskAlpha);
+  float finalAlpha = min(flowAlpha, maskAlpha);
   finalAlpha = min(finalAlpha, u_opacityCap);
 
   // Apply dithering at display output only
@@ -278,9 +292,9 @@ void main() {
     finalAlpha = clamp(finalAlpha + dither / 255.0, 0.0, 1.0);
   }
 
-  // Recover straight RGB from premultiplied strokeFBO, then re-premultiply with finalAlpha.
-  // This preserves per-stamp color jitter stored in the stroke FBO's RGB channels.
-  vec3 straightColor = strokeAlpha > 0.0001 ? strokeSample.rgb / strokeAlpha : vec3(0.0);
+  // Recover straight RGB from premultiplied flowFBO, then re-premultiply with finalAlpha.
+  // This preserves per-stamp color jitter stored in the flow FBO's RGB channels.
+  vec3 straightColor = flowAlpha > 0.0001 ? flowSample.rgb / flowAlpha : vec3(0.0);
   gl_FragColor = vec4(straightColor * finalAlpha, finalAlpha);
 }
 `;
@@ -698,6 +712,7 @@ export function createWebGLBrushContext(
   let msUAngle: WebGLUniformLocation | null = null;
   let msUTip: WebGLUniformLocation | null = null;
   let msUCapAlpha: WebGLUniformLocation | null = null;
+  let msUMinOpacity: WebGLUniformLocation | null = null;
   if (maskStampProg) {
     msAPos = gl.getAttribLocation(maskStampProg, "a_position");
     msATexCoord = gl.getAttribLocation(maskStampProg, "a_texCoord");
@@ -709,18 +724,21 @@ export function createWebGLBrushContext(
     msUAngle = gl.getUniformLocation(maskStampProg, "u_angle");
     msUTip = gl.getUniformLocation(maskStampProg, "u_tip");
     msUCapAlpha = gl.getUniformLocation(maskStampProg, "u_capAlpha");
+    msUMinOpacity = gl.getUniformLocation(maskStampProg, "u_minOpacity");
   }
 
   // ---- Flush-mask program locations ----
   let fmAPos = -1;
   let fmUMask: WebGLUniformLocation | null = null;
   let fmUStroke: WebGLUniformLocation | null = null;
+  let fmUFlow: WebGLUniformLocation | null = null;
   let fmUDither: WebGLUniformLocation | null = null;
   let fmUOpacityCap: WebGLUniformLocation | null = null;
   if (flushMaskProg) {
     fmAPos = gl.getAttribLocation(flushMaskProg, "a_position");
     fmUMask = gl.getUniformLocation(flushMaskProg, "u_mask");
     fmUStroke = gl.getUniformLocation(flushMaskProg, "u_stroke");
+    fmUFlow = gl.getUniformLocation(flushMaskProg, "u_flow");
     fmUDither = gl.getUniformLocation(flushMaskProg, "u_dither");
     fmUOpacityCap = gl.getUniformLocation(flushMaskProg, "u_opacityCap");
   }
@@ -773,6 +791,16 @@ export function createWebGLBrushContext(
   let pressureMaskFBO = usingFloatFBO
     ? makeFBO(gl, width, height, FLOAT_INTERNAL_FORMAT, FLOAT_TYPE)
     : makeFBO(gl, width, height);
+
+  // Flow FBO (Option D): accumulates per-stamp color via source-over blend at actual flow rate.
+  // Only written in pressure→opacity mode. Provides genuine per-stamp deposit accumulation
+  // independent of the MAX-blended pressure ceiling in pressureMaskFBO.
+  // Flush reads min(flowFBO, pressureMaskFBO) — flow controls buildup rate, pressure sets ceiling.
+  // Allocated once at init and reused across all strokes — never allocated per stroke.
+  let flowFBO = usingFloatFBO
+    ? makeFBO(gl, width, height, FLOAT_INTERNAL_FORMAT, FLOAT_TYPE)
+    : makeFBO(gl, width, height);
+
   // Flag: true after any mask stamp has been written this stroke
   let _maskHasData = false;
 
@@ -883,6 +911,7 @@ export function createWebGLBrushContext(
     capAlpha: number,
     tex: WebGLTexture,
     angle: number,
+    minOpacity: number,
   ) {
     if (!maskStampProg || !pressureMaskFBO) return;
 
@@ -923,6 +952,9 @@ export function createWebGLBrushContext(
       _msAngle = angle;
     }
     gl.uniform1f(msUCapAlpha, capAlpha);
+    // BUG 1 FIX: pass minOpacity floor to shader — max(u_minOpacity, u_capAlpha) in GLSL.
+    // At minOpacity=0: no change. At minOpacity=1: all stamps at full opacity.
+    gl.uniform1f(msUMinOpacity, minOpacity);
 
     if (tex !== _msActiveTex) {
       gl.activeTexture(gl.TEXTURE0);
@@ -1176,6 +1208,13 @@ export function createWebGLBrushContext(
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
       }
+      // Clear flowFBO alongside strokeFBO and pressureMaskFBO at stroke start.
+      // Timing must be identical — all three are cleared together before the first stamp.
+      if (flowFBO) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, flowFBO.fbo);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
       _maskHasData = false;
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.clearColor(0, 0, 0, 0);
@@ -1183,10 +1222,17 @@ export function createWebGLBrushContext(
     },
 
     clearMask() {
-      // Clear the pressure mask FBO after stroke commit.
+      // Clear the pressure mask FBO and flow FBO after stroke commit.
       // Must be called after flushStrokeBuffer to avoid clearing before final display.
+      // Both are transient per-stroke buffers — neither persists beyond one stroke.
       if (pressureMaskFBO) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, pressureMaskFBO.fbo);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      }
+      if (flowFBO) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, flowFBO.fbo);
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -1222,6 +1268,8 @@ export function createWebGLBrushContext(
       if (strokeFBO) resizeFBOTex(gl, strokeFBO.tex, w, h, fboIF, fboType);
       if (pressureMaskFBO)
         resizeFBOTex(gl, pressureMaskFBO.tex, w, h, fboIF, fboType);
+      // flowFBO must be resized whenever the canvas is resized — same timing as strokeFBO/pressureMaskFBO.
+      if (flowFBO) resizeFBOTex(gl, flowFBO.tex, w, h, fboIF, fboType);
       // Clear each FBO after resize — resizeFBOTex reallocates texture storage with
       // undefined content. Leaving FBOs dirty causes GL errors and visual glitches
       // when a stroke is started immediately after resize.
@@ -1232,6 +1280,10 @@ export function createWebGLBrushContext(
       }
       if (pressureMaskFBO) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, pressureMaskFBO.fbo);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
+      if (flowFBO) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, flowFBO.fbo);
         gl.clear(gl.COLOR_BUFFER_BIT);
       }
       _maskHasData = false;
@@ -1265,6 +1317,7 @@ export function createWebGLBrushContext(
       dualSize2Scale = 1.0,
       dualAngle2 = 0.0,
       capAlpha = undefined as number | undefined,
+      minOpacity = 0,
     ) {
       if (!strokeFBO) return;
       const tex = getOrBuildTexture(tipImageData, defaultTipCanvas);
@@ -1277,15 +1330,17 @@ export function createWebGLBrushContext(
       // In normal mode, stampFlow controls per-stamp deposit rate as intended.
       const isPressureOpacityMode =
         capAlpha !== undefined && maskStampProg && pressureMaskFBO;
+      // stampFlow for strokeFBO: unchanged — still forced to 1.0 in pressure→opacity mode.
+      // (Change E: this line must NOT be modified — see Option D architecture)
       const stampFlow = isPressureOpacityMode ? 1.0 : opacity;
 
       // Pressure-mask architecture (pressure→opacity):
       // When capAlpha is provided, stamp the tip into pressureMaskFBO via MAX blend
       // in addition to the normal stroke stamp. The mask accumulates the pressure
-      // envelope; flushDisplay multiplies strokeFBO * pressureMaskFBO at display time.
+      // envelope; flushDisplay multiplies flowFBO * pressureMaskFBO at display time.
       // No ping-pong, no per-pixel ceiling in the stroke path — stamps are artifact-free.
       if (isPressureOpacityMode) {
-        doMaskStamp(x, y, size, capAlpha, tex, angle);
+        doMaskStamp(x, y, size, capAlpha, tex, angle, minOpacity);
         // Re-bind strokeFBO for normal stamp below (doMaskStamp left framebuffer unbound)
       }
 
@@ -1293,7 +1348,7 @@ export function createWebGLBrushContext(
       //
       // In pressure→opacity mode (capAlpha defined): use MAX blend on stroke FBO so it fills
       // its spatial envelope at the same rate as pressureMaskFBO. Both FBOs are smooth MAX
-      // envelopes; min(strokeMax, maskMax) at flush is artifact-free.
+      // envelopes. strokeFBO is still written here but is NOT read in the flush (flowFBO replaces it).
       // In normal mode: standard premultiplied source-over accumulation.
       gl.bindFramebuffer(gl.FRAMEBUFFER, strokeFBO.fbo);
       setBlend(isPressureOpacityMode ? "max" : "source_over");
@@ -1341,6 +1396,29 @@ export function createWebGLBrushContext(
         doStamp(x, y, size, stampFlow, tex, angle, softness, r, g, b);
       }
 
+      // 2. Option D — Write to flowFBO in pressure→opacity mode.
+      //
+      // flowFBO uses source-over blend and receives the ACTUAL flow value (opacity param),
+      // not the forced-1.0 stampFlow. This gives flow genuine per-stamp deposit semantics:
+      // low flow = slow source-over buildup toward the pressure ceiling,
+      // high flow = fast buildup. The flush reads min(flowFBO, pressureMaskFBO).
+      //
+      // STAMP_FRAG (lines 91-129) already computes flow × tipAlpha × tipTexture,
+      // so we reuse it by redirecting the draw to flowFBO with source-over blend.
+      //
+      // Eraser guard: eraser strokes do not pass capAlpha (isPressureOpacityMode is false),
+      // so this block is never entered for eraser strokes. The guard is implicit.
+      if (isPressureOpacityMode && flowFBO) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, flowFBO.fbo);
+        setBlend("source_over");
+        // Use doStamp with the actual flow value (opacity), not stampFlow (1.0).
+        // doStamp uses STAMP_FRAG which outputs flow × tipAlpha × tipTexture premultiplied.
+        doStamp(x, y, size, opacity, tex, angle, softness, r, g, b);
+        // Reset setup flag so the next stroke stamp (which may be regular or dual)
+        // re-binds its attribute arrays correctly after this extra render pass.
+        _stampProgSetup = false;
+      }
+
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     },
 
@@ -1359,26 +1437,35 @@ export function createWebGLBrushContext(
       _dActiveTex2 = null;
       _msActiveTex = null;
 
-      // Pressure-mask path: uses FLUSH_MASK_FRAG.
-      // pressureMaskFBO provides alpha ceiling (MAX pressure envelope).
-      // strokeFBO provides per-stamp jittered color (MAX color envelope).
-      // Per-stamp color jitter is preserved: shader reads RGB from strokeFBO directly.
-      if (_maskHasData && flushMaskProg && pressureMaskFBO) {
+      // Pressure-mask path: uses FLUSH_MASK_FRAG (Option D).
+      // pressureMaskFBO (TEXTURE0): pressure envelope alpha ceiling via MAX blend.
+      // strokeFBO (TEXTURE1): still bound as u_stroke (uniform still exists) but not read in the equation.
+      // flowFBO (TEXTURE2): source-over accumulated color at actual flow rate — replaces strokeFBO in the equation.
+      // Shader reads min(flowFBO_alpha, pressureMaskFBO_alpha) for the final alpha.
+      // Per-stamp color jitter is preserved: shader reads RGB from flowFBO directly.
+      if (_maskHasData && flushMaskProg && pressureMaskFBO && flowFBO) {
         // biome-ignore lint/correctness/useHookAtTopLevel: WebGL API, not React
         gl.useProgram(flushMaskProg);
         gl.bindBuffer(gl.ARRAY_BUFFER, quadVbo);
         gl.enableVertexAttribArray(fmAPos);
         gl.vertexAttribPointer(fmAPos, 2, gl.FLOAT, false, 0, 0);
 
-        // Stroke (color + coverage MAX envelope) on TEXTURE1, mask (pressure MAX) on TEXTURE0.
-        // Shader recovers per-stamp jitter colors from strokeFBO RGB instead of flat u_color.
+        // pressureMaskFBO (pressure MAX ceiling) on TEXTURE0.
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, pressureMaskFBO.tex);
         gl.uniform1i(fmUMask, 0);
 
+        // strokeFBO still bound to TEXTURE1 for the u_stroke uniform — unchanged.
+        // It is no longer read in the flush equation but the uniform still exists in the shader.
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, strokeFBO.tex);
         gl.uniform1i(fmUStroke, 1);
+
+        // flowFBO (source-over accumulated color at actual flow) on TEXTURE2.
+        // This is what FLUSH_MASK_FRAG actually reads for the alpha and RGB.
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, flowFBO.tex);
+        gl.uniform1i(fmUFlow, 2);
 
         // Hard ceiling: clamps final alpha to the opacity slider value in the shader.
         gl.uniform1f(fmUOpacityCap, opacityCap);
@@ -1387,6 +1474,8 @@ export function createWebGLBrushContext(
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
         // Unbind texture units
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, null);
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, null);
         gl.activeTexture(gl.TEXTURE0);
@@ -1441,6 +1530,11 @@ export function createWebGLBrushContext(
         gl.deleteFramebuffer(pressureMaskFBO.fbo);
         gl.deleteTexture(pressureMaskFBO.tex);
         pressureMaskFBO = null;
+      }
+      if (flowFBO) {
+        gl.deleteFramebuffer(flowFBO.fbo);
+        gl.deleteTexture(flowFBO.tex);
+        flowFBO = null;
       }
       if (stampVbo) gl.deleteBuffer(stampVbo);
       if (quadVbo) gl.deleteBuffer(quadVbo);

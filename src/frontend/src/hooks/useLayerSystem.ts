@@ -224,7 +224,10 @@ interface UseLayerSystemProps {
     commitFloat: (opts?: { keepSelection?: boolean }) => void;
     revertTransform: () => void;
     rasterizeSelectionMask: () => void;
-    extractFloat: (fromSel: boolean) => void;
+    extractFloat: (
+      fromSel: boolean,
+      opts?: { fromToolActivation?: boolean },
+    ) => void;
   }>;
   setLayerThumbnails: React.Dispatch<
     React.SetStateAction<Record<string, string>>

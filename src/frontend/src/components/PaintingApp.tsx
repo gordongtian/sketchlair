@@ -9,6 +9,7 @@ import {
   rgbToHex,
   rgbToHsv,
 } from "@/utils/colorUtils";
+import { exportAsPSD } from "@/utils/exportPsd";
 import type { FlatEntry } from "@/utils/groupUtils";
 import { resetGroupIdCounterFromFlat } from "@/utils/groupUtils";
 import {
@@ -60,8 +61,9 @@ import { useLineRuler } from "../hooks/useLineRuler";
 import { resetLiquifyField, useLiquifySystem } from "../hooks/useLiquifySystem";
 import { usePaintingCanvasEvents } from "../hooks/usePaintingCanvasEvents";
 import type { PaintingCanvasEventsCallbacks } from "../hooks/usePaintingCanvasEvents";
+import { brushPresetToPreset } from "../hooks/usePreferences";
 import { usePresetSystem } from "../hooks/usePresetSystem";
-import type { BrushSizes } from "../hooks/usePresetSystem";
+import type { BrushSizes, PresetsPayload } from "../hooks/usePresetSystem";
 import { useRulerUIHandlers } from "../hooks/useRulerUIHandlers";
 import { useSelectionSystem } from "../hooks/useSelectionSystem";
 import { useSnapSystem } from "../hooks/useSnapSystem";
@@ -79,6 +81,7 @@ import {
 import { getThumbCanvas, getThumbCtx } from "../utils/thumbnailCache";
 import { createWebGLBrushContext } from "../utils/webglBrush";
 import type { WebGLBrushContext } from "../utils/webglBrush";
+import { AdjustmentsPresetsPanel } from "./AdjustmentsPresetsPanel";
 import {
   BrushConflictDialog,
   CloudOverwriteDialog,
@@ -324,6 +327,13 @@ interface PaintingAppProps {
   registerLoadPresets?: (
     fn: (payload: import("../hooks/usePresetSystem").PresetsPayload) => void,
   ) => void;
+  /** Centralized preferences manager — passed from App so SettingsPanel can sync to canister */
+  preferences?: import("../hooks/usePreferences").PreferencesManager;
+  /**
+   * Called whenever the brush tip editor enters or exits so the parent can
+   * lock / unlock the document tab bar.
+   */
+  onBrushTipEditorActiveChange?: (active: boolean) => void;
 }
 
 export function PaintingApp({
@@ -335,10 +345,23 @@ export function PaintingApp({
   getCanvasHash,
   onPresetsMutated,
   registerLoadPresets,
+  preferences,
+  onBrushTipEditorActiveChange,
 }: PaintingAppProps = {}) {
   // Access DocumentContext to register imperative functions and react to document events
-  const { registerSwapFn, registerLoadFileFn, registerGetSktchBlobFn } =
-    useDocumentContext();
+  const {
+    registerSwapFn,
+    registerDiscardFlushFn,
+    registerLoadFileFn,
+    registerGetSktchBlobFn,
+    updateDocument,
+    activeDocumentId,
+    activeDocument,
+    openFileAsDocument,
+  } = useDocumentContext();
+  // Stable ref so callbacks never capture stale document state
+  const activeDocumentRef = useRef(activeDocument);
+  activeDocumentRef.current = activeDocument;
   // UI state
   const [activeTool, setActiveTool] = useState<Tool>("brush");
   const [activeRulerPresetType, setActiveRulerPresetType] =
@@ -347,6 +370,11 @@ export function PaintingApp({
   const isLoggedInRef = useRef(isLoggedIn);
   const cloudSaveRef = useRef(cloudSave);
   const getCanvasHashRef = useRef(getCanvasHash);
+  // Stable refs for DocumentContext callbacks so closures in useFileIOSystem never go stale
+  const updateDocumentRef = useRef(updateDocument);
+  updateDocumentRef.current = updateDocument;
+  const activeDocumentIdRef = useRef(activeDocumentId);
+  activeDocumentIdRef.current = activeDocumentId;
   isLoggedInRef.current = isLoggedIn;
   cloudSaveRef.current = cloudSave;
   getCanvasHashRef.current = getCanvasHash;
@@ -437,14 +465,91 @@ export function PaintingApp({
   // canvasWidthRef, canvasHeightRef → now in uiRefs group (declared below)
 
   const [webGLFallbackWarning, setWebGLFallbackWarning] = useState(false);
+  const [isPsdExporting, setIsPsdExporting] = useState(false);
+  const [isPngExporting, setIsPngExporting] = useState(false);
   const [activeSubpanel, setActiveSubpanel] = useState<Tool | null>("brush");
   const [leftSidebarCollapsed, setLeftSidebarCollapsed] = useState(false);
-  const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(false);
+  const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(() => {
+    // Default closed on mobile (touch/coarse pointer), open on desktop
+    if (typeof window !== "undefined") {
+      return window.matchMedia("(pointer: coarse)").matches;
+    }
+    return false;
+  });
+
+  // ── Brush tip editor state ─────────────────────────────────────────────────
+  // When active, the main workspace shows a 256×256 tip-editing canvas.
+  // The savedColor is restored on exit; the onAccept callback receives the
+  // grayscale data URL and passes it to the brush engine exactly as the old
+  // ScratchpadDialog did.
+  const [brushTipEditorMode, setBrushTipEditorMode] = useState<{
+    active: boolean;
+    onAccept: (dataUrl: string) => void;
+    savedColor: import("@/utils/colorUtils").HSVAColor;
+    grayLevel: number; // 0–255, slider value
+    // Snapshot of main doc state (layer canvases, layers, etc.) — stored in refs below
+  } | null>(null);
+  const brushTipEditorModeRef = useRef(brushTipEditorMode);
+  useEffect(() => {
+    brushTipEditorModeRef.current = brushTipEditorMode;
+  }, [brushTipEditorMode]);
+  // Saved canvas state for the main document — set on enter, restored on exit
+  const savedMainLayerCanvasesRef = useRef<Map<
+    string,
+    HTMLCanvasElement
+  > | null>(null);
+  const savedMainLayersRef = useRef<import("./LayersPanel").Layer[]>([]);
+  const savedMainActiveLayerIdRef = useRef<string>("");
+  const savedMainViewTransformRef = useRef<import("../types").ViewTransform>({
+    panX: 0,
+    panY: 0,
+    zoom: 1,
+    rotation: 0,
+  });
+  const savedMainCanvasWidthRef = useRef<number>(CANVAS_WIDTH);
+  const savedMainCanvasHeightRef = useRef<number>(CANVAS_HEIGHT);
+  const savedMainUndoStackRef = useRef<
+    import("../hooks/useLayerSystem").UndoEntry[]
+  >([]);
+  const savedMainRedoStackRef = useRef<
+    import("../hooks/useLayerSystem").UndoEntry[]
+  >([]);
+  // Layer canvases owned by the tip editor — created on enter, discarded on exit
+  const tipEditorLayerCanvasesRef = useRef<Map<string, HTMLCanvasElement>>(
+    new Map(),
+  );
+  // Saved right panel state — restored on brush tip editor exit
+  const savedRightSidebarCollapsedRef = useRef<boolean>(false);
+  const savedRightPanelWidthRef = useRef<number>(220);
+
+  // Notify parent when brush tip editor enters/exits
+  useEffect(() => {
+    onBrushTipEditorActiveChange?.(brushTipEditorMode?.active ?? false);
+  }, [brushTipEditorMode?.active, onBrushTipEditorActiveChange]);
+
+  // Beforeunload guard while brush tip editor is active
+  useEffect(() => {
+    if (!brushTipEditorMode?.active) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue =
+        "You have an unsaved brush tip. Accept or discard before leaving.";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [brushTipEditorMode?.active]);
   // Mobile layout state
   const { isMobile, forceDesktop, leftHanded, setForceDesktop, setLeftHanded } =
     useIsMobile();
   const [showMobileColorPanel, setShowMobileColorPanel] = useState(false);
   const [showMobilePresetsPanel, setShowMobilePresetsPanel] = useState(false);
+
+  // Auto-open mobile presets popup when adjustments subpanel becomes active
+  useEffect(() => {
+    if (isMobile && activeSubpanel === "adjustments") {
+      setShowMobilePresetsPanel(true);
+    }
+  }, [isMobile, activeSubpanel]);
 
   // ── Preset system ──────────────────────────────────────────────────────────
   // Call here after brushSizes/setBrushSizes, brushSettings/setBrushSettings,
@@ -496,6 +601,12 @@ export function PaintingApp({
     setActiveTool: (t) => setActiveTool(t),
     onPresetsMutated,
     isLoggedIn,
+    // FIX-WIRE-004: whenever the user creates/edits/deletes a preset, push the
+    // full serialized list into usePreferences so brushesRef stays current and
+    // syncUpload always reads the live state rather than a stale canister cache.
+    onBrushesChanged: (brushes) => {
+      preferences?.setBrushesDirectly(brushes);
+    },
   });
 
   // Register loadPresets with the parent so it can restore cloud presets on login.
@@ -506,6 +617,48 @@ export function PaintingApp({
     registerLoadPresets?.((payload) => loadPresetsRef.current(payload));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [registerLoadPresets]);
+
+  // FIX-WIRE-003: Register a download callback so that when syncDownload fetches
+  // brushes from the canister, they are pushed back into usePresetSystem and the
+  // brush UI reflects the cloud state immediately.
+  useEffect(() => {
+    if (!preferences?.registerOnDownload) return;
+    preferences.registerOnDownload((brushPresets) => {
+      // Convert BrushPreset[] (canister format) → Preset[] (UI format) per tool type
+      const brush: PresetsPayload["brush"] = [];
+      const smudge: PresetsPayload["smudge"] = [];
+      const eraser: PresetsPayload["eraser"] = [];
+      for (const bp of brushPresets) {
+        const preset = brushPresetToPreset(bp);
+        if (!preset) continue; // skip malformed entries
+        if (bp.id.startsWith("smear-") || bp.id.startsWith("smudge-")) {
+          smudge.push(preset);
+        } else if (bp.id.startsWith("eraser-")) {
+          eraser.push(preset);
+        } else {
+          brush.push(preset);
+        }
+      }
+      const payload: PresetsPayload = {
+        brush: brush.length > 0 ? brush : [],
+        smudge: smudge.length > 0 ? smudge : [],
+        eraser: eraser.length > 0 ? eraser : [],
+        activePresetIds: {
+          brush: brush[0]?.id ?? null,
+          smudge: smudge[0]?.id ?? null,
+          eraser: eraser[0]?.id ?? null,
+        },
+      };
+      console.log("[Preferences] Download callback: pushing brushes into UI", {
+        brush: brush.length,
+        smudge: smudge.length,
+        eraser: eraser.length,
+      });
+      loadPresetsRef.current(payload);
+    });
+    // preferences object identity is stable — registerOnDownload stores into a ref
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preferences?.registerOnDownload]);
 
   // Import dialog state (cloud overwrite — preset import/conflict dialogs are in usePresetSystem)
   const [showCloudOverwriteDialog, setShowCloudOverwriteDialog] =
@@ -521,6 +674,10 @@ export function PaintingApp({
   const [_isDraggingFloatState, setIsDraggingFloatState] = useState(false);
   const [brushBlendMode, setBrushBlendMode] = useState("source-over");
   const [rightPanelWidth, setRightPanelWidth] = useState(220);
+  const rightPanelWidthRef = useRef(220);
+  rightPanelWidthRef.current = rightPanelWidth;
+  const rightSidebarCollapsedRef = useRef(false);
+  rightSidebarCollapsedRef.current = rightSidebarCollapsed;
   const [leftSidebarWidth, setLeftSidebarWidth] = useState(220);
   const [wandTolerance, setWandTolerance] = useState(13);
   const [wandContiguous, setWandContiguous] = useState(true);
@@ -1569,7 +1726,6 @@ export function PaintingApp({
     fileLoadInputRef,
     handleSaveFile,
     handleSilentSave,
-    handleLoadFile,
   } = useFileIOSystem({
     layersRef,
     layerCanvasesRef,
@@ -1599,6 +1755,13 @@ export function PaintingApp({
     clearSelection,
     registerGetSktchBlob: registerGetSktchBlobFn,
     registerLoadFile: registerLoadFileFn,
+    onDocumentSaved: (filename: string) => {
+      // Update the active document's tab name in DocumentManager after a successful save
+      const docId = activeDocumentIdRef.current;
+      if (docId) {
+        updateDocumentRef.current(docId, { filename, isDirty: false });
+      }
+    },
   });
 
   // ── Multi-document swap ref ────────────────────────────────────────────────
@@ -1615,6 +1778,72 @@ export function PaintingApp({
   useEffect(() => {
     registerSwapFn((fromDoc, toDoc) => swapDocumentRef.current(fromDoc, toDoc));
   }, [registerSwapFn]);
+
+  // Register the discard flush callback with DocumentContext.
+  // DocumentManager calls this synchronously before removing a document from its array,
+  // ensuring all pixel data is cleared before any new document initializes.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: registerDiscardFlushFn is stable
+  useEffect(() => {
+    registerDiscardFlushFn((doc: DocumentState, isActiveDoc: boolean): void => {
+      console.warn(
+        `[Doc Flush] Flushing discarded document "${doc.filename}" (id=${doc.id}, isActive=${isActiveDoc})`,
+      );
+
+      // 1. Clear and release all layer canvases owned by the discarded document.
+      //    This prevents their pixel data from being reused by a new document.
+      for (const [layerId, canvas] of doc.layerCanvases) {
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+        } else {
+          console.warn(
+            `[Doc Flush] Could not get 2d context for layer canvas ${layerId} — canvas may already be detached`,
+          );
+        }
+        doc.layerCanvases.delete(layerId);
+      }
+
+      // 2. Null out pixelData on all paint layers so ImageData cannot be reused.
+      //    LayerPixelSnapshot.pixelData is the field; plain layers may not have it,
+      //    so we guard with a property check.
+      for (const layer of doc.layers) {
+        if (
+          layer &&
+          typeof layer === "object" &&
+          "pixelData" in layer &&
+          layer.pixelData !== null
+        ) {
+          (layer as { pixelData: ImageData | null }).pixelData = null;
+        }
+      }
+
+      // 3. Clear the display canvas — only needed when discarding the currently
+      //    active document (the display canvas is shared; inactive docs don't own it).
+      if (isActiveDoc && displayCanvasRef.current) {
+        const displayCtx = displayCanvasRef.current.getContext("2d");
+        if (displayCtx) {
+          displayCtx.clearRect(
+            0,
+            0,
+            displayCanvasRef.current.width,
+            displayCanvasRef.current.height,
+          );
+        }
+      }
+
+      // 4. Clear WebGL FBOs (strokeFBO, pressureMaskFBO, flowFBO) if the discarded
+      //    document was active. These transient buffers could hold stale stamp data
+      //    from an incomplete stroke on the discarded document.
+      //    The existing clear() method on WebGLBrushContext clears all three FBOs.
+      if (isActiveDoc && webglBrushRef.current) {
+        webglBrushRef.current.clear();
+      }
+
+      console.warn(
+        `[Doc Flush] Flush complete for "${doc.filename}" — layerCanvases cleared (map size now ${doc.layerCanvases.size})`,
+      );
+    });
+  }, [registerDiscardFlushFn]);
 
   // App-level initialization: themes, beforeunload guard, preset loading, hotkey reload
   useAppInitialization({
@@ -1640,7 +1869,310 @@ export function PaintingApp({
   // real pushHistory with unsaved-changes tracking.
   pushHistoryRef.current = pushHistory;
 
-  // ─── Adjustments system ────────────────────────────────────────────────────
+  // ─── Brush Tip Editor — enter / exit ─────────────────────────────────────
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
+  const enterBrushTipEditor = useCallback(
+    (onAccept: (dataUrl: string) => void) => {
+      const TIP_SIZE = 256;
+
+      // ── Save current main-document state into stable refs ──────────────
+      savedMainLayerCanvasesRef.current = layerCanvasesRef.current;
+      savedMainLayersRef.current = [...layersRef.current];
+      savedMainActiveLayerIdRef.current = activeLayerIdRef.current;
+      savedMainViewTransformRef.current = { ...viewTransformRef.current };
+      savedMainCanvasWidthRef.current = canvasWidthRef.current;
+      savedMainCanvasHeightRef.current = canvasHeightRef.current;
+      savedMainUndoStackRef.current = [...undoStackRef.current];
+      savedMainRedoStackRef.current = [...redoStackRef.current];
+      // Save right panel state so it can be fully restored on exit
+      savedRightSidebarCollapsedRef.current = rightSidebarCollapsedRef.current;
+      savedRightPanelWidthRef.current = rightPanelWidthRef.current;
+
+      // ── Create the 256×256 tip editor layers and canvases ──────────────
+      const bgId = generateLayerId();
+      const paintId = generateLayerId();
+
+      const bgCanvas = document.createElement("canvas");
+      bgCanvas.width = TIP_SIZE;
+      bgCanvas.height = TIP_SIZE;
+      const bgCtx = bgCanvas.getContext("2d")!;
+      bgCtx.fillStyle = "#ffffff";
+      bgCtx.fillRect(0, 0, TIP_SIZE, TIP_SIZE);
+
+      const paintCanvas = document.createElement("canvas");
+      paintCanvas.width = TIP_SIZE;
+      paintCanvas.height = TIP_SIZE;
+
+      const tipLayerCanvases = new Map<string, HTMLCanvasElement>();
+      tipLayerCanvases.set(bgId, bgCanvas);
+      tipLayerCanvases.set(paintId, paintCanvas);
+      tipEditorLayerCanvasesRef.current = tipLayerCanvases;
+
+      const bgLayer: Layer = {
+        id: bgId,
+        name: "Background",
+        type: "paint",
+        visible: true,
+        opacity: 1,
+        blendMode: "source-over",
+        isClippingMask: false,
+        alphaLock: false,
+      };
+      const paintLayer: Layer = {
+        id: paintId,
+        name: "Tip Layer",
+        type: "paint",
+        visible: true,
+        opacity: 1,
+        blendMode: "source-over",
+        isClippingMask: false,
+        alphaLock: false,
+      };
+      // paintLayer at index 0 (top), bgLayer at index 1 (bottom)
+      const tipLayers: Layer[] = [paintLayer, bgLayer];
+
+      // ── Compute zoom to fit 256×256 comfortably in the viewport ────────
+      const container = containerRef.current;
+      const fitZoom = container
+        ? Math.min(
+            (container.clientWidth * 0.7) / TIP_SIZE,
+            (container.clientHeight * 0.7) / TIP_SIZE,
+          )
+        : 1;
+      const tipViewTransform: import("../types").ViewTransform = {
+        panX: 0,
+        panY: 0,
+        zoom: Math.max(0.1, Math.min(fitZoom, 10)),
+        rotation: 0,
+      };
+
+      // ── Swap workspace to tip editor canvas ────────────────────────────
+      invalidateAllLayerBitmaps();
+      layerCanvasesRef.current = tipLayerCanvases;
+      canvasWidthRef.current = TIP_SIZE;
+      canvasHeightRef.current = TIP_SIZE;
+      layersRef.current = tipLayers;
+      activeLayerIdRef.current = paintId;
+      setActiveLayerIdForBitmap(paintId);
+      undoStackRef.current = [];
+      redoStackRef.current = [];
+      strokeCanvasCacheKeyRef.current++;
+      needsFullCompositeRef.current = true;
+      invalidateCompositeContextCaches();
+      _overlayCtxCached = null;
+
+      // Resize display and auxiliary canvases
+      if (displayCanvasRef.current) {
+        displayCanvasRef.current.width = TIP_SIZE;
+        displayCanvasRef.current.height = TIP_SIZE;
+      }
+      if (rulerCanvasRef.current) {
+        rulerCanvasRef.current.width = TIP_SIZE;
+        rulerCanvasRef.current.height = TIP_SIZE;
+      }
+      if (webglBrushRef.current)
+        webglBrushRef.current.resize(TIP_SIZE, TIP_SIZE);
+      for (const offscreen of [
+        belowActiveCanvasRef,
+        aboveActiveCanvasRef,
+        snapshotCanvasRef,
+        activePreviewCanvasRef,
+      ]) {
+        if (offscreen.current) {
+          offscreen.current.width = TIP_SIZE;
+          offscreen.current.height = TIP_SIZE;
+        }
+      }
+
+      viewTransformRef.current = tipViewTransform;
+      applyTransformToDOMRef.current(tipViewTransform);
+
+      // React state sync
+      const savedColor = colorRef.current ?? { h: 0, s: 0, v: 0.05, a: 1 };
+      // Set foreground to black for tip editing
+      const blackColor: import("@/utils/colorUtils").HSVAColor = {
+        h: 0,
+        s: 0,
+        v: 0,
+        a: 1,
+      };
+
+      setBrushTipEditorMode({
+        active: true,
+        onAccept,
+        savedColor,
+        grayLevel: 0,
+      });
+
+      requestAnimationFrame(() => {
+        setLayers([...tipLayers]);
+        setActiveLayerId(paintId);
+        setCanvasWidth(TIP_SIZE);
+        setCanvasHeight(TIP_SIZE);
+        setViewTransform(tipViewTransform);
+        setUndoCount(0);
+        setRedoCount(0);
+        setColor(blackColor);
+        layersRef.current = [...tipLayers];
+        composite();
+        updateNavigatorCanvas();
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
+  const exitBrushTipEditor = useCallback(
+    (accept: boolean) => {
+      const editorState = brushTipEditorModeRef.current;
+      if (!editorState) return;
+
+      if (accept) {
+        // ── Extract tip data from the display canvas (what the user sees) ──
+        // The display canvas is always the ground truth — the WebGL brush engine
+        // renders to it directly. Reading from it before any teardown guarantees
+        // we capture exactly the painted content, not a potentially stale layer canvas.
+        const displayCanvas = displayCanvasRef.current;
+        if (!displayCanvas) {
+          setBrushTipEditorMode(null);
+          return;
+        }
+        const TIP_SIZE = 256;
+
+        console.log(
+          "[BrushTipEditor] accepting — canvas:",
+          displayCanvas.width,
+          "x",
+          displayCanvas.height,
+        );
+
+        // Copy the WebGL display canvas into a 2D canvas so we can call getImageData.
+        // drawImage on a WebGL canvas into a 2D context composites the WebGL result correctly.
+        const flatCanvas = document.createElement("canvas");
+        flatCanvas.width = TIP_SIZE;
+        flatCanvas.height = TIP_SIZE;
+        const flatCtx = flatCanvas.getContext("2d")!;
+        flatCtx.drawImage(displayCanvas, 0, 0);
+
+        const imageData = flatCtx.getImageData(0, 0, TIP_SIZE, TIP_SIZE);
+        console.log(
+          "[BrushTipEditor] imageData non-zero pixels:",
+          imageData.data.filter((v: number, i: number) => i % 4 === 3 && v > 0)
+            .length,
+        );
+
+        // Grayscale conversion with luminance weights
+        const { data } = imageData;
+        for (let i = 0; i < data.length; i += 4) {
+          const gray = Math.round(
+            0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2],
+          );
+          data[i] = gray;
+          data[i + 1] = gray;
+          data[i + 2] = gray;
+        }
+
+        // Write grayscale data to a temp canvas and produce the data URL
+        const tempCanvas = document.createElement("canvas");
+        tempCanvas.width = TIP_SIZE;
+        tempCanvas.height = TIP_SIZE;
+        const tempCtx = tempCanvas.getContext("2d")!;
+        tempCtx.putImageData(imageData, 0, 0);
+        const dataUrl = tempCanvas.toDataURL("image/png");
+
+        // Hand off to the brush engine BEFORE any teardown begins
+        editorState.onAccept(dataUrl);
+      }
+
+      // ── Restore the main document ────────────────────────────────────
+      const savedLayerCanvases = savedMainLayerCanvasesRef.current;
+      if (!savedLayerCanvases) {
+        setBrushTipEditorMode(null);
+        return;
+      }
+      const savedLayers2 = savedMainLayersRef.current;
+      const savedActiveLayerId = savedMainActiveLayerIdRef.current;
+      const savedViewTransform = savedMainViewTransformRef.current;
+      const savedCW = savedMainCanvasWidthRef.current;
+      const savedCH = savedMainCanvasHeightRef.current;
+      const savedUndo = savedMainUndoStackRef.current;
+      const savedRedo = savedMainRedoStackRef.current;
+
+      // Discard tip editor canvases
+      for (const [, c] of tipEditorLayerCanvasesRef.current) {
+        const ctx = c.getContext("2d");
+        ctx?.clearRect(0, 0, c.width, c.height);
+      }
+      tipEditorLayerCanvasesRef.current = new Map();
+
+      // Swap back
+      invalidateAllLayerBitmaps();
+      layerCanvasesRef.current = savedLayerCanvases;
+      canvasWidthRef.current = savedCW;
+      canvasHeightRef.current = savedCH;
+      layersRef.current = [...savedLayers2];
+      activeLayerIdRef.current = savedActiveLayerId;
+      setActiveLayerIdForBitmap(savedActiveLayerId);
+      undoStackRef.current = [...savedUndo];
+      redoStackRef.current = [...savedRedo];
+      strokeCanvasCacheKeyRef.current++;
+      needsFullCompositeRef.current = true;
+      invalidateCompositeContextCaches();
+      _overlayCtxCached = null;
+
+      // Resize display and auxiliary canvases back
+      if (displayCanvasRef.current) {
+        displayCanvasRef.current.width = savedCW;
+        displayCanvasRef.current.height = savedCH;
+      }
+      if (rulerCanvasRef.current) {
+        rulerCanvasRef.current.width = savedCW;
+        rulerCanvasRef.current.height = savedCH;
+      }
+      if (webglBrushRef.current) webglBrushRef.current.resize(savedCW, savedCH);
+      for (const offscreen of [
+        belowActiveCanvasRef,
+        aboveActiveCanvasRef,
+        snapshotCanvasRef,
+        activePreviewCanvasRef,
+      ]) {
+        if (offscreen.current) {
+          offscreen.current.width = savedCW;
+          offscreen.current.height = savedCH;
+        }
+      }
+
+      viewTransformRef.current = savedViewTransform;
+      applyTransformToDOMRef.current(savedViewTransform);
+
+      // Restore saved color and right panel state
+      const savedColor = editorState.savedColor;
+      setBrushTipEditorMode(null);
+      setRightSidebarCollapsed(savedRightSidebarCollapsedRef.current);
+      setRightPanelWidth(savedRightPanelWidthRef.current);
+
+      requestAnimationFrame(() => {
+        setLayers([...savedLayers2]);
+        setActiveLayerId(savedActiveLayerId);
+        setCanvasWidth(savedCW);
+        setCanvasHeight(savedCH);
+        setViewTransform(savedViewTransform);
+        setUndoCount(savedUndo.length);
+        setRedoCount(savedRedo.length);
+        setColor(savedColor);
+        layersRef.current = [...savedLayers2];
+        composite();
+        updateNavigatorCanvas();
+      });
+
+      // Clear refs
+      savedMainLayerCanvasesRef.current = null;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
   const {
     handleAdjustmentsToggle,
     onAdjustmentsPreview,
@@ -3097,20 +3629,21 @@ export function PaintingApp({
     // Translate so that canvas-space 0,0 maps correctly
     ctx.translate(-W / 2, -H / 2);
 
+    const currentZoom = vt.zoom;
     if (presetType === "line") {
-      lineRuler.drawLineRulerOverlay(ctx, rulerLayer);
+      lineRuler.drawLineRulerOverlay(ctx, rulerLayer, currentZoom);
     } else if (presetType === "perspective-1pt") {
-      ruler1pt2pt.draw1ptRulerOverlay(ctx, rulerLayer);
+      ruler1pt2pt.draw1ptRulerOverlay(ctx, rulerLayer, currentZoom);
     } else if (presetType === "perspective-2pt") {
-      ruler1pt2pt.draw2ptRulerOverlay(ctx, rulerLayer);
+      ruler1pt2pt.draw2ptRulerOverlay(ctx, rulerLayer, currentZoom);
     } else if (presetType === "perspective-3pt") {
-      ruler3pt5pt.draw3ptRulerOverlay(ctx, rulerLayer, opacity);
+      ruler3pt5pt.draw3ptRulerOverlay(ctx, rulerLayer, opacity, currentZoom);
     } else if (presetType === "perspective-5pt") {
-      ruler3pt5pt.draw5ptRulerOverlay(ctx, rulerLayer, opacity);
+      ruler3pt5pt.draw5ptRulerOverlay(ctx, rulerLayer, opacity, currentZoom);
     } else if (presetType === "oval") {
-      ellipseGridRuler.drawOvalRulerOverlay(ctx, rulerLayer);
+      ellipseGridRuler.drawOvalRulerOverlay(ctx, rulerLayer, currentZoom);
     } else if (presetType === "grid") {
-      ellipseGridRuler.drawGridRulerOverlay(ctx, rulerLayer);
+      ellipseGridRuler.drawGridRulerOverlay(ctx, rulerLayer, currentZoom);
     }
 
     ctx.restore();
@@ -3158,25 +3691,118 @@ export function PaintingApp({
   // handleExportBrushes, handleImportBrushes, processImportAppend, resolveConflict
   // are now provided by usePresetSystem above.
 
+  /**
+   * Shared save-dialog helper for PNG and PSD export.
+   * Uses the File System Access API when available (Chrome/Edge) so the user
+   * can choose a name and save location. Falls back silently to a standard
+   * <a download> link for Firefox/Safari.
+   *
+   * Errors are propagated to the caller. AbortError (user cancelled) must be
+   * caught and silently ignored at the call site.
+   */
+  const exportWithSaveDialog = useCallback(
+    async (
+      blob: Blob,
+      defaultName: string,
+      fileType: { description: string; accept: Record<string, string[]> },
+    ): Promise<void> => {
+      if ("showSaveFilePicker" in window) {
+        // biome-ignore lint/suspicious/noExplicitAny: File System Access API not in TS lib
+        const fileHandle = await (window as any).showSaveFilePicker({
+          suggestedName: defaultName,
+          types: [fileType],
+        });
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+      } else {
+        // Fallback — silent, no indication that native dialog was unavailable
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = defaultName;
+        a.style.display = "none";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+    },
+    [],
+  );
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: displayCanvasRef is a stable ref
-  const handleExport = useCallback(() => {
+  const handleExport = useCallback(async () => {
     const display = displayCanvasRef.current;
     if (!display) return;
-    const exportCanvas = document.createElement("canvas");
-    exportCanvas.width = display.width;
-    exportCanvas.height = display.height;
-    const ctx = exportCanvas.getContext("2d", { willReadFrequently: !isIPad });
-    if (!ctx) return;
-    ctx.drawImage(display, 0, 0);
-    const link = document.createElement("a");
-    link.href = exportCanvas.toDataURL("image/png");
-    link.download = `painting-${Date.now()}.png`;
-    link.style.display = "none";
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    toast.success("Exported as PNG!");
-  }, []);
+
+    const doc = activeDocumentRef.current;
+    const baseName =
+      (doc?.filename ?? "untitled").replace(/\.sktch$/i, "").trim() ||
+      "untitled";
+    const defaultFilename = `${baseName}.png`;
+
+    setIsPngExporting(true);
+    try {
+      const exportCanvas = document.createElement("canvas");
+      exportCanvas.width = display.width;
+      exportCanvas.height = display.height;
+      const ctx = exportCanvas.getContext("2d", {
+        willReadFrequently: !isIPad,
+      });
+      if (!ctx) return;
+      ctx.drawImage(display, 0, 0);
+
+      // Use toBlob (async) for better memory handling and Blob API compatibility
+      const pngBlob = await new Promise<Blob | null>((resolve) =>
+        exportCanvas.toBlob(resolve, "image/png"),
+      );
+      if (!pngBlob) throw new Error("Failed to generate PNG data");
+
+      await exportWithSaveDialog(pngBlob, defaultFilename, {
+        description: "PNG Image",
+        accept: { "image/png": [".png"] },
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") return; // user cancelled
+      console.error("[PNG Export] Failed:", err);
+      alert(
+        `PNG export failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+      );
+    } finally {
+      setIsPngExporting(false);
+    }
+  }, [exportWithSaveDialog]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: stable refs + activeDocumentRef
+  const handleExportPSD = useCallback(async () => {
+    setIsPsdExporting(true);
+    try {
+      const doc = activeDocumentRef.current;
+      const baseName =
+        (doc?.filename ?? "untitled").replace(/\.sktch$/i, "").trim() ||
+        "untitled";
+      const psdBlob = await exportAsPSD({
+        layers: layersRef.current,
+        layerCanvasMap: layerCanvasesRef.current,
+        canvasWidth: canvasWidthRef.current,
+        canvasHeight: canvasHeightRef.current,
+        filename: baseName,
+      });
+      await exportWithSaveDialog(psdBlob, `${baseName}.psd`, {
+        description: "Photoshop Document",
+        accept: { "application/octet-stream": [".psd"] },
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") return; // user cancelled
+      console.error("[PSD Export] Failed:", err);
+      alert(
+        `PSD export failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+      );
+    } finally {
+      setIsPsdExporting(false);
+    }
+  }, [exportWithSaveDialog]);
 
   const handleSave = useCallback(async () => {
     // Save button always does silent local save (Ctrl+S behavior)
@@ -3441,6 +4067,7 @@ export function PaintingApp({
     selectionActionsRef,
     lastToolBeforeTransformRef,
     selectionBoundaryPathRef,
+    selectionActiveRef,
     prevToolRef,
     layersRef,
     lastPaintToolRef2,
@@ -3522,6 +4149,7 @@ export function PaintingApp({
       setActiveTool("move");
       setActiveSubpanel(null);
       composite();
+      markCanvasDirty(layerId);
     },
     handleSaveFile,
     handleSilentSave,
@@ -4078,7 +4706,7 @@ export function PaintingApp({
             isMobile={isMobile}
             leftHanded={leftHanded}
             fileLoadInputRef={fileLoadInputRef}
-            onFileLoad={handleLoadFile}
+            onFileLoad={openFileAsDocument}
           />
           {/* Left sidebar: Color Panel + Tool Presets — desktop only; mobile uses floating panels */}
           {!isMobile && (
@@ -4153,6 +4781,16 @@ export function PaintingApp({
               setEyedropperSampleSource={setEyedropperSampleSource}
               eyedropperSampleSize={eyedropperSampleSize}
               setEyedropperSampleSize={setEyedropperSampleSize}
+              onEnterBrushTipEditor={enterBrushTipEditor}
+              brushTipEditorActive={brushTipEditorMode?.active === true}
+              grayLevel={brushTipEditorMode?.grayLevel ?? 0}
+              onGrayLevelChange={(gv) => {
+                setBrushTipEditorMode((prev) =>
+                  prev ? { ...prev, grayLevel: gv } : prev,
+                );
+                // Map grayscale 0-255 → HSVA: h=0, s=0, v=gv/255
+                setColor({ h: 0, s: 0, v: gv / 255, a: 1 });
+              }}
             />
           )}{" "}
           {/* end mobile/desktop conditional for left sidebar */}
@@ -4219,6 +4857,9 @@ export function PaintingApp({
               }}
               onClear={handleClear}
               onExport={handleExport}
+              onExportPSD={handleExportPSD}
+              isPsdExporting={isPsdExporting}
+              isPngExporting={isPngExporting}
               onSave={handleSave}
               eyedropperSampleSource={eyedropperSampleSource}
               eyedropperSampleSize={eyedropperSampleSize}
@@ -4280,7 +4921,49 @@ export function PaintingApp({
               onLiquifyStrengthChange={setLiquifyStrength}
               onLiquifyScopeChange={setLiquifyScope}
               isMobile={isMobile}
+              brushTipEditorActive={brushTipEditorMode?.active === true}
             />
+            {/* ── Brush Tip Editor strip ── */}
+            {brushTipEditorMode?.active && (
+              <div
+                data-ocid="brush_tip_editor.strip"
+                className="flex items-center gap-3 px-3 py-1.5 shrink-0 border-b border-border z-10"
+                style={{
+                  backgroundColor: "oklch(var(--toolbar))",
+                  borderTop: "2px solid oklch(var(--accent))",
+                }}
+              >
+                {/* Label */}
+                <span
+                  className="text-xs font-semibold tracking-wide shrink-0"
+                  style={{ color: "oklch(var(--accent))" }}
+                >
+                  🖌 Brush Tip Editor
+                </span>
+
+                {/* Spacer */}
+                <div className="flex-1" />
+
+                {/* Cancel / Accept */}
+                <button
+                  type="button"
+                  data-ocid="brush_tip_editor.cancel_button"
+                  onClick={() => exitBrushTipEditor(false)}
+                  className="text-xs px-3 py-1 rounded border border-border text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors shrink-0"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  data-ocid="brush_tip_editor.accept_button"
+                  onClick={() => exitBrushTipEditor(true)}
+                  className="text-xs px-3 py-1 rounded text-primary-foreground shrink-0 font-medium transition-colors"
+                  style={{ backgroundColor: "oklch(var(--accent))" }}
+                >
+                  ✓ Accept
+                </button>
+              </div>
+            )}
             <CanvasArea
               containerRef={containerRef}
               displayCanvasRef={displayCanvasRef}
@@ -4381,236 +5064,257 @@ export function PaintingApp({
               onCanvasDoubleClick={handleCanvasDoubleClick}
               onSelectionOverlayCanvasRef={handleSelectionOverlayCanvasRef}
               onRulerCanvasRef={handleRulerCanvasRef}
+              mobileAdjustmentsPanel={
+                <AdjustmentsPresetsPanel
+                  activeLayerId={activeLayerId}
+                  activeLayerIsRuler={
+                    !!layers.find((l) => l.id === activeLayerId)?.isRuler
+                  }
+                  layerCanvasesRef={layerCanvasesRef}
+                  selectionMaskRef={selectionMaskRef}
+                  selectionActive={selectionActive}
+                  onPushUndo={onAdjustmentsPushUndo}
+                  onPreview={onAdjustmentsPreview}
+                  onComposite={onAdjustmentsComposite}
+                  onThumbnailUpdate={onAdjustmentsThumbnailUpdate}
+                  onMarkLayerDirty={onAdjustmentsMarkLayerDirty}
+                />
+              }
             />
           </div>
           {/* Right panel: Navigator + Layers */}
           {/* On mobile: hidden when collapsed (button in canvas overlay handles toggle) */}
-          {(!isMobile || !rightSidebarCollapsed) && (
-            <RightSidebarArea
-              isMobile={isMobile}
-              rightSidebarCollapsed={rightSidebarCollapsed}
-              rightPanelWidth={rightPanelWidth}
-              setRightPanelWidth={setRightPanelWidth}
-              setRightSidebarCollapsed={setRightSidebarCollapsed}
-              viewTransform={viewTransform}
-              onSetTransform={(t) => {
-                setViewTransform(t);
-                applyTransformToDOM(t);
-              }}
-              canvasWidth={canvasWidth}
-              canvasHeight={canvasHeight}
-              thumbnailCanvas={navigatorCanvasRef.current}
-              thumbnailVersion={navigatorVersion}
-              isFlipped={isFlipped}
-              layers={layers}
-              layerTree={[]}
-              activeLayerId={activeLayerId}
-              selectedLayerIds={selectedLayerIds}
-              layerThumbnails={layerThumbnails}
-              shiftHeld={shiftHeld}
-              onSetActive={(id) => {
-                const clickedLayer = layersRef.current.find((l) => l.id === id);
+          {/* Hidden entirely while brush tip editor is active — canvas expands to fill the space */}
+          {(!isMobile || !rightSidebarCollapsed) &&
+            !brushTipEditorMode?.active && (
+              <RightSidebarArea
+                isMobile={isMobile}
+                rightSidebarCollapsed={rightSidebarCollapsed}
+                rightPanelWidth={rightPanelWidth}
+                setRightPanelWidth={setRightPanelWidth}
+                setRightSidebarCollapsed={setRightSidebarCollapsed}
+                viewTransform={viewTransform}
+                onSetTransform={(t) => {
+                  setViewTransform(t);
+                  applyTransformToDOM(t);
+                }}
+                canvasWidth={canvasWidth}
+                canvasHeight={canvasHeight}
+                thumbnailCanvas={navigatorCanvasRef.current}
+                thumbnailVersion={navigatorVersion}
+                isFlipped={isFlipped}
+                layers={layers}
+                layerTree={[]}
+                activeLayerId={activeLayerId}
+                selectedLayerIds={selectedLayerIds}
+                layerThumbnails={layerThumbnails}
+                shiftHeld={shiftHeld}
+                onSetActive={(id) => {
+                  const clickedLayer = layersRef.current.find(
+                    (l) => l.id === id,
+                  );
 
-                // If a move/transform is in progress, commit it to history before switching layers
-                const wasTransformActive =
-                  transformActiveRef.current || isDraggingFloatRef.current;
-                if (wasTransformActive && !clickedLayer?.isRuler) {
-                  selectionActionsRef.current.commitFloat({
-                    keepSelection: false,
-                  });
-                }
-
-                if (clickedLayer?.isRuler) {
-                  // Switch to ruler tool when clicking a ruler layer
-                  lastPaintToolRef2.current =
-                    activeToolRef.current !== "ruler"
-                      ? activeToolRef.current
-                      : lastPaintToolRef2.current;
-                  lastPaintLayerIdRef.current =
-                    activeLayerIdRef.current !== id
-                      ? activeLayerIdRef.current
-                      : lastPaintLayerIdRef.current;
-                  // Sync active preset type from the ruler layer
-                  const presetType = (clickedLayer.rulerPresetType ??
-                    "perspective-1pt") as RulerPresetType;
-                  setActiveRulerPresetType(presetType);
-                  activeRulerPresetTypeRef.current = presetType;
-                  setActiveTool("ruler");
-                  setActiveSubpanel("ruler");
-                } else if (activeToolRef.current === "ruler") {
-                  // Switching away from ruler layer: restore paint tool
-                  collapseRulerHistory();
-                  const tool = lastPaintToolRef2.current;
-                  setActiveTool(tool);
-                  if (
-                    tool === "brush" ||
-                    tool === "smudge" ||
-                    tool === "eraser"
-                  ) {
-                    setActiveSubpanel(tool);
-                  } else {
-                    setActiveSubpanel(null);
-                  }
-                }
-                setActiveLayerId(id);
-                activeLayerIdRef.current = id;
-                if (!clickedLayer?.isRuler) {
-                  lastPaintLayerIdRef.current = id;
-                }
-
-                // If a transform was active, begin a new transform on the newly selected layer
-                if (
-                  wasTransformActive &&
-                  !clickedLayer?.isRuler &&
-                  activeToolRef.current === "move"
-                ) {
-                  const newLayerId = id;
-                  const lc = layerCanvasesRef.current.get(newLayerId);
-                  if (lc) {
-                    const ctx = lc.getContext("2d", {
-                      willReadFrequently: !isIPad,
+                  // If a move/transform is in progress, commit it to history before switching layers
+                  const wasTransformActive =
+                    transformActiveRef.current || isDraggingFloatRef.current;
+                  if (wasTransformActive && !clickedLayer?.isRuler) {
+                    selectionActionsRef.current.commitFloat({
+                      keepSelection: false,
                     });
-                    if (ctx) {
-                      const imageData = ctx.getImageData(
-                        0,
-                        0,
-                        lc.width,
-                        lc.height,
-                      );
-                      const { data, width, height } = imageData;
-                      let minX = width;
-                      let minY = height;
-                      let maxX = -1;
-                      let maxY = -1;
-                      for (let y = 0; y < height; y++) {
-                        for (let x = 0; x < width; x++) {
-                          const a = data[(y * width + x) * 4 + 3];
-                          if (a > 0) {
-                            if (x < minX) minX = x;
-                            if (x > maxX) maxX = x;
-                            if (y < minY) minY = y;
-                            if (y > maxY) maxY = y;
+                  }
+
+                  if (clickedLayer?.isRuler) {
+                    // Switch to ruler tool when clicking a ruler layer
+                    lastPaintToolRef2.current =
+                      activeToolRef.current !== "ruler"
+                        ? activeToolRef.current
+                        : lastPaintToolRef2.current;
+                    lastPaintLayerIdRef.current =
+                      activeLayerIdRef.current !== id
+                        ? activeLayerIdRef.current
+                        : lastPaintLayerIdRef.current;
+                    // Sync active preset type from the ruler layer
+                    const presetType = (clickedLayer.rulerPresetType ??
+                      "perspective-1pt") as RulerPresetType;
+                    setActiveRulerPresetType(presetType);
+                    activeRulerPresetTypeRef.current = presetType;
+                    setActiveTool("ruler");
+                    setActiveSubpanel("ruler");
+                  } else if (activeToolRef.current === "ruler") {
+                    // Switching away from ruler layer: restore paint tool
+                    collapseRulerHistory();
+                    const tool = lastPaintToolRef2.current;
+                    setActiveTool(tool);
+                    if (
+                      tool === "brush" ||
+                      tool === "smudge" ||
+                      tool === "eraser"
+                    ) {
+                      setActiveSubpanel(tool);
+                    } else {
+                      setActiveSubpanel(null);
+                    }
+                  }
+                  setActiveLayerId(id);
+                  activeLayerIdRef.current = id;
+                  if (!clickedLayer?.isRuler) {
+                    lastPaintLayerIdRef.current = id;
+                  }
+
+                  // If a transform was active, begin a new transform on the newly selected layer
+                  if (
+                    wasTransformActive &&
+                    !clickedLayer?.isRuler &&
+                    activeToolRef.current === "move"
+                  ) {
+                    const newLayerId = id;
+                    const lc = layerCanvasesRef.current.get(newLayerId);
+                    if (lc) {
+                      const ctx = lc.getContext("2d", {
+                        willReadFrequently: !isIPad,
+                      });
+                      if (ctx) {
+                        const imageData = ctx.getImageData(
+                          0,
+                          0,
+                          lc.width,
+                          lc.height,
+                        );
+                        const { data, width, height } = imageData;
+                        let minX = width;
+                        let minY = height;
+                        let maxX = -1;
+                        let maxY = -1;
+                        for (let y = 0; y < height; y++) {
+                          for (let x = 0; x < width; x++) {
+                            const a = data[(y * width + x) * 4 + 3];
+                            if (a > 0) {
+                              if (x < minX) minX = x;
+                              if (x > maxX) maxX = x;
+                              if (y < minY) minY = y;
+                              if (y > maxY) maxY = y;
+                            }
                           }
                         }
-                      }
-                      if (maxX >= minX && maxY >= minY) {
-                        const maskCanvas = document.createElement("canvas");
-                        maskCanvas.width = canvasWidthRef.current;
-                        maskCanvas.height = canvasHeightRef.current;
-                        const mCtx = maskCanvas.getContext("2d")!;
-                        mCtx.fillStyle = "white";
-                        mCtx.fillRect(
-                          minX,
-                          minY,
-                          maxX - minX + 1,
-                          maxY - minY + 1,
-                        );
-                        selectionMaskRef.current = maskCanvas;
-                        selectionGeometryRef.current = {
-                          type: "rect" as const,
-                          x: minX,
-                          y: minY,
-                          w: maxX - minX + 1,
-                          h: maxY - minY + 1,
-                        };
-                        selectionShapesRef.current = [
-                          selectionGeometryRef.current,
-                        ];
-                        selectionBoundaryPathRef.current.dirty = true;
-                        setSelectionActive(true);
-                        selectionActiveRef.current = true;
-                        selectionActionsRef.current.extractFloat(true);
+                        if (maxX >= minX && maxY >= minY) {
+                          const maskCanvas = document.createElement("canvas");
+                          maskCanvas.width = canvasWidthRef.current;
+                          maskCanvas.height = canvasHeightRef.current;
+                          const mCtx = maskCanvas.getContext("2d")!;
+                          mCtx.fillStyle = "white";
+                          mCtx.fillRect(
+                            minX,
+                            minY,
+                            maxX - minX + 1,
+                            maxY - minY + 1,
+                          );
+                          selectionMaskRef.current = maskCanvas;
+                          selectionGeometryRef.current = {
+                            type: "rect" as const,
+                            x: minX,
+                            y: minY,
+                            w: maxX - minX + 1,
+                            h: maxY - minY + 1,
+                          };
+                          selectionShapesRef.current = [
+                            selectionGeometryRef.current,
+                          ];
+                          selectionBoundaryPathRef.current.dirty = true;
+                          setSelectionActive(true);
+                          selectionActiveRef.current = true;
+                          selectionActionsRef.current.extractFloat(true);
+                        }
                       }
                     }
                   }
-                }
-              }}
-              onToggleVisible={(id) => {
-                const layer = layersRef.current.find((l) => l.id === id);
-                if (layer?.isRuler) {
-                  const nowHiding = layer.visible;
-                  const updFn = (l: Layer): Layer => {
-                    if (l.id !== id) return l;
-                    if (nowHiding) {
-                      // Hiding: save current rulerActive state, then turn ruler OFF
+                }}
+                onToggleVisible={(id) => {
+                  const layer = layersRef.current.find((l) => l.id === id);
+                  if (layer?.isRuler) {
+                    const nowHiding = layer.visible;
+                    const updFn = (l: Layer): Layer => {
+                      if (l.id !== id) return l;
+                      if (nowHiding) {
+                        // Hiding: save current rulerActive state, then turn ruler OFF
+                        return {
+                          ...l,
+                          visible: false,
+                          rulerActiveBeforeHide: l.rulerActive ?? true,
+                          rulerActive: false,
+                        };
+                      }
+                      // Showing: restore previously saved rulerActive state
                       return {
                         ...l,
-                        visible: false,
-                        rulerActiveBeforeHide: l.rulerActive ?? true,
-                        rulerActive: false,
+                        visible: true,
+                        rulerActive:
+                          l.rulerActiveBeforeHide ?? l.rulerActive ?? true,
+                        rulerActiveBeforeHide: undefined,
                       };
-                    }
-                    // Showing: restore previously saved rulerActive state
-                    return {
-                      ...l,
-                      visible: true,
-                      rulerActive:
-                        l.rulerActiveBeforeHide ?? l.rulerActive ?? true,
-                      rulerActiveBeforeHide: undefined,
                     };
-                  };
-                  // Update the ref synchronously FIRST so drawRulerOverlay
-                  // reads the new visibility value immediately.
-                  layersRef.current = layersRef.current.map(updFn);
-                  setLayers((prev) => prev.map(updFn));
-                  // Cancel any pending debounced RAF so it cannot override our
-                  // draw with stale state, then render immediately — no delay.
-                  if (rulerRafRef.current !== null) {
-                    cancelAnimationFrame(rulerRafRef.current);
-                    rulerRafRef.current = null;
+                    // Update the ref synchronously FIRST so drawRulerOverlay
+                    // reads the new visibility value immediately.
+                    layersRef.current = layersRef.current.map(updFn);
+                    setLayers((prev) => prev.map(updFn));
+                    // Cancel any pending debounced RAF so it cannot override our
+                    // draw with stale state, then render immediately — no delay.
+                    if (rulerRafRef.current !== null) {
+                      cancelAnimationFrame(rulerRafRef.current);
+                      rulerRafRef.current = null;
+                    }
+                    drawRulerOverlay();
+                  } else {
+                    handleToggleVisible(id);
                   }
-                  drawRulerOverlay();
-                } else {
-                  handleToggleVisible(id);
-                }
-              }}
-              onSetOpacity={handleSetOpacity}
-              onSetOpacityLive={handleSetOpacityLive}
-              onSetOpacityCommit={handleSetOpacityCommit}
-              onSetBlendMode={handleSetLayerBlendMode}
-              onAddLayer={handleAddLayer}
-              onDeleteLayer={(id) => {
-                const isRuler = layersRef.current.find(
-                  (l) => l.id === id,
-                )?.isRuler;
-                handleDeleteLayer(id);
-                if (isRuler) scheduleRulerOverlay();
-              }}
-              onReorderLayers={handleReorderLayers}
-              onClearLayer={handleClear}
-              onToggleClippingMask={handleToggleClippingMask}
-              onMergeLayers={handleMergeLayers}
-              onRenameLayer={handleRenameLayer}
-              onToggleAlphaLock={handleToggleAlphaLock}
-              onCtrlClickLayer={handleCtrlClickLayer}
-              onToggleRulerActive={(id) => {
-                const toggleFn = (l: Layer): Layer =>
-                  l.id === id
-                    ? { ...l, rulerActive: !(l.rulerActive ?? true) }
-                    : l;
-                setLayers((prev) => prev.map(toggleFn));
-                layersRef.current = layersRef.current.map(toggleFn);
-                scheduleRulerOverlay();
-              }}
-              onToggleGroupCollapse={_handleToggleGroupCollapse}
-              onRenameGroup={_handleRenameGroup}
-              onSetGroupOpacity={_handleSetGroupOpacity}
-              onSetGroupOpacityLive={_handleSetGroupOpacityLive}
-              onSetGroupOpacityCommit={_handleSetGroupOpacityCommit}
-              onToggleGroupVisible={_handleToggleGroupVisible}
-              onOpenDeleteGroup={(groupId) => {
-                const groupLayer = layers.find((l) => l.id === groupId);
-                const groupName = groupLayer?.name ?? "Group";
-                setDeleteGroupConfirm({ groupId, groupName });
-              }}
-              onReorderTree={_handleReorderTree}
-              onReorderTreeSilent={_handleReorderTreeSilent}
-              onReorderLayersSilent={_handleReorderLayersSilent}
-              onCommitReorderHistory={_handleCommitReorderHistory}
-              onToggleLayerSelection={_handleToggleLayerSelection}
-              onCreateGroup={handleCreateGroup}
-            />
-          )}{" "}
+                }}
+                onSetOpacity={handleSetOpacity}
+                onSetOpacityLive={handleSetOpacityLive}
+                onSetOpacityCommit={handleSetOpacityCommit}
+                onSetBlendMode={handleSetLayerBlendMode}
+                onAddLayer={handleAddLayer}
+                onDeleteLayer={(id) => {
+                  const isRuler = layersRef.current.find(
+                    (l) => l.id === id,
+                  )?.isRuler;
+                  handleDeleteLayer(id);
+                  if (isRuler) scheduleRulerOverlay();
+                }}
+                onReorderLayers={handleReorderLayers}
+                onClearLayer={handleClear}
+                onToggleClippingMask={handleToggleClippingMask}
+                onMergeLayers={handleMergeLayers}
+                onRenameLayer={handleRenameLayer}
+                onToggleAlphaLock={handleToggleAlphaLock}
+                onCtrlClickLayer={handleCtrlClickLayer}
+                onToggleRulerActive={(id) => {
+                  const toggleFn = (l: Layer): Layer =>
+                    l.id === id
+                      ? { ...l, rulerActive: !(l.rulerActive ?? true) }
+                      : l;
+                  setLayers((prev) => prev.map(toggleFn));
+                  layersRef.current = layersRef.current.map(toggleFn);
+                  scheduleRulerOverlay();
+                }}
+                onToggleGroupCollapse={_handleToggleGroupCollapse}
+                onRenameGroup={_handleRenameGroup}
+                onSetGroupOpacity={_handleSetGroupOpacity}
+                onSetGroupOpacityLive={_handleSetGroupOpacityLive}
+                onSetGroupOpacityCommit={_handleSetGroupOpacityCommit}
+                onToggleGroupVisible={_handleToggleGroupVisible}
+                onOpenDeleteGroup={(groupId) => {
+                  const groupLayer = layers.find((l) => l.id === groupId);
+                  const groupName = groupLayer?.name ?? "Group";
+                  setDeleteGroupConfirm({ groupId, groupName });
+                }}
+                onReorderTree={_handleReorderTree}
+                onReorderTreeSilent={_handleReorderTreeSilent}
+                onReorderLayersSilent={_handleReorderLayersSilent}
+                onCommitReorderHistory={_handleCommitReorderHistory}
+                onToggleLayerSelection={_handleToggleLayerSelection}
+                onCreateGroup={handleCreateGroup}
+                brushTipEditorActive={brushTipEditorMode?.active === true}
+              />
+            )}{" "}
           {/* end mobile right panel conditional */}
           {/* Settings Panel */}
           <SettingsPanel
@@ -4645,6 +5349,7 @@ export function PaintingApp({
             }}
             leftHanded={leftHanded}
             onLeftHandedChange={setLeftHanded}
+            preferences={preferences}
           />
           {/* Cloud Overwrite Confirmation Dialog */}
           <CloudOverwriteDialog

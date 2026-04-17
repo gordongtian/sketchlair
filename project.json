@@ -1,0 +1,28 @@
+{
+  "overview": "SketchLair is a professional digital painting web application with multi-document workflows, an advanced brush engine, ruler and perspective tools, layer groups, and PSD export. User preferences including brushes, settings, themes, and hotkeys persist on-chain via ICP canister, available across all devices and sessions.",
+  "features": [
+    "Multi-document tab workflow for simultaneous canvases",
+    "Advanced WebGL brush engine with pressure, flow, and opacity control",
+    "Persistent user preferences stored on-chain via ICP canister",
+    "Cross-device brush presets, settings, themes, and hotkey sync",
+    "Unauthenticated fallback with export/import preferences JSON",
+    "Perspective rulers (1, 2, 3, 5-point), ellipse, and symmetry",
+    "Layer groups with flat-array architecture",
+    "PSD and PNG export with native save dialog",
+    "Schema-versioned preferences with migration support",
+    "Debounced canister writes to minimize latency and cycles cost"
+  ],
+  "category": "productivity",
+  "tags": [
+    "digital-art",
+    "painting",
+    "canvas",
+    "icp",
+    "preferences",
+    "brush",
+    "layers",
+    "psd-export",
+    "perspective-rulers"
+  ],
+  "last_updated": "2026-04-16T17:19:32.609Z"
+}

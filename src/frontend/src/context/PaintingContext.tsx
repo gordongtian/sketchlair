@@ -40,7 +40,10 @@ export interface SelectionActions {
   commitFloat: (opts?: { keepSelection?: boolean }) => void;
   revertTransform: () => void;
   rasterizeSelectionMask: () => void;
-  extractFloat: (fromSel: boolean) => void;
+  extractFloat: (
+    fromSel: boolean,
+    opts?: { fromToolActivation?: boolean },
+  ) => void;
 }
 
 export interface PaintingContextValue {

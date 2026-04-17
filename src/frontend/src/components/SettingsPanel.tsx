@@ -1,4 +1,5 @@
 import { Label } from "@/components/ui/label";
+import type { PreferencesManager } from "@/hooks/usePreferences";
 import {
   type ThemeId,
   applyThemeOverrides,
@@ -7,9 +8,11 @@ import {
 } from "@/utils/themeOverrides";
 import {
   Activity,
+  Cloud,
   Download,
   Hand,
   Keyboard,
+  Loader2,
   LogIn,
   LogOut,
   Monitor,
@@ -26,7 +29,7 @@ import { HotkeyEditor } from "./HotkeyEditor";
 import { PressureCurveEditor } from "./PressureCurveEditor";
 import { ThemeColorEditor } from "./ThemeColorEditor";
 
-const THEME_KEY = "heavybrush-theme";
+const THEME_KEY = "sl-theme";
 
 const THEMES: { id: ThemeId; label: string }[] = [
   { id: "light", label: "Light" },
@@ -52,6 +55,19 @@ const ALL_THEME_CLASSES = [
   "theme-everforest-dark",
   "theme-everforest-light",
 ];
+
+function formatRelativeTime(ts: number | null): string {
+  if (ts === null) return "Never";
+  const diffMs = Date.now() - ts;
+  const diffSecs = Math.floor(diffMs / 1000);
+  if (diffSecs < 10) return "just now";
+  if (diffSecs < 60) return `${diffSecs}s ago`;
+  const diffMins = Math.floor(diffSecs / 60);
+  if (diffMins < 60) return `${diffMins}m ago`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+  return new Date(ts).toLocaleDateString();
+}
 
 function applyThemeClass(themeId: ThemeId) {
   const el = document.documentElement;
@@ -87,6 +103,8 @@ export interface SettingsPanelProps {
   onForceDesktopChange?: (v: boolean) => void;
   leftHanded?: boolean;
   onLeftHandedChange?: (v: boolean) => void;
+  /** Centralized preferences manager — optional; enables canister sync */
+  preferences?: PreferencesManager;
 }
 
 export function SettingsPanel({
@@ -108,6 +126,7 @@ export function SettingsPanel({
   onForceDesktopChange,
   leftHanded = false,
   onLeftHandedChange,
+  preferences,
 }: SettingsPanelProps) {
   const [themeId, setThemeId] = useState<ThemeId>(() => {
     const stored = localStorage.getItem(THEME_KEY);
@@ -116,6 +135,12 @@ export function SettingsPanel({
   });
   const [showThemeEditor, setShowThemeEditor] = useState(false);
   const [showHotkeyEditor, setShowHotkeyEditor] = useState(false);
+  // Tick counter so relative timestamps re-render every 30s
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((n) => n + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const themeFileInputRef = useRef<HTMLInputElement>(null);
@@ -205,11 +230,30 @@ export function SettingsPanel({
     setThemeId(id);
   }, []);
 
+  // Sync theme state when canister preferences load (initial login/visit) OR after Download
+  const prefsTheme = preferences?.settings.theme;
+  useEffect(() => {
+    if (!prefsTheme) return;
+    if (THEMES.some((t) => t.id === prefsTheme)) {
+      const id = prefsTheme as ThemeId;
+      setThemeId(id);
+      localStorage.setItem(THEME_KEY, id);
+      applyThemeClass(id);
+      applyThemeOverrides(id);
+    }
+  }, [prefsTheme]);
+
+  const prefImportRef = useRef<HTMLInputElement>(null);
+
   const handleThemeChange = (id: ThemeId) => {
     setThemeId(id);
     localStorage.setItem(THEME_KEY, id);
     applyThemeClass(id);
     applyThemeOverrides(id);
+    // Sync to canister (discrete write — fires immediately)
+    preferences
+      ?.updateSettings({ theme: id })
+      .catch((e) => console.warn("[SettingsPanel] Failed to sync theme:", e));
   };
 
   const handleImportClick = () => {
@@ -654,6 +698,141 @@ export function SettingsPanel({
             Import Brushes
           </button>
 
+          {/* Preferences sync section */}
+          <div className="border-t border-border/40 pt-3 space-y-1">
+            <Label className="text-xs text-muted-foreground uppercase tracking-wide block mb-2">
+              Preferences
+            </Label>
+            {!isLoggedIn && (
+              <div
+                data-ocid="settings.sync_notice"
+                className="flex items-start gap-2 px-2 py-2 rounded text-xs text-muted-foreground border border-border/30 bg-muted/10 mb-2"
+              >
+                <Cloud
+                  size={12}
+                  className="shrink-0 mt-0.5 text-muted-foreground/60"
+                />
+                <span>Sign in to save preferences across devices</span>
+              </div>
+            )}
+            {isLoggedIn && (
+              <div data-ocid="settings.sync_status" className="space-y-1.5">
+                {/* Last uploaded / last downloaded — two separate lines */}
+                <div className="px-1 py-1 space-y-1">
+                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Upload
+                      size={11}
+                      className="shrink-0 text-muted-foreground/60"
+                    />
+                    <span className="truncate">
+                      Last uploaded:{" "}
+                      {preferences?.isUploadingSyncing ? (
+                        <Loader2 size={11} className="inline animate-spin" />
+                      ) : (
+                        formatRelativeTime(preferences?.lastUploaded ?? null)
+                      )}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Download
+                      size={11}
+                      className="shrink-0 text-muted-foreground/60"
+                    />
+                    <span className="truncate">
+                      Last downloaded:{" "}
+                      {preferences?.isDownloadingSyncing ? (
+                        <Loader2 size={11} className="inline animate-spin" />
+                      ) : (
+                        formatRelativeTime(preferences?.lastDownloaded ?? null)
+                      )}
+                    </span>
+                  </div>
+                </div>
+                {/* Per-direction error messages */}
+                {preferences?.uploadError && (
+                  <div
+                    data-ocid="settings.sync_upload.error_state"
+                    className="px-2 py-1.5 rounded text-xs text-destructive border border-destructive/30 bg-destructive/10"
+                  >
+                    {preferences.uploadError}
+                  </div>
+                )}
+                {preferences?.downloadError && (
+                  <div
+                    data-ocid="settings.sync_download.error_state"
+                    className="px-2 py-1.5 rounded text-xs text-destructive border border-destructive/30 bg-destructive/10"
+                  >
+                    {preferences.downloadError}
+                  </div>
+                )}
+                <div className="flex gap-1.5">
+                  <button
+                    type="button"
+                    data-ocid="settings.sync_upload_button"
+                    disabled={preferences?.isSyncing}
+                    title="Push your local brushes and settings to the cloud"
+                    aria-label="Push your local brushes and settings to the cloud"
+                    onClick={() => preferences?.syncUpload()}
+                    className="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded text-xs border border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {preferences?.isUploadingSyncing ? (
+                      <Loader2 size={11} className="animate-spin" />
+                    ) : (
+                      <Upload size={11} />
+                    )}
+                    Upload
+                  </button>
+                  <button
+                    type="button"
+                    data-ocid="settings.sync_download_button"
+                    disabled={preferences?.isSyncing}
+                    title="Pull your saved brushes and settings from the cloud"
+                    aria-label="Pull your saved brushes and settings from the cloud"
+                    onClick={() => preferences?.syncDownload()}
+                    className="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded text-xs border border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {preferences?.isDownloadingSyncing ? (
+                      <Loader2 size={11} className="animate-spin" />
+                    ) : (
+                      <Download size={11} />
+                    )}
+                    Download
+                  </button>
+                </div>
+              </div>
+            )}
+            <button
+              type="button"
+              data-ocid="settings.export_preferences_button"
+              onClick={() => preferences?.exportPreferences()}
+              className="w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+            >
+              <Download size={14} />
+              Export Preferences
+            </button>
+            <button
+              type="button"
+              data-ocid="settings.import_preferences_button"
+              onClick={() => prefImportRef.current?.click()}
+              className="w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+            >
+              <Upload size={14} />
+              Import Preferences
+            </button>
+            <input
+              ref={prefImportRef}
+              type="file"
+              accept=".json"
+              className="hidden"
+              data-ocid="settings.preferences_upload_button"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) preferences?.importPreferences(file);
+                if (prefImportRef.current) prefImportRef.current.value = "";
+              }}
+            />
+          </div>
+
           {/* Theme Export/Import */}
           <div className="border-t border-border/40 pt-3 space-y-1">
             <Label className="text-xs text-muted-foreground uppercase tracking-wide block mb-2">
@@ -710,7 +889,18 @@ export function SettingsPanel({
 
       {/* Hotkey Editor — rendered outside panel via portal inside HotkeyEditor */}
       {showHotkeyEditor && (
-        <HotkeyEditor onClose={() => setShowHotkeyEditor(false)} />
+        <HotkeyEditor
+          onClose={() => setShowHotkeyEditor(false)}
+          onHotkeysChanged={(updated) => {
+            preferences
+              ?.updateHotkeys({
+                assignments: JSON.stringify(Object.values(updated)),
+              })
+              .catch((e) =>
+                console.warn("[SettingsPanel] Failed to sync hotkeys:", e),
+              );
+          }}
+        />
       )}
     </>
   );

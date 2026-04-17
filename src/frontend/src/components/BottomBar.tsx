@@ -1,3 +1,9 @@
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Slider } from "@/components/ui/slider";
 import {
   Tooltip,
@@ -6,7 +12,15 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { BLEND_MODES } from "@/utils/constants";
-import { Download, Redo2, Save, Trash2, Undo2 } from "lucide-react";
+import {
+  Download,
+  FileImage,
+  Loader2,
+  Redo2,
+  Save,
+  Trash2,
+  Undo2,
+} from "lucide-react";
 import React from "react";
 import { toast } from "sonner";
 import type { Layer } from "./LayersPanel";
@@ -32,6 +46,9 @@ interface BottomBarProps {
   onRedo: () => void;
   onClear: () => void;
   onExport: () => void;
+  onExportPSD?: () => void;
+  isPsdExporting?: boolean;
+  isPngExporting?: boolean;
   onSave: () => void;
   // Eyedropper
   eyedropperSampleSource: "canvas" | "layer";
@@ -72,6 +89,8 @@ interface BottomBarProps {
   onLiquifyScopeChange: (s: "active" | "all-visible") => void;
   // Mobile
   isMobile?: boolean;
+  // Brush tip editor mode — hides save/export
+  brushTipEditorActive?: boolean;
 }
 
 function SyncedNumberInput({
@@ -190,6 +209,9 @@ export function BottomBar({
   onRedo,
   onClear,
   onExport,
+  onExportPSD,
+  isPsdExporting = false,
+  isPngExporting = false,
   onSave,
   eyedropperSampleSource,
   eyedropperSampleSize,
@@ -223,6 +245,7 @@ export function BottomBar({
   onLiquifyStrengthChange,
   onLiquifyScopeChange,
   isMobile = false,
+  brushTipEditorActive = false,
 }: BottomBarProps) {
   const renderToolControls = () => {
     // Crop tool
@@ -984,36 +1007,69 @@ export function BottomBar({
             <TooltipContent>Clear Layer</TooltipContent>
           </Tooltip>
 
-          {/* Export */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                data-ocid="bottombar.export_button"
-                onClick={onExport}
-                className="w-8 h-8 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-              >
-                <Download size={16} />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent>Export PNG</TooltipContent>
-          </Tooltip>
+          {/* Export dropdown — hidden in brush tip editor mode */}
+          {!brushTipEditorActive && (
+            <DropdownMenu>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      data-ocid="bottombar.export_button"
+                      className="w-8 h-8 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                    >
+                      <Download size={16} />
+                    </button>
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent>Export</TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  data-ocid="bottombar.export_png_item"
+                  onClick={onExport}
+                  disabled={isPngExporting}
+                >
+                  {isPngExporting ? (
+                    <Loader2 size={14} className="mr-2 animate-spin shrink-0" />
+                  ) : (
+                    <FileImage size={14} className="mr-2 shrink-0" />
+                  )}
+                  {isPngExporting ? "Exporting…" : "PNG Image"}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  data-ocid="bottombar.export_psd_item"
+                  onClick={onExportPSD}
+                  disabled={!onExportPSD || isPsdExporting}
+                >
+                  {isPsdExporting ? (
+                    <Loader2 size={14} className="mr-2 animate-spin shrink-0" />
+                  ) : (
+                    <Download size={14} className="mr-2 shrink-0 opacity-50" />
+                  )}
+                  {isPsdExporting ? "Exporting…" : "Photoshop (.psd)"}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
 
-          {/* Save */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                data-ocid="bottombar.save_button"
-                onClick={onSave}
-                className="flex items-center gap-1.5 px-3 h-8 rounded bg-primary text-primary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
-              >
-                <Save size={13} />
-                Save
-              </button>
-            </TooltipTrigger>
-            <TooltipContent>Save</TooltipContent>
-          </Tooltip>
+          {/* Save — hidden in brush tip editor mode */}
+          {!brushTipEditorActive && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  data-ocid="bottombar.save_button"
+                  onClick={onSave}
+                  className="flex items-center gap-1.5 px-3 h-8 rounded bg-primary text-primary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
+                >
+                  <Save size={13} />
+                  Save
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>Save</TooltipContent>
+            </Tooltip>
+          )}
         </div>
       </div>
     </TooltipProvider>

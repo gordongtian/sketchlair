@@ -154,7 +154,10 @@ export function useTransformSystem({
 
   // Actions ref — populated by the useEffect blocks below
   const transformActionsRef = useRef({
-    extractFloat: (_fromSel: boolean) => {},
+    extractFloat: (
+      _fromSel: boolean,
+      _opts?: { fromToolActivation?: boolean },
+    ) => {},
     commitFloat: (_opts?: { keepSelection?: boolean }) => {},
     revertTransform: () => {},
     getTransformHandles: () =>
@@ -300,7 +303,7 @@ export function useTransformSystem({
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: setIsTransformActive is a stable React setter
   const extractFloat = useCallback(
-    (fromSelection: boolean) => {
+    (fromSelection: boolean, opts?: { fromToolActivation?: boolean }) => {
       const selectedIds = selectedLayerIdsRef?.current ?? new Set<string>();
 
       // Count the number of paintable layers actually selected
@@ -320,7 +323,7 @@ export function useTransformSystem({
         const resolvedLayers = _resolveSelectedLayers();
         if (resolvedLayers.length === 0) {
           // Fallback to single-layer if resolution fails
-          return _extractSingleLayer(fromSelection);
+          return _extractSingleLayer(fromSelection, opts);
         }
 
         // Use the active layer to determine canvas size (authoritative post-crop)
@@ -461,7 +464,9 @@ export function useTransformSystem({
               h: unionMaxY - unionMinY,
             };
           } else {
-            // All layers empty — small centered fallback
+            // All layers empty — skip bounding box when called from tool activation;
+            // fall back to a small centered box only when triggered by pointer-down.
+            if (opts?.fromToolActivation) return;
             const fallbackSize = Math.min(64, currentW / 4, currentH / 4);
             bounds = {
               x: currentW / 2 - fallbackSize / 2,
@@ -533,7 +538,7 @@ export function useTransformSystem({
       }
 
       // ── Single-layer path (unchanged) ────────────────────────────────────
-      _extractSingleLayer(fromSelection);
+      _extractSingleLayer(fromSelection, opts);
     },
     [
       compositeRef,
@@ -555,7 +560,10 @@ export function useTransformSystem({
    * Single-layer float extraction — called when only one layer is active.
    * This path is UNCHANGED from the original implementation.
    */
-  function _extractSingleLayer(fromSelection: boolean) {
+  function _extractSingleLayer(
+    fromSelection: boolean,
+    opts?: { fromToolActivation?: boolean },
+  ) {
     // Clear multi-layer state from any prior session
     multiFloatCanvasesRef.current.clear();
     multiLayerPreSnapshotsRef.current.clear();
@@ -667,8 +675,13 @@ export function useTransformSystem({
           w: scanMaxX - scanMinX,
           h: scanMaxY - scanMinY,
         };
+      } else if (opts?.fromToolActivation) {
+        // Empty layer and called from tool activation — restore the layer canvas
+        // and bail without showing a degenerate bounding box.
+        ctx.putImageData(beforeClear, 0, 0);
+        return;
       }
-      // If no content found, fall back to full canvas (bounds already set above).
+      // If no content found and called from pointer-down, fall back to full canvas (bounds already set above).
     }
 
     moveFloatCanvasRef.current = fc;

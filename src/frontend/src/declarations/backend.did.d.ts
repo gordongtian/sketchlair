@@ -10,8 +10,34 @@ import type { ActorMethod } from '@icp-sdk/core/agent';
 import type { IDL } from '@icp-sdk/core/candid';
 import type { Principal } from '@icp-sdk/core/principal';
 
+export interface AppSettings {
+  'uiScale' : number,
+  'theme' : string,
+  'canvasBackground' : string,
+  'modifiedAt' : bigint,
+  'otherSettings' : string,
+}
+export interface BrushPreset {
+  'id' : string,
+  'modifiedAt' : bigint,
+  'name' : string,
+  'createdAt' : bigint,
+  'settings' : string,
+  'isDefault' : boolean,
+}
 export type CanvasSave = string;
+export interface HotkeyAssignments {
+  'assignments' : string,
+  'modifiedAt' : bigint,
+}
 export type SettingsSave = string;
+export interface UserPreferences {
+  'brushes' : Array<BrushPreset>,
+  'hotkeys' : HotkeyAssignments,
+  'lastModified' : bigint,
+  'settings' : AppSettings,
+  'schemaVersion' : bigint,
+}
 export interface UserProfile { 'name' : string }
 export type UserRole = { 'admin' : null } |
   { 'user' : null } |
@@ -48,16 +74,39 @@ export interface _SERVICE {
   '_immutableObjectStorageUpdateGatewayPrincipals' : ActorMethod<[], undefined>,
   '_initializeAccessControl' : ActorMethod<[], undefined>,
   'assignCallerUserRole' : ActorMethod<[Principal, UserRole], undefined>,
+  /**
+   * / Removes a single brush by id. No-op if the caller has no record or the
+   * / brush id is not found.
+   */
+  'deleteBrush' : ActorMethod<[string], undefined>,
   'getBrushPresets' : ActorMethod<[], [] | [string]>,
   'getCallerUserProfile' : ActorMethod<[], [] | [UserProfile]>,
   'getCallerUserRole' : ActorMethod<[], UserRole>,
   'getCanvasHash' : ActorMethod<[], [] | [CanvasSave]>,
+  /**
+   * / Returns all stored preferences for the caller, or null if none saved yet.
+   */
+  'getPreferences' : ActorMethod<[], [] | [UserPreferences]>,
+  /**
+   * / Returns the schema version stored for the caller, or 0 if no record exists.
+   */
+  'getSchemaVersion' : ActorMethod<[], bigint>,
   'getUserProfile' : ActorMethod<[Principal], [] | [UserProfile]>,
   'getUserSettings' : ActorMethod<[], [] | [SettingsSave]>,
   'isCallerAdmin' : ActorMethod<[], boolean>,
+  /**
+   * / Upserts a single brush by id. Creates a default preferences record first
+   * / if the caller has no existing record.
+   */
+  'saveBrush' : ActorMethod<[BrushPreset], undefined>,
   'saveBrushPresets' : ActorMethod<[string], undefined>,
   'saveCallerUserProfile' : ActorMethod<[UserProfile], undefined>,
   'saveCanvasHash' : ActorMethod<[CanvasSave], undefined>,
+  /**
+   * / Atomically replaces all preferences for the caller.
+   * / Always overwrites lastModified with the current canister time.
+   */
+  'savePreferences' : ActorMethod<[UserPreferences], undefined>,
   'saveUserSettings' : ActorMethod<[SettingsSave], undefined>,
 }
 export declare const idlService: IDL.ServiceClass;

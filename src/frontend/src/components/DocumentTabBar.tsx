@@ -17,6 +17,8 @@ interface DocumentTabBarProps {
   isMobile: boolean;
   /** Show the tab bar even on mobile if true (e.g. user requests desktop UI). */
   forceDesktop: boolean;
+  /** When true, tab switching is locked (brush tip editor is active). */
+  brushTipEditorActive?: boolean;
 }
 
 // ── Tab component ─────────────────────────────────────────────────────────────
@@ -25,16 +27,27 @@ interface TabProps {
   tab: DocumentTab;
   isActive: boolean;
   isSwapping: boolean;
+  isLocked: boolean;
   onSwitch: (id: string) => void;
   onClose: (id: string) => void;
 }
 
-function Tab({ tab, isActive, isSwapping, onSwitch, onClose }: TabProps) {
+function Tab({
+  tab,
+  isActive,
+  isSwapping,
+  isLocked,
+  onSwitch,
+  onClose,
+}: TabProps) {
   return (
     <button
       type="button"
       data-ocid={`doc_tab.${tab.id}`}
-      onClick={() => onSwitch(tab.id)}
+      onClick={() => {
+        if (isLocked) return;
+        onSwitch(tab.id);
+      }}
       className="group relative flex h-full min-w-[120px] max-w-[200px] shrink-0 items-center gap-1.5 px-3 text-xs select-none transition-colors duration-150"
       style={
         isActive
@@ -46,10 +59,16 @@ function Tab({ tab, isActive, isSwapping, onSwitch, onClose }: TabProps) {
           : {
               borderTop: "2px solid transparent",
               backgroundColor: "oklch(var(--toolbar))",
-              color: "oklch(var(--muted-text))",
+              color: isLocked
+                ? "oklch(var(--muted-text) / 0.4)"
+                : "oklch(var(--muted-text))",
+              cursor: isLocked ? "not-allowed" : undefined,
+              opacity: isLocked && !isActive ? 0.5 : undefined,
             }
       }
-      title={tab.filename}
+      title={
+        isLocked && !isActive ? "Exit brush tip editor first" : tab.filename
+      }
     >
       {/* Spinner — shown while this tab is the swap destination */}
       {isSwapping ? (
@@ -221,6 +240,7 @@ export function DocumentTabBar({
   onOpenDocument,
   isMobile,
   forceDesktop,
+  brushTipEditorActive = false,
 }: DocumentTabBarProps) {
   // Hide on mobile unless the user has explicitly requested the desktop UI
   if (isMobile && !forceDesktop) return null;
@@ -243,6 +263,7 @@ export function DocumentTabBar({
             tab={tab}
             isActive={tab.id === activeDocumentId}
             isSwapping={tab.id === swappingToId}
+            isLocked={brushTipEditorActive && tab.id !== activeDocumentId}
             onSwitch={onSwitchDocument}
             onClose={onCloseTab}
           />

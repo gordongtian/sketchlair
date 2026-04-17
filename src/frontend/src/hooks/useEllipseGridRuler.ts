@@ -125,9 +125,17 @@ export interface EllipseGridRulerHandles {
 
   // ── Overlay drawing ─────────────────────────────────────────────────────────
   /** Draw the oval ruler overlay onto ctx (already in canvas-space). */
-  drawOvalRulerOverlay: (ctx: CanvasRenderingContext2D, layer: Layer) => void;
+  drawOvalRulerOverlay: (
+    ctx: CanvasRenderingContext2D,
+    layer: Layer,
+    zoom?: number,
+  ) => void;
   /** Draw the grid ruler overlay onto ctx (already in canvas-space). */
-  drawGridRulerOverlay: (ctx: CanvasRenderingContext2D, layer: Layer) => void;
+  drawGridRulerOverlay: (
+    ctx: CanvasRenderingContext2D,
+    layer: Layer,
+    zoom?: number,
+  ) => void;
 
   // ── Snap ────────────────────────────────────────────────────────────────────
   /** Returns the snapped position for an oval ruler stroke. */
@@ -223,7 +231,7 @@ export function useEllipseGridRuler({
 
   // ── drawOvalRulerOverlay ──────────────────────────────────────────────────
   const drawOvalRulerOverlay = useCallback(
-    (ctx: CanvasRenderingContext2D, layer: Layer) => {
+    (ctx: CanvasRenderingContext2D, layer: Layer, zoom = 1) => {
       const cx = layer.ovalCenterX;
       const cy = layer.ovalCenterY;
       if (cx === undefined || cy === undefined) return;
@@ -268,13 +276,14 @@ export function useEllipseGridRuler({
       const semiMajHY = cy + majDY * a;
 
       // Center handle (filled square / diamond)
+      const handleRadiusOval = Math.max(4, 6 / zoom);
       ctx.save();
       ctx.translate(cx, cy);
       ctx.rotate(Math.PI / 4);
       ctx.fillStyle = "rgba(0,0,0,0.6)";
       ctx.strokeStyle = color;
       ctx.lineWidth = 1.5;
-      const hs = 5;
+      const hs = handleRadiusOval;
       ctx.beginPath();
       ctx.rect(-hs, -hs, hs * 2, hs * 2);
       ctx.fill();
@@ -285,7 +294,7 @@ export function useEllipseGridRuler({
 
       // Rotation handle
       ctx.beginPath();
-      ctx.arc(rotHX, rotHY, 6, 0, Math.PI * 2);
+      ctx.arc(rotHX, rotHY, handleRadiusOval, 0, Math.PI * 2);
       ctx.fillStyle = "rgba(0,0,0,0.6)";
       ctx.fill();
       ctx.strokeStyle = color;
@@ -299,7 +308,7 @@ export function useEllipseGridRuler({
 
       // Slide handle
       ctx.beginPath();
-      ctx.arc(slideHX, slideHY, 5, 0, Math.PI * 2);
+      ctx.arc(slideHX, slideHY, handleRadiusOval, 0, Math.PI * 2);
       ctx.fillStyle = "rgba(0,0,0,0.6)";
       ctx.fill();
       ctx.strokeStyle = color;
@@ -310,7 +319,7 @@ export function useEllipseGridRuler({
 
       // Semi-minor handle
       ctx.beginPath();
-      ctx.arc(semiMinHX, semiMinHY, 5, 0, Math.PI * 2);
+      ctx.arc(semiMinHX, semiMinHY, handleRadiusOval, 0, Math.PI * 2);
       ctx.fillStyle = "rgba(0,0,0,0.6)";
       ctx.fill();
       ctx.strokeStyle = color;
@@ -321,7 +330,7 @@ export function useEllipseGridRuler({
 
       // Semi-major handle
       ctx.beginPath();
-      ctx.arc(semiMajHX, semiMajHY, 5, 0, Math.PI * 2);
+      ctx.arc(semiMajHX, semiMajHY, handleRadiusOval, 0, Math.PI * 2);
       ctx.fillStyle = "rgba(0,0,0,0.6)";
       ctx.fill();
       ctx.strokeStyle = color;
@@ -335,7 +344,7 @@ export function useEllipseGridRuler({
       const propHX = cx + a * INV_SQRT2 * majDX - b * INV_SQRT2 * minDX;
       const propHY = cy + a * INV_SQRT2 * majDY - b * INV_SQRT2 * minDY;
       ctx.beginPath();
-      ctx.arc(propHX, propHY, 5, 0, Math.PI * 2);
+      ctx.arc(propHX, propHY, handleRadiusOval, 0, Math.PI * 2);
       ctx.fillStyle = "rgba(0,0,0,0.6)";
       ctx.fill();
       ctx.strokeStyle = color;
@@ -349,7 +358,7 @@ export function useEllipseGridRuler({
 
   // ── drawGridRulerOverlay ──────────────────────────────────────────────────
   const drawGridRulerOverlay = useCallback(
-    (ctx: CanvasRenderingContext2D, layer: Layer) => {
+    (ctx: CanvasRenderingContext2D, layer: Layer, zoom = 1) => {
       const corners = layer.gridCorners;
       if (!corners) return;
 
@@ -646,6 +655,7 @@ export function useEllipseGridRuler({
       if (activeToolRef.current !== "ruler") return;
 
       // Draw 8 handles (4 corners + 4 edge midpoints)
+      const handleRadiusGrid = Math.max(4, 6 / zoom);
       const lerp2 = (a: Point, b: Point, t: number) => ({
         x: a.x + (b.x - a.x) * t,
         y: a.y + (b.y - a.y) * t,
@@ -658,7 +668,7 @@ export function useEllipseGridRuler({
       const labels = ["TL", "TR", "BR", "BL", "", "", "", ""];
       handles.forEach((h, i) => {
         ctx.beginPath();
-        ctx.arc(h.x, h.y, 6, 0, Math.PI * 2);
+        ctx.arc(h.x, h.y, handleRadiusGrid, 0, Math.PI * 2);
         ctx.fillStyle = "rgba(0,0,0,0.6)";
         ctx.fill();
         ctx.strokeStyle = color;
@@ -1366,34 +1376,9 @@ export function useEllipseGridRuler({
 
       if (!anyOval && !anyGrid) return false;
 
-      // Fix 2: Clamp non-VP position handles to canvas bounds on pointer-up.
-      const W = canvasWidthRef.current;
-      const H = canvasHeightRef.current;
-      const cx = (v: number | undefined) =>
-        v !== undefined ? Math.max(0, Math.min(W, v)) : v;
-      const cy = (v: number | undefined) =>
-        v !== undefined ? Math.max(0, Math.min(H, v)) : v;
-
       let afterState: Record<string, unknown>;
 
       if (anyOval) {
-        // Clamp ovalCenter position. ovalAngle and semi-axes are not positions.
-        const clampedOvalCX = cx(layer.ovalCenterX);
-        const clampedOvalCY = cy(layer.ovalCenterY);
-        const needsClampOval =
-          clampedOvalCX !== layer.ovalCenterX ||
-          clampedOvalCY !== layer.ovalCenterY;
-        if (needsClampOval) {
-          const patchOval: Partial<Layer> = {};
-          if (clampedOvalCX !== undefined)
-            patchOval.ovalCenterX = clampedOvalCX;
-          if (clampedOvalCY !== undefined)
-            patchOval.ovalCenterY = clampedOvalCY;
-          const fnOval = (l: Layer) =>
-            l.id === layer.id ? { ...l, ...patchOval } : l;
-          setLayers((prev) => prev.map(fnOval));
-          layersRef.current = layersRef.current.map(fnOval);
-        }
         const refreshedOval =
           layersRef.current.find((l) => l.id === layer.id) ?? layer;
         afterState = {
@@ -1404,23 +1389,7 @@ export function useEllipseGridRuler({
           ovalSemiMinor: refreshedOval.ovalSemiMinor ?? 60,
         };
       } else {
-        // Grid: clamp each corner to canvas bounds.
-        const gc = layer.gridCorners;
-        if (gc) {
-          const clampedCorners = gc.map((pt) => ({
-            x: Math.max(0, Math.min(W, pt.x)),
-            y: Math.max(0, Math.min(H, pt.y)),
-          })) as typeof gc;
-          const needsClampGrid = clampedCorners.some(
-            (pt, i) => pt.x !== gc[i].x || pt.y !== gc[i].y,
-          );
-          if (needsClampGrid) {
-            const fnGrid = (l: Layer) =>
-              l.id === layer.id ? { ...l, gridCorners: clampedCorners } : l;
-            setLayers((prev) => prev.map(fnGrid));
-            layersRef.current = layersRef.current.map(fnGrid);
-          }
-        }
+        // Grid: capture current state, no clamping
         const refreshedGrid =
           layersRef.current.find((l) => l.id === layer.id) ?? layer;
         afterState = { gridCorners: refreshedGrid.gridCorners };
@@ -1454,15 +1423,7 @@ export function useEllipseGridRuler({
       scheduleRulerOverlay();
       return true;
     },
-    [
-      canvasWidthRef,
-      canvasHeightRef,
-      layersRef,
-      setLayers,
-      pushHistory,
-      rulerEditHistoryDepthRef,
-      scheduleRulerOverlay,
-    ],
+    [layersRef, pushHistory, rulerEditHistoryDepthRef, scheduleRulerOverlay],
   );
 
   // ── isOvalDragging ────────────────────────────────────────────────────────

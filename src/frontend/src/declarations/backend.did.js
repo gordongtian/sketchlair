@@ -26,6 +26,32 @@ export const UserRole = IDL.Variant({
 });
 export const UserProfile = IDL.Record({ 'name' : IDL.Text });
 export const CanvasSave = IDL.Text;
+export const BrushPreset = IDL.Record({
+  'id' : IDL.Text,
+  'modifiedAt' : IDL.Int,
+  'name' : IDL.Text,
+  'createdAt' : IDL.Int,
+  'settings' : IDL.Text,
+  'isDefault' : IDL.Bool,
+});
+export const HotkeyAssignments = IDL.Record({
+  'assignments' : IDL.Text,
+  'modifiedAt' : IDL.Int,
+});
+export const AppSettings = IDL.Record({
+  'uiScale' : IDL.Float64,
+  'theme' : IDL.Text,
+  'canvasBackground' : IDL.Text,
+  'modifiedAt' : IDL.Int,
+  'otherSettings' : IDL.Text,
+});
+export const UserPreferences = IDL.Record({
+  'brushes' : IDL.Vec(BrushPreset),
+  'hotkeys' : HotkeyAssignments,
+  'lastModified' : IDL.Int,
+  'settings' : AppSettings,
+  'schemaVersion' : IDL.Nat,
+});
 export const SettingsSave = IDL.Text;
 
 export const idlService = IDL.Service({
@@ -57,10 +83,13 @@ export const idlService = IDL.Service({
   '_immutableObjectStorageUpdateGatewayPrincipals' : IDL.Func([], [], []),
   '_initializeAccessControl' : IDL.Func([], [], []),
   'assignCallerUserRole' : IDL.Func([IDL.Principal, UserRole], [], []),
+  'deleteBrush' : IDL.Func([IDL.Text], [], []),
   'getBrushPresets' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
   'getCallerUserProfile' : IDL.Func([], [IDL.Opt(UserProfile)], ['query']),
   'getCallerUserRole' : IDL.Func([], [UserRole], ['query']),
   'getCanvasHash' : IDL.Func([], [IDL.Opt(CanvasSave)], ['query']),
+  'getPreferences' : IDL.Func([], [IDL.Opt(UserPreferences)], ['query']),
+  'getSchemaVersion' : IDL.Func([], [IDL.Nat], ['query']),
   'getUserProfile' : IDL.Func(
       [IDL.Principal],
       [IDL.Opt(UserProfile)],
@@ -68,9 +97,11 @@ export const idlService = IDL.Service({
     ),
   'getUserSettings' : IDL.Func([], [IDL.Opt(SettingsSave)], ['query']),
   'isCallerAdmin' : IDL.Func([], [IDL.Bool], ['query']),
+  'saveBrush' : IDL.Func([BrushPreset], [], []),
   'saveBrushPresets' : IDL.Func([IDL.Text], [], []),
   'saveCallerUserProfile' : IDL.Func([UserProfile], [], []),
   'saveCanvasHash' : IDL.Func([CanvasSave], [], []),
+  'savePreferences' : IDL.Func([UserPreferences], [], []),
   'saveUserSettings' : IDL.Func([SettingsSave], [], []),
 });
 
@@ -95,6 +126,32 @@ export const idlFactory = ({ IDL }) => {
   });
   const UserProfile = IDL.Record({ 'name' : IDL.Text });
   const CanvasSave = IDL.Text;
+  const BrushPreset = IDL.Record({
+    'id' : IDL.Text,
+    'modifiedAt' : IDL.Int,
+    'name' : IDL.Text,
+    'createdAt' : IDL.Int,
+    'settings' : IDL.Text,
+    'isDefault' : IDL.Bool,
+  });
+  const HotkeyAssignments = IDL.Record({
+    'assignments' : IDL.Text,
+    'modifiedAt' : IDL.Int,
+  });
+  const AppSettings = IDL.Record({
+    'uiScale' : IDL.Float64,
+    'theme' : IDL.Text,
+    'canvasBackground' : IDL.Text,
+    'modifiedAt' : IDL.Int,
+    'otherSettings' : IDL.Text,
+  });
+  const UserPreferences = IDL.Record({
+    'brushes' : IDL.Vec(BrushPreset),
+    'hotkeys' : HotkeyAssignments,
+    'lastModified' : IDL.Int,
+    'settings' : AppSettings,
+    'schemaVersion' : IDL.Nat,
+  });
   const SettingsSave = IDL.Text;
   
   return IDL.Service({
@@ -126,10 +183,13 @@ export const idlFactory = ({ IDL }) => {
     '_immutableObjectStorageUpdateGatewayPrincipals' : IDL.Func([], [], []),
     '_initializeAccessControl' : IDL.Func([], [], []),
     'assignCallerUserRole' : IDL.Func([IDL.Principal, UserRole], [], []),
+    'deleteBrush' : IDL.Func([IDL.Text], [], []),
     'getBrushPresets' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
     'getCallerUserProfile' : IDL.Func([], [IDL.Opt(UserProfile)], ['query']),
     'getCallerUserRole' : IDL.Func([], [UserRole], ['query']),
     'getCanvasHash' : IDL.Func([], [IDL.Opt(CanvasSave)], ['query']),
+    'getPreferences' : IDL.Func([], [IDL.Opt(UserPreferences)], ['query']),
+    'getSchemaVersion' : IDL.Func([], [IDL.Nat], ['query']),
     'getUserProfile' : IDL.Func(
         [IDL.Principal],
         [IDL.Opt(UserProfile)],
@@ -137,9 +197,11 @@ export const idlFactory = ({ IDL }) => {
       ),
     'getUserSettings' : IDL.Func([], [IDL.Opt(SettingsSave)], ['query']),
     'isCallerAdmin' : IDL.Func([], [IDL.Bool], ['query']),
+    'saveBrush' : IDL.Func([BrushPreset], [], []),
     'saveBrushPresets' : IDL.Func([IDL.Text], [], []),
     'saveCallerUserProfile' : IDL.Func([UserProfile], [], []),
     'saveCanvasHash' : IDL.Func([CanvasSave], [], []),
+    'savePreferences' : IDL.Func([UserPreferences], [], []),
     'saveUserSettings' : IDL.Func([SettingsSave], [], []),
   });
 };

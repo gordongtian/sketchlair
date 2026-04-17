@@ -5,7 +5,7 @@ import {
   Palette,
   SlidersHorizontal as PresetsIcon,
 } from "lucide-react";
-import type { RefObject } from "react";
+import type { ReactNode, RefObject } from "react";
 import type { ViewTransform } from "../types";
 import type { BrushSettings } from "./BrushSettingsPanel";
 import { ColorPickerPanel } from "./ColorPickerPanel";
@@ -29,6 +29,7 @@ type ActiveSubpanel =
   | "ruler"
   | "eyedropper"
   | "rotate"
+  | "adjustments"
   | null;
 
 export interface CanvasAreaProps {
@@ -158,6 +159,12 @@ export interface CanvasAreaProps {
   // Ruler overlay ref callback
   onRulerCanvasRef: (el: HTMLCanvasElement | null) => void;
   onSelectionOverlayCanvasRef: (el: HTMLCanvasElement | null) => void;
+
+  /**
+   * Pre-rendered AdjustmentsPresetsPanel node for mobile popup.
+   * Shown in the mobile presets popup when activeSubpanel === 'adjustments'.
+   */
+  mobileAdjustmentsPanel?: ReactNode;
 }
 
 export function CanvasArea({
@@ -242,6 +249,7 @@ export function CanvasArea({
   onCanvasDoubleClick,
   onRulerCanvasRef,
   onSelectionOverlayCanvasRef,
+  mobileAdjustmentsPanel,
 }: CanvasAreaProps) {
   // Derive ruler layer props from layers array
   const rulerLayer = layers.find((l) => l.isRuler);
@@ -582,6 +590,8 @@ export function CanvasArea({
                   onFivePtEnableUDChange={onFivePtEnableUDChange}
                   onGridReset={onGridReset}
                 />
+              ) : activeSubpanel === "adjustments" && mobileAdjustmentsPanel ? (
+                mobileAdjustmentsPanel
               ) : (
                 <div className="flex items-center justify-center h-16 text-muted-foreground text-xs select-none opacity-40">
                   No presets for this tool
@@ -799,7 +809,9 @@ export function CanvasArea({
         style={{
           position: "absolute",
           bottom: 48,
-          left: 12,
+          // On mobile: shift right to clear the FOS sliders (width ~30px, offset 6px → ~44px clear)
+          // Right-handed: sliders on left → offset from left; left-handed: sliders on right → stay at left
+          left: isMobile && !leftHanded ? 44 : 12,
           display: "flex",
           alignItems: "center",
           gap: 8,

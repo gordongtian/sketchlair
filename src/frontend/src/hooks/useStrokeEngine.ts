@@ -439,6 +439,7 @@ export function useStrokeEngine({
         _dualSize2Scale,
         _dualAngle2,
         capAlpha,
+        settings.minOpacity ?? 0,
       );
       // Dirty rect tracking (snapshot is taken once at pen-down, not lazily per-stamp).
       const _halfSize = stampSize / 2;

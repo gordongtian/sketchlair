@@ -1,5 +1,8 @@
 import type { Layer } from "@/components/LayersPanel";
-import { invalidateAllLayerBitmaps } from "@/hooks/useCompositing";
+import {
+  invalidateAllLayerBitmaps,
+  markCanvasDirty,
+} from "@/hooks/useCompositing";
 import type { UndoEntry } from "@/hooks/useLayerSystem";
 import type { LayerNode } from "@/types";
 import { resetGroupIdCounterFromFlat } from "@/utils/groupUtils";
@@ -44,6 +47,11 @@ export interface UseFileIOSystemProps {
   // Optional cloud registration callbacks
   registerGetSktchBlob?: (fn: () => Promise<Blob>) => void;
   registerLoadFile?: (fn: (file: File) => Promise<void>) => void;
+  /**
+   * Called after a successful save with the final filename (including .sktch).
+   * Use this to update the document tab name and dirty state in DocumentManager.
+   */
+  onDocumentSaved?: (filename: string) => void;
 }
 
 export interface UseFileIOSystemReturn {
@@ -113,6 +121,7 @@ export function useFileIOSystem({
   clearSelection,
   registerGetSktchBlob,
   registerLoadFile,
+  onDocumentSaved,
 }: UseFileIOSystemProps): UseFileIOSystemReturn {
   // Remembers the filename of the last loaded .sktch file so Save reuses it
   const loadedFileNameRef = useRef<string>("untitled.sktch");
@@ -125,15 +134,21 @@ export function useFileIOSystem({
   const fileLoadInputRef = useRef<HTMLInputElement | null>(null);
 
   // Helper: update tab title / dirty state after a successful save
-  const _applyFileSave = useCallback(async (_blob: Blob, filename: string) => {
-    const baseName = filename.replace(/\.sktch$/i, "");
-    loadedFileNameRef.current = `${baseName}.sktch`;
-    document.title = baseName ? `${baseName} | SketchLair` : "SketchLair";
-    isDirtyRef.current = false;
-    setHasUnsavedChanges(false);
-    // Mark that a session exists so Resume works next launch
-    localStorage.setItem("sl_has_session", "1");
-  }, []);
+  const _applyFileSave = useCallback(
+    async (_blob: Blob, filename: string) => {
+      const baseName = filename.replace(/\.sktch$/i, "");
+      const fullName = `${baseName}.sktch`;
+      loadedFileNameRef.current = fullName;
+      document.title = baseName ? `${baseName} — SketchLair` : "SketchLair";
+      isDirtyRef.current = false;
+      setHasUnsavedChanges(false);
+      // Notify DocumentManager so the tab label updates to the saved filename
+      onDocumentSaved?.(fullName);
+      // Mark that a session exists so Resume works next launch
+      localStorage.setItem("sl_has_session", "1");
+    },
+    [onDocumentSaved],
+  );
 
   // File save handler — Ctrl+Shift+S (Save As: always prompts)
   // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
@@ -348,6 +363,19 @@ export function useFileIOSystem({
         setRedoCount(result.redoStack.length);
         setLayers(result.layers);
         setActiveLayerId(result.activeLayerId);
+        // Regenerate thumbnails for all paint layers after load so the layer
+        // panel shows the correct content immediately (not blank/stale thumbnails).
+        for (const layer of result.layers) {
+          const layerTyped = layer as {
+            type?: string;
+            isRuler?: boolean;
+            id: string;
+          };
+          if (layerTyped.type === "group" || layerTyped.type === "end_group")
+            continue;
+          if (layerTyped.isRuler) continue;
+          markCanvasDirty(layerTyped.id);
+        }
         // Restore the full layer tree (with groups) — no-op in flat architecture
         // (result.layerTree is always empty; the actual layer data is in result.layers)
         setLayerTreeRef.current(result.layerTree as unknown as LayerNode[]);
@@ -367,7 +395,7 @@ export function useFileIOSystem({
           ? `${baseName}.sktch`
           : "untitled.sktch";
         // Set document title to loaded filename
-        document.title = baseName ? `${baseName} | SketchLair` : "SketchLair";
+        document.title = baseName ? `${baseName} — SketchLair` : "SketchLair";
         // Mark session as existing so Resume works on next launch
         localStorage.setItem("sl_has_session", "1");
         // Composite and update navigator after layers have been set

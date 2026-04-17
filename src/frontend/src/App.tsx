@@ -9,22 +9,18 @@ import {
   useDocumentContext,
 } from "@/context/DocumentContext";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { usePreferences } from "@/hooks/usePreferences";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import { AnimatePresence } from "motion/react";
 import { Component, useCallback, useEffect, useRef, useState } from "react";
 import type { ErrorInfo, ReactNode } from "react";
-import { createActorWithConfig } from "./config";
 import {
   InternetIdentityProvider,
   useInternetIdentity,
 } from "./hooks/useInternetIdentity";
 import type { PresetsPayload } from "./hooks/usePresetSystem";
-import {
-  type ThemeId,
-  applyThemeOverrides,
-  importThemes,
-} from "./utils/themeOverrides";
+import { type ThemeId, applyThemeOverrides } from "./utils/themeOverrides";
 
 const queryClient = new QueryClient();
 
@@ -72,10 +68,55 @@ const SESSION_EXISTS_KEY = "sl_has_session";
 function AppInner() {
   const [softwareWebGL, setSoftwareWebGL] = useState(false);
   const [dismissed, setDismissed] = useState(false);
+  const [brushTipEditorActive, setBrushTipEditorActive] = useState(false);
 
-  const { identity, login, clear, isInitializing } = useInternetIdentity();
+  const { identity, login, clear } = useInternetIdentity();
   const isLoggedIn = !!identity && !identity.getPrincipal().isAnonymous();
   const { isMobile, forceDesktop } = useIsMobile();
+
+  // ── Preferences (canister-backed) ─────────────────────────────────────────
+  const preferences = usePreferences(identity, isLoggedIn);
+
+  // Apply loaded preferences to DOM once loading is done
+  useEffect(() => {
+    if (preferences.isLoading) return;
+    const { theme } = preferences.settings;
+    if (theme) {
+      const validTheme = theme as ThemeId;
+      localStorage.setItem(THEME_KEY, validTheme);
+      for (const cls of [...document.documentElement.classList]) {
+        if (cls.startsWith("theme-"))
+          document.documentElement.classList.remove(cls);
+      }
+      if (validTheme === "dark") {
+        document.documentElement.classList.add("dark");
+      } else if (validTheme !== "light") {
+        document.documentElement.classList.add(`theme-${validTheme}`);
+      }
+      applyThemeOverrides(validTheme);
+    }
+    // Apply hotkeys from canister if present
+    const { assignments } = preferences.hotkeys;
+    if (assignments && assignments !== "[]") {
+      try {
+        const parsed = JSON.parse(assignments) as Array<{
+          id: string;
+          primary: unknown;
+          secondary: unknown;
+        }>;
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const hotkeyMap: Record<string, unknown> = {};
+          for (const action of parsed) {
+            if (action.id) hotkeyMap[action.id] = action;
+          }
+          localStorage.setItem("sl_hotkeys", JSON.stringify(hotkeyMap));
+          window.dispatchEvent(new Event("sl:hotkeys-updated"));
+        }
+      } catch {
+        // ignore malformed hotkey data
+      }
+    }
+  }, [preferences.isLoading, preferences.settings, preferences.hotkeys]);
 
   // Splash: shown on every launch until the user makes a choice
   const [showSplash, setShowSplash] = useState(true);
@@ -93,6 +134,19 @@ function AppInner() {
     handleSwitchDocument,
   } = useDocumentContext();
 
+  // Update page title whenever the active document changes
+  useEffect(() => {
+    if (!activeDocumentId) {
+      document.title = "SketchLair";
+      return;
+    }
+    const doc = documents.find((d) => d.id === activeDocumentId);
+    if (doc) {
+      const baseName = doc.filename.replace(/\.sktch$/i, "");
+      document.title = baseName ? `${baseName} — SketchLair` : "SketchLair";
+    }
+  }, [activeDocumentId, documents]);
+
   // Return to splash when all tabs are closed
   useEffect(() => {
     if (activeDocumentId === null) {
@@ -100,12 +154,9 @@ function AppInner() {
     }
   }, [activeDocumentId]);
 
-  // Settings sync state
-  const settingsSyncedRef = useRef(false);
   const loadPresetsRef = useRef<((payload: PresetsPayload) => void) | null>(
     null,
   );
-  const presetSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Modal / dialog state
   const [showNewDocModal, setShowNewDocModal] = useState(false);
@@ -134,90 +185,6 @@ function AppInner() {
     }
   }, []);
 
-  // Silently sync settings when the user logs in
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional one-shot on login change
-  useEffect(() => {
-    if (isInitializing) return;
-    if (!isLoggedIn) {
-      settingsSyncedRef.current = false;
-      return;
-    }
-    if (settingsSyncedRef.current) return;
-    settingsSyncedRef.current = true;
-
-    void (async () => {
-      try {
-        const actor = await createActorWithConfig({
-          agentOptions: { identity },
-        });
-
-        console.log("[Load] Fetching user settings from backend...");
-        const settingsJson = await actor.getUserSettings();
-        console.log("[Load] Raw user settings from backend:", settingsJson);
-        if (settingsJson) {
-          try {
-            const settings = JSON.parse(settingsJson) as {
-              theme?: string;
-              themeOverrides?: Record<string, Record<string, string>>;
-              hotkeys?: Record<string, string[]>;
-              presets?: PresetsPayload;
-            };
-            console.log("[Load] Parsed user settings:", settings);
-            if (settings.theme) {
-              const validTheme = settings.theme as ThemeId;
-              localStorage.setItem(THEME_KEY, validTheme);
-              for (const cls of [...document.documentElement.classList]) {
-                if (cls.startsWith("theme-"))
-                  document.documentElement.classList.remove(cls);
-              }
-              document.documentElement.classList.add(`theme-${validTheme}`);
-              applyThemeOverrides(validTheme);
-            }
-            console.log("[Load] Parsed preferences applied (theme/hotkeys):", {
-              theme: settings.theme,
-              hotkeys: settings.hotkeys,
-            });
-            if (settings.themeOverrides) {
-              const currentTheme = (localStorage.getItem(THEME_KEY) ||
-                "light") as ThemeId;
-              importThemes(settings.themeOverrides, currentTheme);
-            }
-            if (settings.hotkeys) {
-              try {
-                localStorage.setItem(
-                  "sl_hotkeys",
-                  JSON.stringify(settings.hotkeys),
-                );
-              } catch {
-                // ignore hotkey restore errors
-              }
-            }
-            console.log(
-              "[Load] Raw brush settings from storage:",
-              settings.presets,
-            );
-            if (settings.presets && loadPresetsRef.current) {
-              try {
-                loadPresetsRef.current(settings.presets);
-                console.log(
-                  "[Load] Brush settings handed off to preset system for application",
-                );
-              } catch {
-                // ignore preset restore errors
-              }
-            } else if (!settings.presets) {
-              console.warn("[Load] Brush settings: null — nothing to load");
-            }
-          } catch (e) {
-            console.warn("Failed to parse cloud settings", e);
-          }
-        }
-      } catch (e) {
-        console.warn("[Load] Failed to load user settings:", e);
-      }
-    })();
-  }, [isLoggedIn, isInitializing]);
-
   // ── Splash handlers ──────────────────────────────────────────────────────
 
   const handleNewCanvas = useCallback(
@@ -243,50 +210,14 @@ function AppInner() {
 
   const handleLogout = useCallback(() => {
     clear();
-    settingsSyncedRef.current = false;
   }, [clear]);
 
   // ── Brush preset auto-save ────────────────────────────────────────────────
 
-  const identityRef = useRef(identity);
-  identityRef.current = identity;
-
   const handlePresetsMutated = useCallback(
-    async (presetsJson: string) => {
-      if (presetSaveTimerRef.current !== null) {
-        clearTimeout(presetSaveTimerRef.current);
-        presetSaveTimerRef.current = null;
-      }
+    (_presetsJson: string) => {
       if (activeDocumentId) setDirty(activeDocumentId, true);
-
-      try {
-        const currentIdentity = identityRef.current;
-        if (!currentIdentity || currentIdentity.getPrincipal().isAnonymous())
-          return;
-        const actor = await createActorWithConfig({
-          agentOptions: { identity: currentIdentity },
-        });
-        let base: Record<string, unknown> = {};
-        try {
-          const existing = await actor.getUserSettings();
-          console.log("[Save] Existing user settings from backend:", existing);
-          if (existing) {
-            base = JSON.parse(existing) as Record<string, unknown>;
-          }
-        } catch {
-          // start fresh
-        }
-        const presets = JSON.parse(presetsJson) as PresetsPayload;
-        console.log(
-          "[Save] Brush settings: queuing save for presets payload:",
-          presets,
-        );
-        const merged = { ...base, presets };
-        console.log("[Save] Merged settings being written to backend:", merged);
-        await actor.saveUserSettings(JSON.stringify(merged));
-      } catch (error) {
-        console.warn("[Save] Brush settings: save failed:", error);
-      }
+      // Preset persistence is handled by usePreferences via saveBrush — no legacy canister calls here.
     },
     [activeDocumentId, setDirty],
   );
@@ -406,60 +337,68 @@ function AppInner() {
         </div>
       )}
 
-      {/* PaintingApp: always mounted (behind splash), single persistent instance.
-          Wrapped in ErrorBoundary so any render crash does not kill the SplashScreen. */}
-      <PaintingErrorBoundary>
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            height: "100vh",
-            overflow: "hidden",
-          }}
-        >
-          {/* Main canvas area — paddingBottom compensates for fixed DocumentTabBar height */}
+      {/* PaintingApp: always mounted (behind splash) once preferences are loaded.
+          Wrapped in ErrorBoundary so any render crash does not kill the SplashScreen.
+          When the user is authenticated, we wait for preferences.isLoading to clear
+          so the canvas initializes with the correct saved settings (theme, hotkeys, etc.)
+          rather than flashing defaults. Unauthenticated users skip this gate entirely. */}
+      {(!isLoggedIn || !preferences.isLoading) && (
+        <PaintingErrorBoundary>
           <div
             style={{
-              flex: 1,
+              display: "flex",
+              flexDirection: "column",
+              height: "100vh",
               overflow: "hidden",
-              position: "relative",
-              paddingBottom: "36px",
             }}
           >
-            {/* PaintingApp reads registerSwapFn / registerLoadFileFn / registerGetSktchBlobFn
-                directly from DocumentContext — no prop drilling needed */}
-            <PaintingApp
-              isLoggedIn={isLoggedIn}
-              identity={identity ?? undefined}
-              onLogin={login}
-              onLogout={handleLogout}
-              onPresetsMutated={handlePresetsMutated}
-              registerLoadPresets={(fn) => {
-                loadPresetsRef.current = fn;
+            {/* Main canvas area — paddingBottom compensates for fixed DocumentTabBar height */}
+            <div
+              style={{
+                flex: 1,
+                overflow: "hidden",
+                position: "relative",
+                paddingBottom: "36px",
               }}
-              cloudSave={undefined}
-              getCanvasHash={undefined}
+            >
+              {/* PaintingApp reads registerSwapFn / registerLoadFileFn / registerGetSktchBlobFn
+                directly from DocumentContext — no prop drilling needed */}
+              <PaintingApp
+                isLoggedIn={isLoggedIn}
+                identity={identity ?? undefined}
+                onLogin={login}
+                onLogout={handleLogout}
+                onPresetsMutated={handlePresetsMutated}
+                registerLoadPresets={(fn) => {
+                  loadPresetsRef.current = fn;
+                }}
+                cloudSave={undefined}
+                getCanvasHash={undefined}
+                preferences={preferences}
+                onBrushTipEditorActiveChange={setBrushTipEditorActive}
+              />
+            </div>
+
+            {/* Tab bar — desktop only, fixed at bottom */}
+            <DocumentTabBar
+              documents={documents.map((d) => ({
+                id: d.id,
+                filename: d.filename,
+                isDirty: d.isDirty,
+              }))}
+              activeDocumentId={activeDocumentId}
+              swappingToId={swappingToId}
+              onSwitchDocument={handleSwitchDocument}
+              onCloseTab={handleCloseTab}
+              onNewDocument={handleNewDocument}
+              onOpenDocument={handleOpenDocument}
+              isMobile={isMobile}
+              forceDesktop={forceDesktop}
+              brushTipEditorActive={brushTipEditorActive}
             />
           </div>
-
-          {/* Tab bar — desktop only, fixed at bottom */}
-          <DocumentTabBar
-            documents={documents.map((d) => ({
-              id: d.id,
-              filename: d.filename,
-              isDirty: d.isDirty,
-            }))}
-            activeDocumentId={activeDocumentId}
-            swappingToId={swappingToId}
-            onSwitchDocument={handleSwitchDocument}
-            onCloseTab={handleCloseTab}
-            onNewDocument={handleNewDocument}
-            onOpenDocument={handleOpenDocument}
-            isMobile={isMobile}
-            forceDesktop={forceDesktop}
-          />
-        </div>
-      </PaintingErrorBoundary>
+        </PaintingErrorBoundary>
+      )}
 
       {/* New Document Resolution Selector Modal */}
       <AnimatePresence>

@@ -21,7 +21,10 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-type Props = { onClose: () => void };
+type Props = {
+  onClose: () => void;
+  onHotkeysChanged?: (hotkeys: Record<string, HotkeyAction>) => void;
+};
 
 const CATEGORY_ORDER = [
   "Tools",
@@ -33,7 +36,7 @@ const CATEGORY_ORDER = [
   "Ruler",
 ] as const;
 
-export function HotkeyEditor({ onClose }: Props) {
+export function HotkeyEditor({ onClose, onHotkeysChanged }: Props) {
   const [hotkeys, setHotkeys] = useState<Record<string, HotkeyAction>>(() =>
     loadHotkeys(),
   );
@@ -73,11 +76,15 @@ export function HotkeyEditor({ onClose }: Props) {
     }
   }
 
-  const updateAndSave = useCallback((updated: Record<string, HotkeyAction>) => {
-    setHotkeys(updated);
-    saveHotkeys(updated);
-    window.dispatchEvent(new Event("sl:hotkeys-updated"));
-  }, []);
+  const updateAndSave = useCallback(
+    (updated: Record<string, HotkeyAction>) => {
+      setHotkeys(updated);
+      saveHotkeys(updated);
+      window.dispatchEvent(new Event("sl:hotkeys-updated"));
+      onHotkeysChanged?.(updated);
+    },
+    [onHotkeysChanged],
+  );
 
   const handleReset = useCallback(
     (actionId: string) => {

@@ -1,5 +1,7 @@
 import type { BrushSettings } from "@/components/BrushSettingsPanel";
 import type { Tool } from "@/components/Toolbar";
+import type { BrushPreset } from "@/hooks/usePreferences";
+import { presetToBrushPreset } from "@/hooks/usePreferences";
 import type { Preset } from "@/utils/toolPresets";
 import { DEFAULT_PRESETS } from "@/utils/toolPresets";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -38,6 +40,13 @@ export interface UsePresetSystemProps {
    * When undefined or when the user is not logged in, no save is attempted.
    */
   onPresetsMutated?: (json: string) => void;
+  /**
+   * Called alongside onPresetsMutated whenever presets are mutated.
+   * Receives all brushes (all three tool types) serialized to BrushPreset[]
+   * so the caller can push them into usePreferences and keep brushesRef current.
+   * This is the wiring that ensures syncUpload always reads the live preset state.
+   */
+  onBrushesChanged?: (brushes: BrushPreset[]) => void;
   /** When true the debounced save fires; when false/undefined it is suppressed. */
   isLoggedIn?: boolean;
 }
@@ -128,6 +137,7 @@ export function usePresetSystem({
   setColor,
   setActiveTool,
   onPresetsMutated,
+  onBrushesChanged,
   isLoggedIn,
 }: UsePresetSystemProps): UsePresetSystemReturn {
   // ── State ──────────────────────────────────────────────────────────────────
@@ -180,8 +190,10 @@ export function usePresetSystem({
   // Keep latest callback and login state in refs so the debounce closure
   // always reads the current values without needing to be recreated.
   const onPresetsMutatedRef = useRef(onPresetsMutated);
+  const onBrushesChangedRef = useRef(onBrushesChanged);
   const isLoggedInRef = useRef(isLoggedIn);
   onPresetsMutatedRef.current = onPresetsMutated;
+  onBrushesChangedRef.current = onBrushesChanged;
   isLoggedInRef.current = isLoggedIn;
 
   // Keep refs in sync with state
@@ -204,14 +216,28 @@ export function usePresetSystem({
     }
     saveTimerRef.current = setTimeout(() => {
       saveTimerRef.current = null;
-      if (!isLoggedInRef.current) return;
-      if (!onPresetsMutatedRef.current) return;
       const payload: PresetsPayload = {
         brush: presetsRef.current.brush,
         smudge: presetsRef.current.smudge,
         eraser: presetsRef.current.eraser,
         activePresetIds: activePresetIdsRef.current,
       };
+
+      // Always notify the preferences manager of brush changes so
+      // brushesRef stays current for syncUpload — works for both
+      // authenticated and unauthenticated users.
+      if (onBrushesChangedRef.current) {
+        const allPresets = [
+          ...presetsRef.current.brush,
+          ...presetsRef.current.smudge,
+          ...presetsRef.current.eraser,
+        ];
+        const brushPresets = allPresets.map(presetToBrushPreset);
+        onBrushesChangedRef.current(brushPresets);
+      }
+
+      if (!isLoggedInRef.current) return;
+      if (!onPresetsMutatedRef.current) return;
       try {
         console.log(
           "[Save] Brush settings: triggering save with payload:",

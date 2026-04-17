@@ -116,7 +116,10 @@ export function useSelectionSystem({
     commitFloat: (_opts?: { keepSelection?: boolean }) => {},
     revertTransform: () => {},
     rasterizeSelectionMask: () => {},
-    extractFloat: (_fromSel: boolean) => {},
+    extractFloat: (
+      _fromSel: boolean,
+      _opts?: { fromToolActivation?: boolean },
+    ) => {},
   });
 
   // Wired by PaintingApp to atomically reset _boundaryRebuildPending.

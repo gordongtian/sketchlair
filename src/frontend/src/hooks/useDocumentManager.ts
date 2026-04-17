@@ -52,6 +52,16 @@ export interface DocumentManagerResult {
   ) => void;
 
   /**
+   * Register a synchronous flush callback that PaintingApp provides.
+   * Called by DocumentManager immediately before a document is discarded,
+   * so all pixel data is cleared before any new document initializes.
+   * fn(doc, isActiveDoc): clears layerCanvases, display canvas, and WebGL FBOs.
+   */
+  registerDiscardFlushFn: (
+    fn: (doc: DocumentState, isActiveDoc: boolean) => void,
+  ) => void;
+
+  /**
    * Create a blank document with the given dimensions, add it to the store,
    * and queue a three-phase swap into it. Returns the new document id.
    */
@@ -160,6 +170,10 @@ export function useDocumentManager(): DocumentManagerResult {
   >(null);
   const loadFileFnRef = useRef<((file: File) => Promise<void>) | null>(null);
   const getSktchBlobFnRef = useRef<(() => Promise<Blob>) | null>(null);
+  /** Registered by PaintingApp — synchronously flushes a discarded document's pixel data. */
+  const discardFlushFnRef = useRef<
+    ((doc: DocumentState, isActiveDoc: boolean) => void) | null
+  >(null);
 
   // Track which document is currently loaded into PaintingApp
   const loadedDocIdRef = useRef<string | null>(null);
@@ -184,6 +198,18 @@ export function useDocumentManager(): DocumentManagerResult {
 
   const removeDocument = useCallback((id: string) => {
     setDocuments((prev) => {
+      // Find the document being removed so we can flush its pixel data before removal.
+      const discardedDoc = prev.find((d) => d.id === id);
+
+      // Synchronously flush all pixel data from the discarded document BEFORE
+      // filtering it from the array and BEFORE any new document initializes.
+      // This prevents stale pixel data from appearing on a subsequently-created canvas.
+      // The flush must be synchronous — no setTimeout/rAF between flush and removal.
+      if (discardedDoc && discardFlushFnRef.current) {
+        const isActiveDoc = discardedDoc.id === loadedDocIdRef.current;
+        discardFlushFnRef.current(discardedDoc, isActiveDoc);
+      }
+
       const next = prev.filter((d) => d.id !== id);
 
       // If the removed doc was active, switch to the last remaining one
@@ -306,6 +332,13 @@ export function useDocumentManager(): DocumentManagerResult {
   const registerSwapFn = useCallback(
     (fn: (fromDoc: DocumentState, toDoc: DocumentState) => void) => {
       swapFnRef.current = fn;
+    },
+    [],
+  );
+
+  const registerDiscardFlushFn = useCallback(
+    (fn: (doc: DocumentState, isActiveDoc: boolean) => void) => {
+      discardFlushFnRef.current = fn;
     },
     [],
   );
@@ -436,6 +469,7 @@ export function useDocumentManager(): DocumentManagerResult {
     setDirty,
     getNextUntitledIndex,
     registerSwapFn,
+    registerDiscardFlushFn,
     createDocument,
     registerLoadFileFn,
     openFileAsDocument,

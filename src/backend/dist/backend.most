@@ -1,7 +1,25 @@
 // Version: 1.0.0
+type AppSettings__813771059 =
+  {
+    canvasBackground : Text;
+    modifiedAt : Int;
+    otherSettings : Text;
+    theme : Text;
+    uiScale : Float
+  };
+type BrushPreset__95671841 =
+  {
+    createdAt : Int;
+    id : Text;
+    isDefault : Bool;
+    modifiedAt : Int;
+    name : Text;
+    settings : Text
+  };
 type CanvasSave__864224653 = Text;
 type Data__791452850<K, V> =
   {var count : Nat__490723111; kvs : [var ?(K, V)]};
+type HotkeyAssignments__223722748 = {assignments : Text; modifiedAt : Int};
 type Internal__8484328<K, V> =
   {children : [var ?Node__46230540<K, V>]; data : Data__791452850<K, V>};
 type Leaf__809889148<K, V> = {data : Data__791452850<K, V>};
@@ -14,6 +32,14 @@ type Nat__920180692 = Nat;
 type Node__46230540<K, V> =
   {#internal : Internal__8484328<K, V>; #leaf : Leaf__809889148<K, V>};
 type SettingsSave__419654141 = Text;
+type UserPreferences__810131452 =
+  {
+    brushes : [BrushPreset__95671841];
+    hotkeys : HotkeyAssignments__223722748;
+    lastModified : Int;
+    schemaVersion : Nat;
+    settings : AppSettings__813771059
+  };
 type UserProfile__491224006 = {name : Text};
 type UserRole__1054455867 = {#admin; #guest; #user};
 actor {
@@ -27,6 +53,11 @@ actor {
   stable canvasSaveMap :
     {
       var root : Node__46230540<Principal, CanvasSave__864224653>;
+      var size : Nat__490723111
+    };
+  stable preferencesMap :
+    {
+      var root : Node__46230540<Principal, UserPreferences__810131452>;
       var size : Nat__490723111
     };
   stable settingsMap :

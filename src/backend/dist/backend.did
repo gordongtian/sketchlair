@@ -18,8 +18,38 @@ type UserRole =
    user;
  };
 type UserProfile = record {name: text;};
+type UserPreferences = 
+ record {
+   brushes: vec BrushPreset;
+   hotkeys: HotkeyAssignments;
+   lastModified: int;
+   schemaVersion: nat;
+   settings: AppSettings;
+ };
 type SettingsSave = text;
+type HotkeyAssignments = 
+ record {
+   assignments: text;
+   modifiedAt: int;
+ };
 type CanvasSave = text;
+type BrushPreset = 
+ record {
+   createdAt: int;
+   id: text;
+   isDefault: bool;
+   modifiedAt: int;
+   name: text;
+   settings: text;
+ };
+type AppSettings = 
+ record {
+   canvasBackground: text;
+   modifiedAt: int;
+   otherSettings: text;
+   theme: text;
+   uiScale: float64;
+ };
 service : {
   _immutableObjectStorageBlobsAreLive: (hashes: vec blob) -> (vec bool) query;
   _immutableObjectStorageBlobsToDelete: () -> (vec blob) query;
@@ -32,15 +62,28 @@ service : {
   _immutableObjectStorageUpdateGatewayPrincipals: () -> ();
   _initializeAccessControl: () -> ();
   assignCallerUserRole: (user: principal, role: UserRole) -> ();
+  /// Removes a single brush by id. No-op if the caller has no record or the
+  /// brush id is not found.
+  deleteBrush: (id: text) -> ();
   getBrushPresets: () -> (opt text) query;
   getCallerUserProfile: () -> (opt UserProfile) query;
   getCallerUserRole: () -> (UserRole) query;
   getCanvasHash: () -> (opt CanvasSave) query;
+  /// Returns all stored preferences for the caller, or null if none saved yet.
+  getPreferences: () -> (opt UserPreferences) query;
+  /// Returns the schema version stored for the caller, or 0 if no record exists.
+  getSchemaVersion: () -> (nat) query;
   getUserProfile: (user: principal) -> (opt UserProfile) query;
   getUserSettings: () -> (opt SettingsSave) query;
   isCallerAdmin: () -> (bool) query;
+  /// Upserts a single brush by id. Creates a default preferences record first
+  /// if the caller has no existing record.
+  saveBrush: (brush: BrushPreset) -> ();
   saveBrushPresets: (data: text) -> ();
   saveCallerUserProfile: (profile: UserProfile) -> ();
   saveCanvasHash: (canvasHash: CanvasSave) -> ();
+  /// Atomically replaces all preferences for the caller.
+  /// Always overwrites lastModified with the current canister time.
+  savePreferences: (prefs: UserPreferences) -> ();
   saveUserSettings: (settings: SettingsSave) -> ();
 }
