@@ -1,6 +1,12 @@
 import type { HSVAColor } from "@/utils/colorUtils";
 import { generateLayerThumbnail, hsvToRgb } from "@/utils/colorUtils";
-import { bfsFloodFill, chaikinSmooth } from "@/utils/selectionUtils";
+import {
+  bfsFloodFill,
+  chaikinSmooth,
+  computeDistanceTransform,
+  dilateByRadius,
+  extractBoundaryMask,
+} from "@/utils/selectionUtils";
 import { getThumbCanvas, getThumbCtx } from "@/utils/thumbnailCache";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -201,11 +207,13 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
     tolerance: 30,
     gradientMode: "linear",
     contiguous: true,
+    gapClosing: 0,
   });
   const fillSettingsRef = useRef<FillSettings>({
     tolerance: 30,
     gradientMode: "linear",
     contiguous: true,
+    gapClosing: 0,
   });
 
   // Keep fillSettingsRef in sync with fillSettings state.
@@ -297,6 +305,185 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
           }
         }
       }
+
+      // ── Gap closing branch (only when gapClosing > 0) ──────────────────
+      // Distance-transform-based gap closing:
+      //   1. Extract boundary mask from the layer
+      //   2. Compute distance from every non-boundary pixel to the nearest boundary
+      //   3. For each non-boundary pixel P within the gap-closing radius, check whether
+      //      P lies between TWO separate boundary segments (i.e. it bridges a genuine gap).
+      //      A pixel bridges a gap if there exist two boundary pixels B1 and B2 within
+      //      the radius such that B1 and B2 are from different segments
+      //      (Manhattan distance > 4 — not immediately adjacent).
+      //   4. Only those "genuine gap" pixels are added to a gapMask.
+      //   5. The sampling ImageData is built using (boundaryMask | gapMask) as the
+      //      effective boundary — gaps are closed; open fill areas are untouched.
+      //   6. Flood fill runs on the augmented sampling data; fill is written to the
+      //      original layer canvas as normal.
+      //
+      // When gapClosing === 0 the branch is never entered — identical to legacy path.
+      const gapClosing = fillSettingsRef.current.gapClosing ?? 0;
+      if (gapClosing > 0) {
+        // Get seed color (unpremultiplied)
+        const sidx = (y * width + x) * 4;
+        const sa = data[sidx + 3];
+        const seedR = sa > 0 ? Math.round((data[sidx] * 255) / sa) : 0;
+        const seedG = sa > 0 ? Math.round((data[sidx + 1] * 255) / sa) : 0;
+        const seedB = sa > 0 ? Math.round((data[sidx + 2] * 255) / sa) : 0;
+
+        // Step 1: extract boundary mask
+        const boundaryMask = extractBoundaryMask(
+          imgData,
+          seedR,
+          seedG,
+          seedB,
+          20,
+          tolerance,
+        );
+
+        // Step 2: compute distance transform — distance from each non-boundary pixel
+        // to the nearest boundary pixel.
+        const distFloat = computeDistanceTransform(boundaryMask, width, height);
+
+        // Step 3: pre-collect boundary pixel coordinates for fast neighborhood search.
+        // We only need to store coords of boundary pixels for the segment check.
+        const bndCoords: { x: number; y: number }[] = [];
+        for (let i = 0; i < width * height; i++) {
+          if (boundaryMask[i]) {
+            bndCoords.push({ x: i % width, y: Math.floor(i / width) });
+          }
+        }
+
+        // Step 4: for each non-boundary pixel within gapClosing distance, test
+        // whether it bridges two separate boundary segments.
+        const gapMask = new Uint8Array(width * height);
+        const R = gapClosing;
+        const R2 = R * R;
+
+        // Build a spatial index: for each cell in a coarse grid, store the boundary
+        // pixels that fall in it. This avoids an O(N·M) full scan per candidate pixel.
+        // Cell size = R+1 so any pixel within radius R of (px,py) is in the same or
+        // directly adjacent cell.
+        const cellSize = Math.max(1, R + 1);
+        const gridW = Math.ceil(width / cellSize);
+        const gridH = Math.ceil(height / cellSize);
+        const grid: number[][] = new Array(gridW * gridH)
+          .fill(null)
+          .map(() => []);
+        for (let bi = 0; bi < bndCoords.length; bi++) {
+          const gx = Math.floor(bndCoords[bi].x / cellSize);
+          const gy = Math.floor(bndCoords[bi].y / cellSize);
+          grid[gy * gridW + gx].push(bi);
+        }
+
+        for (let py = 0; py < height; py++) {
+          for (let px = 0; px < width; px++) {
+            const pidx = py * width + px;
+            if (boundaryMask[pidx]) continue; // already a boundary pixel
+            if (distFloat[pidx] > R) continue; // too far from any boundary
+
+            // Gather all boundary pixels within radius R using the spatial grid.
+            const cgx = Math.floor(px / cellSize);
+            const cgy = Math.floor(py / cellSize);
+            const cgMinX = Math.max(0, cgx - 1);
+            const cgMaxX = Math.min(gridW - 1, cgx + 1);
+            const cgMinY = Math.max(0, cgy - 1);
+            const cgMaxY = Math.min(gridH - 1, cgy + 1);
+
+            // Collect up to 2 boundary pixels from different segments.
+            // We store the first boundary pixel found (B1) and then look for B2
+            // that is NOT adjacent to B1 (Manhattan distance > 4).
+            let b1x = -1;
+            let b1y = -1;
+            let foundGap = false;
+
+            for (let gy2 = cgMinY; gy2 <= cgMaxY && !foundGap; gy2++) {
+              for (let gx2 = cgMinX; gx2 <= cgMaxX && !foundGap; gx2++) {
+                const cellBnds = grid[gy2 * gridW + gx2];
+                for (let ci = 0; ci < cellBnds.length && !foundGap; ci++) {
+                  const bi = cellBnds[ci];
+                  const bx = bndCoords[bi].x;
+                  const by = bndCoords[bi].y;
+                  const dx = bx - px;
+                  const dy = by - py;
+                  if (dx * dx + dy * dy > R2) continue; // outside circle
+
+                  if (b1x < 0) {
+                    // First boundary pixel found — store as B1
+                    b1x = bx;
+                    b1y = by;
+                  } else {
+                    // Check if this boundary pixel (B2) is from a different segment
+                    // than B1 — i.e., not immediately adjacent (Manhattan dist > 4).
+                    const sepManhattan =
+                      Math.abs(bx - b1x) + Math.abs(by - b1y);
+                    if (sepManhattan > 4) {
+                      // P bridges two separate boundary segments → genuine gap pixel
+                      foundGap = true;
+                    }
+                  }
+                }
+              }
+            }
+
+            if (foundGap) {
+              gapMask[pidx] = 1;
+            }
+          }
+        }
+
+        // Step 5: build combined boundary = original boundary ∪ gap-bridging pixels
+        const combinedMask = new Uint8Array(width * height);
+        for (let i = 0; i < width * height; i++) {
+          combinedMask[i] = boundaryMask[i] | gapMask[i];
+        }
+
+        // Step 6: build sampling ImageData — dilate combined boundary colors into the
+        // gap pixels so flood fill sees the closed gaps as genuine boundaries.
+        const samplingImgData = dilateByRadius(
+          imgData,
+          combinedMask,
+          gapClosing,
+          width,
+          height,
+        );
+
+        // Step 7: run flood fill on sampling data (boundary detection only)
+        const fillMask = bfsFloodFill(
+          samplingImgData.data,
+          width,
+          height,
+          x,
+          y,
+          tolerance,
+          contiguous,
+          selData,
+        );
+
+        // Step 8: apply fill to ORIGINAL layer data (not the sampling copy)
+        for (let i = 0; i < fillMask.length; i++) {
+          if (fillMask[i]) {
+            const pi = i * 4;
+            const existingAlpha = data[pi + 3];
+            if (existingAlpha === 0) {
+              data[pi] = fr;
+              data[pi + 1] = fg;
+              data[pi + 2] = fb;
+              data[pi + 3] = 255;
+            } else {
+              if (data[pi] === fr && data[pi + 1] === fg && data[pi + 2] === fb)
+                continue;
+              data[pi] = fr;
+              data[pi + 1] = fg;
+              data[pi + 2] = fb;
+              // alpha stays exactly what it was
+            }
+          }
+        }
+        ctx.putImageData(imgData, 0, 0);
+        return;
+      }
+      // ── End gap closing branch ─────────────────────────────────────────
 
       const fillMask = bfsFloodFill(
         data,

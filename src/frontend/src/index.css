@@ -82,6 +82,16 @@
     --muted-text: 0.5527 0.011 273.24;
     --outline: 0.28 0.01 250;
 
+    /* ── Learn module tokens ── */
+    --learn-panel-bg: 0.16 0.01 250;
+    --learn-card-bg: 0.19 0.01 250;
+    --learn-card-border: 0.25 0.01 250;
+    --learn-pill-inactive: 0.22 0.01 250;
+    --learn-pill-active: 0.7036 0.1441 233.05;
+    --learn-timer-text: 0.9 0.01 250;
+    --learn-pause-overlay: 0 0 0 / 0.4;
+    --learn-floating-shadow: 0 4px 12px 0 rgb(0 0 0 / 0.3);
+
     /* ── Tailwind token aliases ── */
     --background: var(--toolbar);
     --foreground: var(--text);
@@ -700,6 +710,7 @@
 }
 
 /* Radix Slider: override Tailwind bg-muted/bg-primary with theme slider vars */
+/* Radix Slider: override Tailwind bg-muted/bg-primary with theme slider vars */
 [data-slot="slider-track"] {
   background-color: oklch(var(--slider-bg));
 }
@@ -712,4 +723,78 @@
   background-color: oklch(var(--slider-handle));
   border-color: oklch(var(--slider-handle));
   box-shadow: none;
+}
+
+/* ── Learn Module Utilities ── */
+@layer utilities {
+  .learn-panel {
+    @apply bg-opacity-95;
+    background-color: oklch(var(--learn-panel-bg));
+  }
+
+  .learn-card {
+    @apply rounded-sm border;
+    background-color: oklch(var(--learn-card-bg));
+    border-color: oklch(var(--learn-card-border));
+  }
+
+  .learn-card-hover {
+    @apply transition-colors;
+    &:hover {
+      background-color: oklch(0.21 0.01 250);
+    }
+  }
+
+  .learn-pill {
+    @apply rounded-full px-4 py-2 text-sm font-medium transition-all cursor-pointer border;
+    background-color: oklch(var(--learn-pill-inactive));
+    border-color: oklch(var(--learn-card-border));
+    color: oklch(var(--text));
+
+    &.active {
+      background-color: oklch(var(--learn-pill-active));
+      border-color: oklch(var(--learn-pill-active));
+      color: oklch(var(--accent-text));
+    }
+  }
+
+  .learn-timer {
+    @apply font-mono text-2xl font-semibold;
+    color: oklch(var(--learn-timer-text));
+  }
+
+  .learn-pause-overlay {
+    background-color: oklch(var(--learn-pause-overlay));
+  }
+
+  .learn-floating-shadow {
+    box-shadow: var(--learn-floating-shadow);
+  }
+
+  .learn-section-divider {
+    @apply my-6 h-px;
+    background-color: oklch(var(--learn-card-border));
+  }
+}
+
+@keyframes slideInFromRight {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes slideInFromLeft {
+  from {
+    opacity: 0;
+    transform: translateX(-12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }

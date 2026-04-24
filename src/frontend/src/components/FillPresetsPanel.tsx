@@ -8,6 +8,7 @@ export interface FillSettings {
   tolerance: number;
   gradientMode: GradientMode;
   contiguous: boolean;
+  gapClosing: number;
 }
 
 interface FillPresetsPanelProps {
@@ -164,6 +165,16 @@ export function FillPresetsPanel({
                   ocid="fill_presets.tolerance.input"
                   onChange={(v) =>
                     onSettingsChange({ ...fillSettings, tolerance: v })
+                  }
+                />
+                <SliderRow
+                  label={`Gap Closing: ${fillSettings.gapClosing}`}
+                  value={fillSettings.gapClosing}
+                  min={0}
+                  max={30}
+                  ocid="fill_presets.gap_closing.input"
+                  onChange={(v) =>
+                    onSettingsChange({ ...fillSettings, gapClosing: v })
                   }
                 />
                 <div className="flex items-center justify-between">

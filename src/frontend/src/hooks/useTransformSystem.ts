@@ -1,14 +1,70 @@
 import { useCallback, useEffect, useRef } from "react";
 import type React from "react";
 import type { LassoMode, Tool } from "../components/Toolbar";
+import type { XfState } from "../context/PaintingContext";
 import type { SelectionGeom } from "../selectionTypes";
 import type { ViewTransform } from "../types";
+import { inv3x3, solveHomography } from "../utils/homographyWarp";
 import { computeMaskBounds } from "../utils/selectionUtils";
 import { markCanvasDirty } from "./useCompositing";
 import type { UndoEntry } from "./useLayerSystem";
 
 const CANVAS_WIDTH_DEFAULT = 2560;
 const CANVAS_HEIGHT_DEFAULT = 1440;
+
+/**
+ * Compute the four corner world positions from the current xfState.
+ * Applies the full affine: translate(cx,cy) · rotate(rotation) · skew(skewX,skewY) · scale
+ * Returns { tl, tr, bl, br } — world positions of top-left, top-right, bottom-left, bottom-right.
+ */
+export function getTransformCornersWorld(xf: {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rotation: number;
+  skewX?: number;
+  skewY?: number;
+}): {
+  tl: { x: number; y: number };
+  tr: { x: number; y: number };
+  bl: { x: number; y: number };
+  br: { x: number; y: number };
+} {
+  const cx = xf.x + xf.w / 2;
+  const cy = xf.y + xf.h / 2;
+  const rot = xf.rotation;
+  const skX = xf.skewX ?? 0;
+  const skY = xf.skewY ?? 0;
+  const cosR = Math.cos(rot);
+  const sinR = Math.sin(rot);
+  const tanSkX = Math.tan(skX);
+  const tanSkY = Math.tan(skY);
+
+  // Transform a local point (lx, ly) relative to center using rotate then skew.
+  // The skew matrix in canvas 2D is applied after rotation:
+  //   ctx.rotate(rot) then ctx.transform(1, tanSkY, tanSkX, 1, 0, 0)
+  // Combined:  world = rotate then skew
+  //   After rotate: rx = lx*cosR - ly*sinR,  ry = lx*sinR + ly*cosR
+  //   After skew:   wx = rx + tanSkX*ry,      wy = tanSkY*rx + ry
+  function localToWorld(lx: number, ly: number): { x: number; y: number } {
+    const rx = lx * cosR - ly * sinR;
+    const ry = lx * sinR + ly * cosR;
+    return {
+      x: cx + rx + tanSkX * ry,
+      y: cy + tanSkY * rx + ry,
+    };
+  }
+
+  const hw = xf.w / 2;
+  const hh = xf.h / 2;
+  return {
+    tl: localToWorld(-hw, -hh),
+    tr: localToWorld(hw, -hh),
+    bl: localToWorld(-hw, hh),
+    br: localToWorld(hw, hh),
+  };
+}
 
 interface UseTransformSystemParams {
   canvasWidth?: number;
@@ -112,14 +168,18 @@ export function useTransformSystem({
     /** For scale handle drags: the canvas-space pivot point (opposite handle's position at drag start) */
     pivotX?: number;
     pivotY?: number;
+    /** Skew values captured at drag start — skew accumulates from these */
+    skewXAtDragStart?: number;
+    skewYAtDragStart?: number;
+    /** For free-corner drag (corner handle + Ctrl): the four corner world positions at drag start */
+    dragStartCorners?: {
+      tl: { x: number; y: number };
+      tr: { x: number; y: number };
+      bl: { x: number; y: number };
+      br: { x: number; y: number };
+    };
   } | null>(null);
-  const xfStateRef = useRef<{
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-    rotation: number;
-  } | null>(null);
+  const xfStateRef = useRef<XfState | null>(null);
   const transformPreSnapshotRef = useRef<ImageData | null>(null);
   const transformPreCommitSnapshotRef = useRef<ImageData | null>(null);
   const transformOrigFloatCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -151,6 +211,23 @@ export function useTransformSystem({
   const multiLayerPreSnapshotsRef = useRef<Map<string, ImageData>>(new Map());
   /** Ordered array of resolved paintable layer IDs (bottom-to-top in layer stack). */
   const multiLayerResolvedIdsRef = useRef<string[]>([]);
+
+  /**
+   * Free-corner mode state — set when user Ctrl+drags a corner handle.
+   * Holds the four current corner world positions (one moves, three fixed)
+   * and which corner is being dragged. null when not in free-corner mode.
+   */
+  const freeCornerStateRef = useRef<{
+    corners: {
+      tl: { x: number; y: number };
+      tr: { x: number; y: number };
+      bl: { x: number; y: number };
+      br: { x: number; y: number };
+    };
+    draggedCorner: "tl" | "tr" | "bl" | "br";
+    /** Original content rectangle (canvas space) before ANY transform this session */
+    origRect: { x: number; y: number; w: number; h: number };
+  } | null>(null);
 
   // Actions ref — populated by the useEffect blocks below
   const transformActionsRef = useRef({
@@ -521,6 +598,8 @@ export function useTransformSystem({
           w: bounds.w,
           h: bounds.h,
           rotation: 0,
+          skewX: 0,
+          skewY: 0,
         };
         transformActiveRef.current = true;
         setIsTransformActive(true);
@@ -694,6 +773,8 @@ export function useTransformSystem({
       w: bounds.w,
       h: bounds.h,
       rotation: 0,
+      skewX: 0,
+      skewY: 0,
     };
     transformActiveRef.current = true;
     setIsTransformActive(true);
@@ -711,6 +792,180 @@ export function useTransformSystem({
   // biome-ignore lint/correctness/useExhaustiveDependencies: selection refs from hook are stable
   const commitFloat = useCallback(
     (opts?: { keepSelection?: boolean }) => {
+      // ── Free-corner homography commit path ───────────────────────────────
+      // When the user Ctrl+dragged a corner handle, freeCornerStateRef is set.
+      // A standard affine (2×3) cannot represent a general quadrilateral warp —
+      // we must use a homography (3×3 perspective matrix) solved from the four
+      // point correspondences: original rect corners → current quad corners.
+      if (freeCornerStateRef.current) {
+        const fcState = freeCornerStateRef.current;
+        const fc = moveFloatCanvasRef.current;
+        const obCommit = moveFloatOriginBoundsRef.current;
+        const origFloat = transformOrigFloatCanvasRef.current || fc;
+        if (!fc || !obCommit || !origFloat) {
+          freeCornerStateRef.current = null;
+          // Fall through to normal path
+        } else {
+          const layerId = activeLayerIdRef.current;
+          const lc = layerCanvasesRef.current.get(layerId!);
+          if (!lc) {
+            freeCornerStateRef.current = null;
+            return;
+          }
+          const ctx = lc.getContext("2d", { willReadFrequently: true });
+          if (!ctx) {
+            freeCornerStateRef.current = null;
+            return;
+          }
+
+          const before =
+            transformPreCommitSnapshotRef.current ??
+            ctx.getImageData(0, 0, lc.width, lc.height);
+
+          // Source rectangle corners (in the origFloat canvas coordinate space).
+          // These are the four corners of the content as it was when extracted.
+          const srcX = obCommit.x;
+          const srcY = obCommit.y;
+          const srcW = obCommit.w;
+          const srcH = obCommit.h;
+          // Source points: TL, TR, BL, BR of the original content rect
+          const src = [
+            { x: srcX, y: srcY }, // TL
+            { x: srcX + srcW, y: srcY }, // TR
+            { x: srcX, y: srcY + srcH }, // BL
+            { x: srcX + srcW, y: srcY + srcH }, // BR
+          ];
+          // Destination points: the four corners in world (canvas) space
+          const dst = [
+            fcState.corners.tl,
+            fcState.corners.tr,
+            fcState.corners.bl,
+            fcState.corners.br,
+          ];
+
+          // Compute destination bounding box
+          const dstAllX = dst.map((p) => p.x);
+          const dstAllY = dst.map((p) => p.y);
+          const dstMinX = Math.floor(Math.min(...dstAllX));
+          const dstMinY = Math.floor(Math.min(...dstAllY));
+          const dstMaxX = Math.ceil(Math.max(...dstAllX));
+          const dstMaxY = Math.ceil(Math.max(...dstAllY));
+          const dstW = dstMaxX - dstMinX;
+          const dstH = dstMaxY - dstMinY;
+          if (dstW <= 0 || dstH <= 0) {
+            freeCornerStateRef.current = null;
+            return;
+          }
+
+          // Solve 3×3 homography H such that H * [src_x, src_y, 1]^T ∝ [dst_x, dst_y, 1]^T
+          // Using the Direct Linear Transform (DLT) — shared implementation in homographyWarp.ts
+          // so both the preview path (useCompositing) and commit path use identical code.
+
+          const hVec = solveHomography(src, dst);
+          if (!hVec) {
+            freeCornerStateRef.current = null;
+            return;
+          }
+          // H = [[h00,h01,h02],[h10,h11,h12],[h20,h21,1]]
+          const [h00, h01, h02, h10, h11, h12, h20, h21] = hVec;
+
+          // Compute inverse homography H_inv for backward mapping
+          // (shared implementation in homographyWarp.ts)
+          const hinv = inv3x3([h00, h01, h02, h10, h11, h12, h20, h21, 1]);
+          if (!hinv) {
+            freeCornerStateRef.current = null;
+            return;
+          }
+          const [i00, i01, i02, i10, i11, i12, i20, i21, i22] = hinv;
+
+          // Read source pixels
+          const srcCanvas = origFloat;
+          const srcCtx = srcCanvas.getContext("2d", {
+            willReadFrequently: true,
+          });
+          if (!srcCtx) {
+            freeCornerStateRef.current = null;
+            return;
+          }
+          const srcData = srcCtx.getImageData(
+            0,
+            0,
+            srcCanvas.width,
+            srcCanvas.height,
+          );
+
+          // Create destination canvas at the bounding box of the quad
+          const destCanvas = document.createElement("canvas");
+          destCanvas.width = dstW;
+          destCanvas.height = dstH;
+          const destCtx = destCanvas.getContext("2d", {
+            willReadFrequently: true,
+          })!;
+          const destData = destCtx.createImageData(dstW, dstH);
+          const destPixels = destData.data;
+          const srcPixels = srcData.data;
+          const sw = srcCanvas.width;
+          const sh = srcCanvas.height;
+
+          // Backward mapping: for each dest pixel, compute source pixel via H_inv
+          for (let dy = 0; dy < dstH; dy++) {
+            for (let dx2 = 0; dx2 < dstW; dx2++) {
+              // World coordinates of this destination pixel
+              const wx = dx2 + dstMinX;
+              const wy = dy + dstMinY;
+              // Apply inverse homography
+              const wh = i20 * wx + i21 * wy + i22;
+              if (Math.abs(wh) < 1e-10) continue;
+              const sxRaw = (i00 * wx + i01 * wy + i02) / wh;
+              const syRaw = (i10 * wx + i11 * wy + i12) / wh;
+              // Bilinear interpolation
+              const sxF = Math.floor(sxRaw);
+              const syF = Math.floor(syRaw);
+              const tx2 = sxRaw - sxF;
+              const ty2 = syRaw - syF;
+              // Clamp source coordinates to canvas bounds
+              if (sxF < 0 || syF < 0 || sxF >= sw || syF >= sh) continue;
+              const x1 = Math.min(sxF + 1, sw - 1);
+              const y1 = Math.min(syF + 1, sh - 1);
+              const i00px = (syF * sw + sxF) * 4;
+              const i01px = (syF * sw + x1) * 4;
+              const i10px = (y1 * sw + sxF) * 4;
+              const i11px = (y1 * sw + x1) * 4;
+              const destIdx = (dy * dstW + dx2) * 4;
+              for (let ch = 0; ch < 4; ch++) {
+                // Bilinear blend
+                const val =
+                  srcPixels[i00px + ch] * (1 - tx2) * (1 - ty2) +
+                  srcPixels[i01px + ch] * tx2 * (1 - ty2) +
+                  srcPixels[i10px + ch] * (1 - tx2) * ty2 +
+                  srcPixels[i11px + ch] * tx2 * ty2;
+                destPixels[destIdx + ch] = Math.round(val);
+              }
+            }
+          }
+          destCtx.putImageData(destData, 0, 0);
+
+          // Write result to the layer canvas
+          ctx.globalCompositeOperation = "source-over";
+          ctx.globalAlpha = 1;
+          ctx.drawImage(destCanvas, dstMinX, dstMinY);
+          ctx.globalCompositeOperation = "source-over";
+          ctx.globalAlpha = 1;
+
+          const after = ctx.getImageData(0, 0, lc.width, lc.height);
+          pushHistory({ type: "pixels", layerId, before, after });
+          markLayerBitmapDirtyRef?.current(layerId);
+
+          freeCornerStateRef.current = null;
+          _updateSelectionAfterCommit(xfStateRef.current, obCommit, opts, lc);
+          _cleanupTransformState();
+          if (strokeCanvasCacheKeyRef) strokeCanvasCacheKeyRef.current++;
+          compositeRef.current();
+          markCanvasDirty();
+          return;
+        }
+      }
+
       // ── Multi-layer per-float commit path ────────────────────────────────
       const isMultiCommit = multiLayerResolvedIdsRef.current.length > 1;
       if (isMultiCommit) {
@@ -755,6 +1010,12 @@ export function useTransformSystem({
             ctx.save();
             ctx.translate(cx, cy);
             ctx.rotate(xfCommit.rotation);
+            // Apply skew in the rotated coordinate frame
+            const skX = xfCommit.skewX ?? 0;
+            const skY = xfCommit.skewY ?? 0;
+            if (skX !== 0 || skY !== 0) {
+              ctx.transform(1, Math.tan(skY), Math.tan(skX), 1, 0, 0);
+            }
             ctx.drawImage(
               floatCanvas,
               obCommit.x,
@@ -848,6 +1109,12 @@ export function useTransformSystem({
         ctx.save();
         ctx.translate(cx, cy);
         ctx.rotate(xfCommit.rotation);
+        // Apply skew in the rotated coordinate frame
+        const skXSingle = xfCommit.skewX ?? 0;
+        const skYSingle = xfCommit.skewY ?? 0;
+        if (skXSingle !== 0 || skYSingle !== 0) {
+          ctx.transform(1, Math.tan(skYSingle), Math.tan(skXSingle), 1, 0, 0);
+        }
         ctx.drawImage(
           origFloatCommit,
           obCommit.x,
@@ -1055,6 +1322,7 @@ export function useTransformSystem({
     transformPreCommitSnapshotRef.current = null;
     transformOrigFloatCanvasRef.current = null;
     floatDragStartRef.current = null;
+    freeCornerStateRef.current = null;
     // Free per-layer float canvases
     for (const fc of multiFloatCanvasesRef.current.values()) {
       fc.width = 0;
@@ -1108,6 +1376,7 @@ export function useTransformSystem({
     transformPreCommitSnapshotRef.current = null;
     transformOrigFloatCanvasRef.current = null;
     floatDragStartRef.current = null;
+    freeCornerStateRef.current = null;
     multiFloatCanvasesRef.current.clear();
     multiLayerPreSnapshotsRef.current.clear();
     multiLayerResolvedIdsRef.current = [];
@@ -1147,24 +1416,81 @@ export function useTransformSystem({
     setIsTransformActive,
   ]);
 
-  // Get the 9 transform handle positions (8 + rotation) based on float position and original bounds
+  // Get the 9 transform handle positions (8 + rotation) based on the current
+  // transformed corner world positions — correctly accounts for skew.
+  // In free-corner mode, uses freeCornerStateRef corners directly instead of xfState.
   const getTransformHandles = useCallback(() => {
+    // Free-corner mode: derive handles directly from the four stored corner positions
+    if (freeCornerStateRef.current) {
+      const fc = freeCornerStateRef.current;
+      const { tl, tr, bl, br } = fc.corners;
+      const n = { x: (tl.x + tr.x) / 2, y: (tl.y + tr.y) / 2 };
+      const s = { x: (bl.x + br.x) / 2, y: (bl.y + br.y) / 2 };
+      const w = { x: (tl.x + bl.x) / 2, y: (tl.y + bl.y) / 2 };
+      const e = { x: (tr.x + br.x) / 2, y: (tr.y + br.y) / 2 };
+      const topEdgeDx = tr.x - tl.x;
+      const topEdgeDy = tr.y - tl.y;
+      const topEdgeLen =
+        Math.sqrt(topEdgeDx * topEdgeDx + topEdgeDy * topEdgeDy) || 1;
+      const perpX = topEdgeDy / topEdgeLen;
+      const perpY = -topEdgeDx / topEdgeLen;
+      const rot = { x: n.x + perpX * 24, y: n.y + perpY * 24 };
+      // Compute axis-aligned bounds for compatibility with "bounds" consumers
+      const allX = [tl.x, tr.x, bl.x, br.x];
+      const allY = [tl.y, tr.y, bl.y, br.y];
+      const minX = Math.min(...allX);
+      const maxX = Math.max(...allX);
+      const minY = Math.min(...allY);
+      const maxY = Math.max(...allY);
+      return {
+        nw: tl,
+        n,
+        ne: tr,
+        w,
+        e,
+        sw: bl,
+        s,
+        se: br,
+        rot,
+        bounds: { x: minX, y: minY, w: maxX - minX, h: maxY - minY },
+        corners: fc.corners,
+      };
+    }
     const xfH = xfStateRef.current;
     if (!xfH) return null;
-    const { x, y, w, h } = xfH;
-    const hw = w / 2;
-    const hh = h / 2;
+    const corners = getTransformCornersWorld(xfH);
+    const { tl, tr, bl, br } = corners;
+    // Edge midpoints
+    const n = { x: (tl.x + tr.x) / 2, y: (tl.y + tr.y) / 2 };
+    const s = { x: (bl.x + br.x) / 2, y: (bl.y + br.y) / 2 };
+    const w = { x: (tl.x + bl.x) / 2, y: (tl.y + bl.y) / 2 };
+    const e = { x: (tr.x + br.x) / 2, y: (tr.y + br.y) / 2 };
+    // Rotation handle: offset along the "up" direction (outward from top edge)
+    const topEdgeDx = tr.x - tl.x;
+    const topEdgeDy = tr.y - tl.y;
+    const topEdgeLen =
+      Math.sqrt(topEdgeDx * topEdgeDx + topEdgeDy * topEdgeDy) || 1;
+    // Perpendicular to top edge pointing outward (upward in local space)
+    const perpX = topEdgeDy / topEdgeLen;
+    const perpY = -topEdgeDx / topEdgeLen;
+    const rot = {
+      x: n.x + perpX * 24,
+      y: n.y + perpY * 24,
+    };
     return {
-      nw: { x, y },
-      n: { x: x + hw, y },
-      ne: { x: x + w, y },
-      w: { x, y: y + hh },
-      e: { x: x + w, y: y + hh },
-      sw: { x, y: y + h },
-      s: { x: x + hw, y: y + h },
-      se: { x: x + w, y: y + h },
-      rot: { x: x + hw, y: y - 24 },
-      bounds: { x, y, w, h },
+      nw: tl,
+      n,
+      ne: tr,
+      w,
+      e,
+      sw: bl,
+      s,
+      se: br,
+      rot,
+      // Store the original x,y,w,h bounds for scale operations (unchanged from xfState)
+      bounds: { x: xfH.x, y: xfH.y, w: xfH.w, h: xfH.h },
+      // Also expose corners for use in free-corner drag
+      corners,
     };
   }, []);
 
@@ -1173,43 +1499,66 @@ export function useTransformSystem({
       const handles = getTransformHandles();
       if (!handles) return null;
       const xfHit = xfStateRef.current;
-      const rot = xfHit ? xfHit.rotation : 0;
-      let testX = px;
-      let testY = py;
-      if (rot !== 0) {
-        // Inverse-rotate px, py around the visual center of the bounding box
-        const { x, y, w, h } = handles.bounds;
-        const cx = x + w / 2;
-        const cy = y + h / 2;
-        const cos = Math.cos(-rot);
-        const sin = Math.sin(-rot);
-        const dx = px - cx;
-        const dy = py - cy;
-        testX = cx + dx * cos - dy * sin;
-        testY = cy + dx * sin + dy * cos;
-      }
+      if (!xfHit) return null;
+
       // Scale hit radius inversely with zoom so handles stay grabbable when zoomed out.
-      // At zoom >= 1 the radius is the baseline 8 canvas-px.
-      // At zoom < 1 (zoomed out) the radius grows so the screen-pixel hit area stays constant.
       const zoom = viewTransformRef?.current?.zoom ?? 1;
       const R = Math.max(8, 8 / zoom);
-      for (const [key, pt] of Object.entries(handles)) {
-        if (key === "bounds") continue;
-        const dx = testX - (pt as { x: number; y: number }).x;
-        const dy = testY - (pt as { x: number; y: number }).y;
+
+      // Test each named handle point using direct world-space distance (no inverse rotation needed —
+      // the handle positions are already in world space from getTransformCornersWorld).
+      const namedHandles = [
+        "nw",
+        "n",
+        "ne",
+        "w",
+        "e",
+        "sw",
+        "s",
+        "se",
+        "rot",
+      ] as const;
+      for (const key of namedHandles) {
+        const pt = handles[key] as { x: number; y: number };
+        const dx = px - pt.x;
+        const dy = py - pt.y;
         if (Math.sqrt(dx * dx + dy * dy) <= R) return key;
       }
-      // Check if inside bounds = drag entire float
-      const { x, y, w, h } = handles.bounds;
-      if (testX >= x && testX <= x + w && testY >= y && testY <= y + h)
-        return "move";
-      // Outside-bbox: check if within ROT_ZONE of any edge = rotation
+
+      // Check if inside the parallelogram (skewed bounding box) = "move"
+      // Use a barycentric / cross-product test against the four corners.
+      const { tl, tr, bl, br } = handles.corners;
+      function _cross(ax: number, ay: number, bx: number, by: number): number {
+        return ax * by - ay * bx;
+      }
+      function _insideQuad(qx: number, qy: number): boolean {
+        // Test point (qx,qy) inside quad tl→tr→br→bl using sign-consistent cross products
+        const d1 = _cross(tr.x - tl.x, tr.y - tl.y, qx - tl.x, qy - tl.y);
+        const d2 = _cross(br.x - tr.x, br.y - tr.y, qx - tr.x, qy - tr.y);
+        const d3 = _cross(bl.x - br.x, bl.y - br.y, qx - br.x, qy - br.y);
+        const d4 = _cross(tl.x - bl.x, tl.y - bl.y, qx - bl.x, qy - bl.y);
+        const hasNeg = d1 < 0 || d2 < 0 || d3 < 0 || d4 < 0;
+        const hasPos = d1 > 0 || d2 > 0 || d3 > 0 || d4 > 0;
+        return !(hasNeg && hasPos);
+      }
+      if (_insideQuad(px, py)) return "move";
+
+      // Outside-bbox: check if within ROT_ZONE of the quad edges = rotation
       const ROT_ZONE = Math.max(30, 30 / zoom);
+      // Expand the quad outward by ROT_ZONE in all directions for the rotation zone test.
+      // Approximate: check axis-aligned bounding rect of corners extended by ROT_ZONE.
+      const allX = [tl.x, tr.x, bl.x, br.x];
+      const allY = [tl.y, tr.y, bl.y, br.y];
+      const minX = Math.min(...allX) - ROT_ZONE;
+      const maxX = Math.max(...allX) + ROT_ZONE;
+      const minY = Math.min(...allY) - ROT_ZONE;
+      const maxY = Math.max(...allY) + ROT_ZONE;
       if (
-        testX >= x - ROT_ZONE &&
-        testX <= x + w + ROT_ZONE &&
-        testY >= y - ROT_ZONE &&
-        testY <= y + h + ROT_ZONE
+        px >= minX &&
+        px <= maxX &&
+        py >= minY &&
+        py <= maxY &&
+        !_insideQuad(px, py)
       ) {
         return "rot";
       }
@@ -1256,6 +1605,8 @@ export function useTransformSystem({
     multiFloatCanvasesRef,
     // Ordered layer IDs for multi-layer transform (used by compositing loop)
     multiLayerResolvedIdsRef,
+    // Free-corner mode state (Ctrl+corner handle drag)
+    freeCornerStateRef,
     // Actions
     transformActionsRef,
   };

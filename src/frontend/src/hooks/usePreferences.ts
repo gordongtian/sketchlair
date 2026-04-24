@@ -170,6 +170,33 @@ function migratePreferences(prefs: UserPreferences): UserPreferences {
   return { ...prefs, schemaVersion: CURRENT_SCHEMA_VERSION };
 }
 
+// ── Error message helpers ─────────────────────────────────────────────────────
+
+/**
+ * Map raw canister/network error strings to clear user-facing messages.
+ * "Unauthorized" from Motoko means an anonymous or mismatched principal — tell
+ * the user to sign in rather than surfacing internal error text.
+ */
+function extractSyncError(
+  raw: string,
+  direction: "upload" | "download",
+): string {
+  const lower = raw.toLowerCase();
+  if (
+    lower.includes("unauthorized") ||
+    lower.includes("user is not registered") ||
+    lower.includes("only users can") ||
+    lower.includes("anonymous")
+  ) {
+    return "Not signed in — please log in and try again.";
+  }
+  if (lower.includes("network") || lower.includes("fetch")) {
+    return "Network error — check your connection and try again.";
+  }
+  const verb = direction === "upload" ? "Upload" : "Download";
+  return raw || `${verb} failed. Please try again.`;
+}
+
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
 export function usePreferences(
@@ -208,8 +235,10 @@ export function usePreferences(
   // Refs for debounced settings writes
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSettingsRef = useRef<AppSettings | null>(null);
+
+  // Keep a ref to the latest identity so async callbacks always read the
+  // freshest value without re-creating every dependent useCallback.
   const identityRef = useRef(identity);
-  identityRef.current = identity;
 
   // Snapshot of current full state for flush operations
   const brushesRef = useRef(brushes);
@@ -219,17 +248,60 @@ export function usePreferences(
   settingsRef.current = settings;
   hotkeysRef.current = hotkeys;
 
+  // Invalidate cached actor whenever identity or auth state changes so we
+  // never re-use a stale anonymous principal after logout→login.
+  const cachedActorRef = useRef<Awaited<
+    ReturnType<typeof createActorWithConfig>
+  > | null>(null);
+
+  useEffect(() => {
+    // Update ref so async callbacks always read the current identity
+    identityRef.current = identity;
+    // Bust the cached actor — next sync call will rebuild it with the fresh identity
+    cachedActorRef.current = null;
+    console.log(
+      "[Preferences] identity changed — actor cache invalidated, isAuthenticated:",
+      isAuthenticated,
+    );
+  }, [identity, isAuthenticated]);
+
   // Callback registered by PaintingApp to receive downloaded brushes
   const onDownloadCallbackRef = useRef<
     ((brushes: BrushPreset[]) => void) | null
   >(null);
 
   // ── Actor factory ──────────────────────────────────────────────────────────
+  // Reads identityRef.current (always current) and caches the actor so we
+  // don't re-create it on every sync call — but the cache is busted by the
+  // useEffect above whenever identity or isAuthenticated changes.
 
   const getActor = useCallback(async () => {
     const id = identityRef.current;
-    if (!id || id.getPrincipal().isAnonymous()) return null;
-    return createActorWithConfig({ agentOptions: { identity: id } });
+
+    // Hard guard: never create an actor for an anonymous/null identity
+    if (!id) {
+      console.warn("[Preferences] getActor — no identity available");
+      return null;
+    }
+    if (id.getPrincipal().isAnonymous()) {
+      console.warn(
+        "[Preferences] getActor — identity is anonymous, refusing to create actor",
+      );
+      return null;
+    }
+
+    // Return cached actor if we have one for the current identity
+    if (cachedActorRef.current !== null) {
+      return cachedActorRef.current;
+    }
+
+    console.log(
+      "[Preferences] getActor — creating fresh actor for principal:",
+      id.getPrincipal().toText(),
+    );
+    const actor = await createActorWithConfig({ identity: id });
+    cachedActorRef.current = actor;
+    return actor;
   }, []);
 
   // ── Flush pending debounced settings write ─────────────────────────────────
@@ -274,9 +346,7 @@ export function usePreferences(
     let cancelled = false;
     void (async () => {
       try {
-        const actor = await createActorWithConfig({
-          agentOptions: { identity },
-        });
+        const actor = await createActorWithConfig({ identity });
         const raw = await actor.getPreferences();
         if (cancelled) return;
 
@@ -591,6 +661,13 @@ export function usePreferences(
       return;
     }
 
+    // Defence-in-depth: check identity before attempting the call
+    const currentIdentity = identityRef.current;
+    if (!currentIdentity || currentIdentity.getPrincipal().isAnonymous()) {
+      setUploadError("Not signed in — please log in and try again.");
+      return;
+    }
+
     // Cancel any pending debounce — this upload supersedes it
     if (debounceTimerRef.current !== null) {
       clearTimeout(debounceTimerRef.current);
@@ -603,7 +680,7 @@ export function usePreferences(
     try {
       const actor = await getActor();
       if (!actor) {
-        setUploadError("Not connected to the network. Please try again.");
+        setUploadError("Not signed in — please log in and try again.");
         return;
       }
 
@@ -635,8 +712,8 @@ export function usePreferences(
         `[Preferences] Upload complete — ${brushesRef.current.length} brush(es) pushed to canister.`,
       );
     } catch (e) {
-      const msg =
-        e instanceof Error ? e.message : "Upload failed. Please try again.";
+      const raw = e instanceof Error ? e.message : String(e);
+      const msg = extractSyncError(raw, "upload");
       console.warn("[Preferences] syncUpload failed:", e);
       setUploadError(msg);
     } finally {
@@ -656,12 +733,19 @@ export function usePreferences(
       return;
     }
 
+    // Defence-in-depth: check identity before attempting the call
+    const currentIdentity = identityRef.current;
+    if (!currentIdentity || currentIdentity.getPrincipal().isAnonymous()) {
+      setDownloadError("Not signed in — please log in and try again.");
+      return;
+    }
+
     setIsDownloadingSyncing(true);
     setIsSyncing(true);
     try {
       const actor = await getActor();
       if (!actor) {
-        setDownloadError("Not connected to the network. Please try again.");
+        setDownloadError("Not signed in — please log in and try again.");
         return;
       }
 
@@ -716,8 +800,8 @@ export function usePreferences(
         );
       }
     } catch (e) {
-      const msg =
-        e instanceof Error ? e.message : "Download failed. Please try again.";
+      const raw = e instanceof Error ? e.message : String(e);
+      const msg = extractSyncError(raw, "download");
       console.warn("[Preferences] syncDownload failed:", e);
       setDownloadError(msg);
     } finally {

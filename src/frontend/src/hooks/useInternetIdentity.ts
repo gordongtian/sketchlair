@@ -167,6 +167,9 @@ export function InternetIdentityProvider({
       setErrorMessage("Identity not found after successful login");
       return;
     }
+    console.log(
+      `[Auth ${performance.now().toFixed(0)}] identity retrieved — principal: ${latestIdentity.getPrincipal().toString()} — isAnonymous: ${latestIdentity.getPrincipal().isAnonymous()}`,
+    );
     setIdentity(latestIdentity);
     setStatus("success");
   }, [authClient, setErrorMessage]);
@@ -239,13 +242,25 @@ export function InternetIdentityProvider({
         let existingClient = authClient;
         if (!existingClient) {
           existingClient = await createAuthClient(createOptions);
+          console.log(
+            `[Auth ${performance.now().toFixed(0)}] authClient created`,
+          );
           if (cancelled) return;
           setAuthClient(existingClient);
         }
+        console.log(
+          `[Auth ${performance.now().toFixed(0)}] isAuthenticated() called`,
+        );
         const isAuthenticated = await existingClient.isAuthenticated();
+        console.log(
+          `[Auth ${performance.now().toFixed(0)}] isAuthenticated() resolved → ${isAuthenticated}`,
+        );
         if (cancelled) return;
         if (isAuthenticated) {
           const loadedIdentity = existingClient.getIdentity();
+          console.log(
+            `[Auth ${performance.now().toFixed(0)}] identity retrieved — principal: ${loadedIdentity.getPrincipal().toString()} — isAnonymous: ${loadedIdentity.getPrincipal().isAnonymous()}`,
+          );
           setIdentity(loadedIdentity);
         }
       } catch (unknownError) {

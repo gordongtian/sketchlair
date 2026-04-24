@@ -2,3 +2,4 @@
 canisters:
   - src/frontend
   - src/backend
+  - src/payments

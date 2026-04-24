@@ -1,0 +1,85 @@
+type _ImmutableObjectStorageRefillResult = 
+ record {
+   success: opt bool;
+   topped_up_amount: opt nat;
+ };
+type _ImmutableObjectStorageRefillInformation = record {
+                                                  proposed_top_up_amount:
+                                                   opt nat;};
+type _ImmutableObjectStorageCreateCertificateResult = 
+ record {
+   blob_hash: text;
+   method: text;
+ };
+type UserRole = 
+ variant {
+   admin;
+   guest;
+   user;
+ };
+type HttpResponse = 
+ record {
+   body: blob;
+   headers: vec record {
+                  text;
+                  text;
+                };
+   status_code: nat16;
+   upgrade: opt bool;
+ };
+type HttpRequest = 
+ record {
+   body: blob;
+   headers: vec record {
+                  text;
+                  text;
+                };
+   method: text;
+   url: text;
+ };
+service : {
+  _immutableObjectStorageBlobsAreLive: (hashes: vec blob) -> (vec bool) query;
+  _immutableObjectStorageBlobsToDelete: () -> (vec blob) query;
+  _immutableObjectStorageConfirmBlobDeletion: (blobs: vec blob) -> ();
+  _immutableObjectStorageCreateCertificate: (blobHash: text) ->
+   (_ImmutableObjectStorageCreateCertificateResult);
+  _immutableObjectStorageRefillCashier: (refillInformation:
+   opt _ImmutableObjectStorageRefillInformation) ->
+   (_ImmutableObjectStorageRefillResult);
+  _immutableObjectStorageUpdateGatewayPrincipals: () -> ();
+  _initializeAccessControl: () -> ();
+  assignCallerUserRole: (user: principal, role: UserRole) -> ();
+   /// Create a Stripe Checkout session for a given pack.
+   /// - Rejects anonymous callers.
+   /// - Uses ICP HTTPS outcalls to POST to the Stripe API.
+   /// - Stores the session → (principal, itemType, itemId) mapping.
+   /// - Returns the Stripe-hosted Checkout URL on success.
+   /// - successUrl and cancelUrl must be provided by the frontend (window.location.origin-based).
+   createCheckoutSession: (packId: text, successUrl: text, cancelUrl: text) -> (variant {
+                                               err: text;
+                                               ok: text;
+                                             });
+  getCallerUserRole: () -> (UserRole) query;
+  /// Return all pack IDs and their current prices (USD cents). Public.
+  getPackPrices: () -> (vec record {
+                              text;
+                              nat;
+                            }) query;
+  /// Standard ICP HTTP query handler.
+  /// For POST /stripe/webhook, upgrades to http_request_update.
+  http_request: (request: HttpRequest) -> (HttpResponse) query;
+  /// Update handler for POST /stripe/webhook.
+  /// - Verifies HMAC-SHA256 Stripe signature.
+  /// - Handles checkout.session.completed events.
+  /// - Idempotency: skips already-processed sessions.
+  /// - Calls imageSets canister to grant entitlement to buyer.
+  /// - Returns HTTP 200 on success, 400/500 on failure.
+  http_request_update: (request: HttpRequest) -> (HttpResponse);
+  isCallerAdmin: () -> (bool) query;
+  /// Set the price (in USD cents) for a purchasable pack. Admin only.
+  setPackPrice: (packId: text, priceUsdCents: nat) -> (bool);
+  /// Store the Stripe secret key. Admin only. Write-only — never returned.
+  setStripeSecretKey: (key: text) -> (bool);
+  /// Store the Stripe webhook signing secret. Admin only. Write-only — never returned.
+  setStripeWebhookSecret: (secret: text) -> (bool);
+}

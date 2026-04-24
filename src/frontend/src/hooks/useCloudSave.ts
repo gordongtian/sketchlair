@@ -65,9 +65,7 @@ export function useCloudSave(
 
         const { hash } = await storageClient.putFile(bytes);
 
-        const actor = await createActorWithConfig({
-          agentOptions: { identity },
-        });
+        const actor = await createActorWithConfig({ identity });
         await actor.saveCanvasHash(hash);
 
         toast.success("Saved to cloud", { id: toastId });
@@ -82,7 +80,7 @@ export function useCloudSave(
   const getCanvasHash = useCallback(async (): Promise<string | null> => {
     if (!identity) return null;
     try {
-      const actor = await createActorWithConfig({ agentOptions: { identity } });
+      const actor = await createActorWithConfig({ identity });
       return await actor.getCanvasHash();
     } catch {
       return null;

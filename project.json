@@ -1,28 +1,26 @@
 {
-  "overview": "SketchLair is a professional digital painting web application with multi-document workflows, an advanced brush engine, ruler and perspective tools, layer groups, and PSD export. User preferences including brushes, settings, themes, and hotkeys persist on-chain via ICP canister, available across all devices and sessions.",
+  "overview": "SketchLair is a professional digital painting web application on ICP with a figure drawing Learn module, multi-document workflows, cloud preferences sync, and a new Stripe-powered marketplace for purchasing reference image packs.",
   "features": [
-    "Multi-document tab workflow for simultaneous canvases",
-    "Advanced WebGL brush engine with pressure, flow, and opacity control",
-    "Persistent user preferences stored on-chain via ICP canister",
-    "Cross-device brush presets, settings, themes, and hotkey sync",
-    "Unauthenticated fallback with export/import preferences JSON",
-    "Perspective rulers (1, 2, 3, 5-point), ellipse, and symmetry",
-    "Layer groups with flat-array architecture",
-    "PSD and PNG export with native save dialog",
-    "Schema-versioned preferences with migration support",
-    "Debounced canister writes to minimize latency and cycles cost"
+    "Stripe-powered marketplace for purchasing reference image packs",
+    "Payments canister with webhook signature verification and idempotency",
+    "Per-pack USD pricing set by admins",
+    "On-chain entitlements tied to Internet Identity principal",
+    "Pack grid with owned/unowned state and checkout flow",
+    "Admin pricing UI and Stripe credentials configuration",
+    "Professional digital painting with WebGL brush engine",
+    "Figure drawing learn module with timer and pose references",
+    "Multi-document tab system",
+    "Cloud preferences sync via ICP canister"
   ],
   "category": "productivity",
   "tags": [
-    "digital-art",
-    "painting",
-    "canvas",
+    "digital-painting",
+    "art",
     "icp",
-    "preferences",
-    "brush",
-    "layers",
-    "psd-export",
-    "perspective-rulers"
+    "stripe",
+    "marketplace",
+    "figure-drawing",
+    "web-app"
   ],
-  "last_updated": "2026-04-16T17:19:32.609Z"
+  "last_updated": "2026-04-20T17:19:36.173Z"
 }

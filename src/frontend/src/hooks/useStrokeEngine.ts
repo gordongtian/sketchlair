@@ -40,6 +40,17 @@ export type StrokePoint = {
   capAlpha?: number;
 };
 
+/** A single entry in the stroke-level path accumulation buffer.
+ *  Exported so callers (usePaintingCanvasEvents) can type the reset/append ops.
+ */
+export type PathPoint = {
+  x: number;
+  y: number;
+  opacity: number;
+  size: number;
+  capAlpha?: number;
+};
+
 // ─── Module-level smudge buffer ───────────────────────────────────────────────
 export let _smudgeBufferData: Uint8ClampedArray | null = null;
 export let _smudgeBufferDataCapacity = 0;
@@ -73,6 +84,19 @@ let _cachedDualB = 0;
 /** Reset the smudge initialized flag at stroke start */
 export function resetSmudgeInitialized(): void {
   _smudgeInitialized = false;
+}
+
+/** Reset carried buffer to null at stroke end (pointer-up).
+ *  The spec requires carriedBuffer = null between strokes. */
+export function clearSmudgeBuffer(): void {
+  _smudgeBufferData = null;
+  _smudgeBufferDataCapacity = 0;
+  _smudgeBufferDataSize = 0;
+  _smudgeInitialized = false;
+  _smudgeCanvasMirror = null;
+  _smudgeCanvasMirrorCapacity = 0;
+  _smudgeCanvasMirrorW = 0;
+  _smudgeCanvasMirrorH = 0;
 }
 
 // ─── Pure helpers ─────────────────────────────────────────────────────────────
@@ -163,6 +187,21 @@ export function useStrokeEngine({
   markLayerBitmapDirty,
   layersRef,
 }: UseStrokeEngineParams) {
+  // ── Path accumulation refs ────────────────────────────────────────────────
+  /**
+   * Accumulates ALL input points for the current stroke in timestamp order.
+   * Cleared on stroke start (pointer-down). Used by renderBrushSegmentAlongPoints
+   * to place stamps along the full accumulated path rather than per-segment,
+   * eliminating banding artifacts caused by variable event-segment lengths.
+   */
+  const strokePathBufferRef = useRef<PathPoint[]>([]);
+  /**
+   * Index into strokePathBufferRef of the path point just PAST the position
+   * where the last stamp was emitted. The stamp loop advances forward from this
+   * position on every new point append.
+   */
+  const lastStampPathIdxRef = useRef<number>(0);
+
   // ── Stroke lifecycle refs ─────────────────────────────────────────────────
   const tailRafIdRef = useRef<number | null>(null);
   const tailDoCommitRef = useRef<(() => void) | null>(null);
@@ -479,130 +518,193 @@ export function useStrokeEngine({
       _segCapAlpha?: number,
     ) => {
       if (points.length < 2) return;
-      const avgSize = (sizeFrom + sizeTo) / 2;
-      const _fillStyle = _tool !== "eraser" ? (ctx.fillStyle as string) : "";
-      let totalSegDist = 0;
-      for (let i = 1; i < points.length; i++) {
-        totalSegDist += _ptDist(points[i - 1], points[i]);
+
+      // ── Path accumulation: append new points to the stroke path buffer ─────
+      // Each call adds the new tail point(s) to the buffer. The head point is
+      // already present from the previous call (it was the tail of the last
+      // segment). We dedup at the seam to avoid zero-length ghost segments.
+      const buf = strokePathBufferRef.current;
+      const fromPoint = points[0];
+      const toPoint = points[points.length - 1];
+
+      // Build the opacity/size for each new point based on caller-supplied range.
+      // For the two-point [from, to] case (the common path), we interpolate
+      // opacity and size linearly. For longer polylines the same logic applies.
+      const totalNewSegs = points.length - 1;
+      let newPointsAdded = 0;
+      for (let pi = 0; pi < points.length; pi++) {
+        const t = totalNewSegs > 0 ? pi / totalNewSegs : 1;
+        const ptOpacity = opacityFrom + (opacityTo - opacityFrom) * t;
+        const ptSize = sizeFrom + (sizeTo - sizeFrom) * t;
+        const pt = points[pi];
+        // Skip the head point if it exactly matches the last buffered point
+        // (seam dedup) — but always add the tail and any intermediate points.
+        if (pi === 0 && buf.length > 0) {
+          const last = buf[buf.length - 1];
+          if (
+            Math.abs(last.x - pt.x) < 0.001 &&
+            Math.abs(last.y - pt.y) < 0.001
+          ) {
+            continue;
+          }
+        }
+        buf.push({
+          x: pt.x,
+          y: pt.y,
+          opacity: ptOpacity,
+          size: ptSize,
+          capAlpha: _segCapAlpha,
+        });
+        newPointsAdded++;
       }
-      let distFromSegStart = 0;
-      for (let i = 1; i < points.length; i++) {
-        const from = points[i - 1];
-        const to = points[i];
-        const dx = to.x - from.x;
-        const dy = to.y - from.y;
+      // Nothing meaningful added — nothing to stamp.
+      if (newPointsAdded === 0 || buf.length < 2) return;
+
+      // ── Stamp loop: advance along accumulated path from last stamp position ─
+      // idx is the index of the SECOND point of the current sub-segment we are
+      // walking. lastStampPathIdxRef tracks where we currently are in the buffer.
+      const _fillStyle = _tool !== "eraser" ? (ctx.fillStyle as string) : "";
+
+      // Start walking from the segment that contains the last-stamp residual.
+      let idx = lastStampPathIdxRef.current;
+      // Clamp: idx must be at least 1 (we need a from/to pair).
+      if (idx < 1) idx = 1;
+      // If the buffer shrank (shouldn't happen, but guard) reset to start.
+      if (idx >= buf.length) idx = 1;
+
+      while (idx < buf.length) {
+        const A = buf[idx - 1];
+        const B = buf[idx];
+        const dx = B.x - A.x;
+        const dy = B.y - A.y;
         const segDist = Math.sqrt(dx * dx + dy * dy);
         const strokeAngle = Math.atan2(dy, dx);
-        let accdist = distAccumRef.current + segDist;
-        let stampsPlaced = 0;
-        while (true) {
-          const globalT =
-            totalSegDist > 0
-              ? (distFromSegStart +
-                  (stampsPlaced + 1) *
-                    Math.max(1, (settings.spacing / 100) * avgSize) -
-                  distAccumRef.current) /
-                totalSegDist
-              : 0;
-          const clampedT = Math.min(1, Math.max(0, globalT));
-          const interpSize = sizeFrom + (sizeTo - sizeFrom) * clampedT;
-          // Adaptive spacing for soft/airbrush tips at low flow
-          const _asp_softness = settings.softness ?? 0;
-          const _asp_flow = opacityFrom; // use base flow as representative value for spacing calc
-          const _asp_softFactor =
-            _asp_softness > 0.5
-              ? 1.0 -
-                (_asp_softness - 0.5) * 2.0 * (1.0 - Math.max(0.35, _asp_flow))
-              : 1.0;
-          const spacingPixels = Math.max(
-            1,
-            ((settings.spacing / 100) * interpSize * _asp_softFactor) /
-              (settings.count ?? 1),
-          );
-          if (accdist < spacingPixels) break;
-          const distFromPrev =
-            (stampsPlaced + 1) * spacingPixels - distAccumRef.current;
-          const segT = segDist > 0 ? distFromPrev / segDist : 0;
-          const sx = from.x + dx * segT;
-          const sy = from.y + dy * segT;
-          const _interpOpacity =
-            opacityFrom + (opacityTo - opacityFrom) * clampedT;
-          {
-            const _countA = settings.count ?? 1;
-            for (let _ci = 0; _ci < _countA; _ci++) {
-              const _scatter = settings.scatter ?? 0;
-              const _sizeJitter = settings.sizeJitter ?? 0;
-              const _colorJitter = settings.colorJitter ?? 0;
-              const _rotationJitter = settings.rotationJitter ?? 0;
-              const _flowJitter = settings.flowJitter ?? 0;
-              const _stampX = sx + (Math.random() - 0.5) * 2 * _scatter;
-              const _stampY = sy + (Math.random() - 0.5) * 2 * _scatter;
-              const _stampSize =
-                interpSize * (1 + (Math.random() - 0.5) * _sizeJitter);
-              const _rotJitterRad =
-                (_rotationJitter / 2) *
-                (Math.PI / 180) *
-                (Math.random() - 0.5) *
-                2;
-              const _flowJitterVal =
-                (_flowJitter / 100) *
-                _interpOpacity *
-                (Math.random() - 0.5) *
-                2;
-              const _stampOpacity = Math.max(
-                0,
-                Math.min(1, _interpOpacity + _flowJitterVal),
+
+        // Adaptive spacing (same formula as before, using A's opacity as base).
+        const _asp_softness = settings.softness ?? 0;
+        const _asp_flow = A.opacity;
+        const _asp_softFactor =
+          _asp_softness > 0.5
+            ? 1.0 -
+              (_asp_softness - 0.5) * 2.0 * (1.0 - Math.max(0.35, _asp_flow))
+            : 1.0;
+        const interpSize = (A.size + B.size) / 2;
+        const spacingPixels = Math.max(
+          1,
+          ((settings.spacing / 100) * interpSize * _asp_softFactor) /
+            (settings.count ?? 1),
+        );
+
+        // Walk this segment, placing stamps wherever distAccumRef reaches spacing.
+        let distIntoSeg = 0;
+        // How far along this segment until the first stamp lands.
+        const distToFirstStamp = spacingPixels - distAccumRef.current;
+
+        if (distToFirstStamp > segDist) {
+          // No stamp fits in this segment — accumulate and move on.
+          distAccumRef.current += segDist;
+          idx++;
+          continue;
+        }
+
+        // Place all stamps that fit in this segment.
+        distIntoSeg = distToFirstStamp;
+        while (distIntoSeg <= segDist + 1e-9) {
+          const segT = segDist > 0 ? distIntoSeg / segDist : 0;
+          const sx = A.x + dx * segT;
+          const sy = A.y + dy * segT;
+          // Pressure-interpolated opacity between the two path points.
+          const stampOpacityBase = A.opacity + (B.opacity - A.opacity) * segT;
+          // capAlpha from the nearer path point (use A's unless past midpoint).
+          const stampCapAlpha = segT < 0.5 ? A.capAlpha : B.capAlpha;
+
+          const _countA = settings.count ?? 1;
+          for (let _ci = 0; _ci < _countA; _ci++) {
+            const _scatter = settings.scatter ?? 0;
+            const _sizeJitter = settings.sizeJitter ?? 0;
+            const _colorJitter = settings.colorJitter ?? 0;
+            const _rotationJitter = settings.rotationJitter ?? 0;
+            const _flowJitter = settings.flowJitter ?? 0;
+            const _stampX = sx + (Math.random() - 0.5) * 2 * _scatter;
+            const _stampY = sy + (Math.random() - 0.5) * 2 * _scatter;
+            const _stampSize =
+              interpSize * (1 + (Math.random() - 0.5) * _sizeJitter);
+            const _rotJitterRad =
+              (_rotationJitter / 2) *
+              (Math.PI / 180) *
+              (Math.random() - 0.5) *
+              2;
+            const _flowJitterVal =
+              (_flowJitter / 100) *
+              stampOpacityBase *
+              (Math.random() - 0.5) *
+              2;
+            const _stampOpacity = Math.max(
+              0,
+              Math.min(1, stampOpacityBase + _flowJitterVal),
+            );
+            const _baseAngle =
+              settings.rotateMode === "follow"
+                ? strokeAngle
+                : (settings.rotation * Math.PI) / 180;
+            const _stampAngle = _baseAngle + _rotJitterRad;
+
+            if (_tool === "eraser") {
+              stampWebGL(
+                _stampX,
+                _stampY,
+                _stampSize,
+                _stampOpacity,
+                settings,
+                _stampAngle,
+                "rgb(255,255,255)",
+                undefined,
+                stampCapAlpha,
               );
-              const _baseAngle =
-                settings.rotateMode === "follow"
-                  ? strokeAngle
-                  : (settings.rotation * Math.PI) / 180;
-              const _stampAngle = _baseAngle + _rotJitterRad;
-              // Dual tip color (no color jitter for texture)
-              if (_tool === "eraser") {
-                stampWebGL(
-                  _stampX,
-                  _stampY,
-                  _stampSize,
-                  _stampOpacity,
-                  settings,
-                  _stampAngle,
-                  "rgb(255,255,255)",
-                  undefined,
-                  _segCapAlpha,
-                );
-              } else {
-                const _jFill =
-                  _colorJitter > 0
-                    ? _applyColorJitter(_fillStyle, _colorJitter)
-                    : _fillStyle;
-                const _dualJFill = _jFill;
-                stampWebGL(
-                  _stampX,
-                  _stampY,
-                  _stampSize,
-                  _stampOpacity,
-                  settings,
-                  _stampAngle,
-                  _jFill,
-                  _dualJFill,
-                  _segCapAlpha,
-                );
-              }
+            } else {
+              const _jFill =
+                _colorJitter > 0
+                  ? _applyColorJitter(_fillStyle, _colorJitter)
+                  : _fillStyle;
+              stampWebGL(
+                _stampX,
+                _stampY,
+                _stampSize,
+                _stampOpacity,
+                settings,
+                _stampAngle,
+                _jFill,
+                _jFill,
+                stampCapAlpha,
+              );
             }
           }
-          stampsPlaced++;
-          accdist -= spacingPixels;
+
+          distIntoSeg += spacingPixels;
         }
-        distAccumRef.current = accdist;
-        distFromSegStart += segDist;
+
+        // Remainder after the last stamp in this segment.
+        // distIntoSeg overshot segDist by (distIntoSeg - segDist - spacingPixels) beyond the last stamp.
+        // The last stamp was at distIntoSeg - spacingPixels.
+        const lastStampDistIntoSeg = distIntoSeg - spacingPixels;
+        distAccumRef.current = segDist - lastStampDistIntoSeg;
+
+        // Update lastStampPathIdx to point to this segment.
+        lastStampPathIdxRef.current = idx;
+        idx++;
       }
+
+      // Suppress unused-variable warnings — fromPoint / toPoint only used for
+      // documentation of the approach above.
+      void fromPoint;
+      void toPoint;
     },
     [stampWebGL],
   );
 
   // ── renderSmearAlongPoints ────────────────────────────────────────────────
-  // HeavyPaint-style smudge: samples paint at stroke start, drags it forward blending with canvas.
+  // Spec-compliant smudge: carries a pixel buffer across the stroke.
+  // Per-stamp order: (1) sample canvas, (2) blend buffer, (3) deposit with tip mask.
   // Must call initSmudgeBuffer(lc, pos, size) at stroke start before first move.
   // biome-ignore lint/correctness/useExhaustiveDependencies: all refs are stable (useRef)
   const renderSmearAlongPoints = useCallback(
@@ -612,6 +714,7 @@ export function useStrokeEngine({
       brushSizeVal: number,
       settings: BrushSettings,
       strength = 0.8,
+      opacity = 1.0,
     ) => {
       // Ruler layer guard — silently abort; tool stays active but produces no output
       if (
@@ -621,6 +724,10 @@ export function useStrokeEngine({
         return;
       const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
       if (!ctx || points.length < 2) return;
+
+      // At strength=0: complete no-op — depositOpacity=0, nothing deposited.
+      if (strength <= 0) return;
+
       const size = brushSizeVal;
       const radius = size / 2;
       const cw = lc.width;
@@ -630,6 +737,13 @@ export function useStrokeEngine({
       const scatter = settings.scatter ?? 0;
       const count = Math.max(1, settings.count ?? 1);
       const spacingPx = Math.max(1, ((settings.spacing ?? 5) / 100) * size);
+
+      // absorbRate = 1 - strength
+      // strength=1 → absorbRate=0 → buffer never changes (thick wet paint drag)
+      // strength=0 → absorbRate=1 → buffer immediately becomes canvas (no-op: deposit=0)
+      const absorbRate = 1.0 - strength;
+      // depositOpacity scales with strength
+      const depositOpacity = opacity * strength;
 
       // Ensure smudge buffer typed array is allocated and sized correctly.
       // initSmudgeBuffer() is called at stroke start; this is a safety-net fallback.
@@ -702,7 +816,8 @@ export function useStrokeEngine({
             if (clampedW <= 0 || clampedH <= 0) continue;
 
             try {
-              // Build softness weight mask — cached on bufSize + tip image (not clampedW/H)
+              // Build tip alpha mask — cached on bufSize + tip image + softness.
+              // This mask defines tipAlpha per pixel within the bufSize bounding box.
               const maxBufPixels = bufSize * bufSize;
               if (
                 !_smearSoftnessWeights ||
@@ -720,7 +835,7 @@ export function useStrokeEngine({
                 _smearSoftnessSize !== bufSize ||
                 _smearTipCacheKey !== newTipKey
               ) {
-                // Compute circular softness falloff
+                // Compute circular softness falloff (gaussian-style via hardness)
                 const cx2 = bufSize / 2;
                 const cy2 = bufSize / 2;
                 const r = bufSize / 2;
@@ -771,7 +886,8 @@ export function useStrokeEngine({
               const swOffX = Math.max(0, -destX);
               const swOffY = Math.max(0, -destY);
 
-              // Read canvas pixels at the stamp destination (1 getImageData per stamp).
+              // ── Step 1: Sample canvas BEFORE deposit ──────────────────────
+              // Read canvas pixels at the stamp destination.
               const patchLen = clampedW * clampedH * 4;
               if (!_smearPatchData || _smearPatchDataCapacity < patchLen) {
                 _smearPatchData = new Uint8ClampedArray(
@@ -779,7 +895,7 @@ export function useStrokeEngine({
                 );
                 _smearPatchDataCapacity = _smearPatchData.length;
               }
-              const ocd = _smearPatchData.subarray(0, patchLen);
+              const canvasPixels = _smearPatchData.subarray(0, patchLen);
               if (
                 _smudgeCanvasMirror &&
                 _smudgeCanvasMirrorW === cw &&
@@ -788,58 +904,143 @@ export function useStrokeEngine({
                 for (let row = 0; row < clampedH; row++) {
                   const srcOff = ((clampedY + row) * cw + clampedX) * 4;
                   const dstOff = row * clampedW * 4;
-                  ocd.set(
+                  canvasPixels.set(
                     _smudgeCanvasMirror.subarray(srcOff, srcOff + clampedW * 4),
                     dstOff,
                   );
                 }
               } else {
-                // Fallback: mirror not available, use getImageData
                 const fallback = ctx.getImageData(
                   clampedX,
                   clampedY,
                   clampedW,
                   clampedH,
                 );
-                ocd.set(fallback.data);
+                canvasPixels.set(fallback.data);
               }
 
-              // Ensure paint output array is large enough
+              // ── Step 2: Update carried buffer (blendBuffers) ──────────────
+              // Premultiplied-alpha lerp to prevent black bleed when blending
+              // into transparent canvas space (RGBA 0,0,0,0).
+              // Straight-alpha lerp pulls RGB toward (0,0,0) because transparent
+              // pixels have RGB=0. Premultiplied space naturally handles this:
+              // a fully-transparent pixel has all premultiplied channels = 0,
+              // so blending toward it fades color to transparent without tinting.
+              //
+              // absorbRate=0 → carried unchanged; absorbRate=1 → carried becomes canvas
+              const bd = _smudgeBufferData!;
+              if (absorbRate > 0) {
+                let lpx2 = 0;
+                let lpy2 = 0;
+                for (let i = 0; i < canvasPixels.length; i += 4) {
+                  const bufIdx =
+                    ((lpy2 + swOffY) * bufSize + (lpx2 + swOffX)) * 4;
+
+                  // Convert canvas sample to premultiplied alpha
+                  const cA = canvasPixels[i + 3] / 255;
+                  const cR_pre = canvasPixels[i] * cA;
+                  const cG_pre = canvasPixels[i + 1] * cA;
+                  const cB_pre = canvasPixels[i + 2] * cA;
+                  const cA_pre = canvasPixels[i + 3];
+
+                  // Convert carried buffer pixel to premultiplied alpha
+                  const bA = bd[bufIdx + 3] / 255;
+                  const bR_pre = bd[bufIdx] * bA;
+                  const bG_pre = bd[bufIdx + 1] * bA;
+                  const bB_pre = bd[bufIdx + 2] * bA;
+                  const bA_pre = bd[bufIdx + 3];
+
+                  // Lerp in premultiplied space
+                  const rR_pre = bR_pre + (cR_pre - bR_pre) * absorbRate;
+                  const rG_pre = bG_pre + (cG_pre - bG_pre) * absorbRate;
+                  const rB_pre = bB_pre + (cB_pre - bB_pre) * absorbRate;
+                  const rA_pre = bA_pre + (cA_pre - bA_pre) * absorbRate;
+
+                  // Convert back to straight alpha
+                  const rA_norm = rA_pre / 255;
+                  bd[bufIdx + 3] = Math.round(rA_pre);
+                  if (rA_norm > 0) {
+                    bd[bufIdx] = Math.round(rR_pre / rA_norm);
+                    bd[bufIdx + 1] = Math.round(rG_pre / rA_norm);
+                    bd[bufIdx + 2] = Math.round(rB_pre / rA_norm);
+                  } else {
+                    // Fully transparent — RGB is irrelevant, zero it out cleanly
+                    bd[bufIdx] = 0;
+                    bd[bufIdx + 1] = 0;
+                    bd[bufIdx + 2] = 0;
+                  }
+
+                  lpx2++;
+                  if (lpx2 >= clampedW) {
+                    lpx2 = 0;
+                    lpy2++;
+                  }
+                }
+              }
+
+              // ── Step 3: Deposit carried buffer onto canvas with tip mask ──
+              // For each pixel: source-over composite at depositOpacity × tipAlpha.
+              // Read existing canvas pixels for source-over blending.
               if (!_smearPaintData || _smearPaintData.length < patchLen) {
                 _smearPaintData = new Uint8ClampedArray(
                   Math.max(patchLen, SMEAR_BUF_SIZE),
                 );
               }
-              const paintData = _smearPaintData.subarray(0, patchLen);
+              const outputPixels = _smearPaintData.subarray(0, patchLen);
 
-              // getImageData/putImageData use STRAIGHT (un-premultiplied) alpha.
               let lpx = 0;
               let lpy = 0;
-              const bd = _smudgeBufferData!;
-              for (let i = 0; i < ocd.length; i += 4) {
+              for (let i = 0; i < canvasPixels.length; i += 4) {
                 const bufIdx = ((lpy + swOffY) * bufSize + (lpx + swOffX)) * 4;
-                const sWeight = sw[(lpy + swOffY) * bufSize + (lpx + swOffX)];
+                const tipAlpha = sw[(lpy + swOffY) * bufSize + (lpx + swOffX)];
 
-                const bR = bd[bufIdx];
-                const bG = bd[bufIdx + 1];
-                const bB = bd[bufIdx + 2];
-                const bA = bd[bufIdx + 3];
+                // Final source alpha = depositOpacity × tipAlpha × (carried alpha / 255)
+                const srcA = (depositOpacity * tipAlpha * bd[bufIdx + 3]) / 255;
 
-                const oA = ocd[i + 3];
-                const oR = oA > 0 ? ocd[i] : bR;
-                const oG = oA > 0 ? ocd[i + 1] : bG;
-                const oB = oA > 0 ? ocd[i + 2] : bB;
-
-                const blendFactor = sWeight * strength;
-                paintData[i] = oR + (bR - oR) * blendFactor;
-                paintData[i + 1] = oG + (bG - oG) * blendFactor;
-                paintData[i + 2] = oB + (bB - oB) * blendFactor;
-                paintData[i + 3] = oA + (bA - oA) * blendFactor;
-
-                bd[bufIdx] = oR + (bR - oR) * strength;
-                bd[bufIdx + 1] = oG + (bG - oG) * strength;
-                bd[bufIdx + 2] = oB + (bB - oB) * strength;
-                bd[bufIdx + 3] = oA + (bA - oA) * strength;
+                if (srcA <= 0) {
+                  // Tip mask = 0: pass canvas pixel through unchanged
+                  outputPixels[i] = canvasPixels[i];
+                  outputPixels[i + 1] = canvasPixels[i + 1];
+                  outputPixels[i + 2] = canvasPixels[i + 2];
+                  outputPixels[i + 3] = canvasPixels[i + 3];
+                } else {
+                  // Source-over composite (straight alpha):
+                  // outA   = srcA + dstA*(1 - srcA)
+                  // outRGB = (srcRGB*srcA + dstRGB*dstA*(1-srcA)) / outA
+                  const dstA = canvasPixels[i + 3] / 255;
+                  const outA = srcA + dstA * (1 - srcA);
+                  if (outA > 0) {
+                    const invSrcA = 1 - srcA;
+                    const srcContrib = srcA / outA;
+                    const dstContrib = (dstA * invSrcA) / outA;
+                    outputPixels[i] = Math.min(
+                      255,
+                      Math.round(
+                        bd[bufIdx] * srcContrib + canvasPixels[i] * dstContrib,
+                      ),
+                    );
+                    outputPixels[i + 1] = Math.min(
+                      255,
+                      Math.round(
+                        bd[bufIdx + 1] * srcContrib +
+                          canvasPixels[i + 1] * dstContrib,
+                      ),
+                    );
+                    outputPixels[i + 2] = Math.min(
+                      255,
+                      Math.round(
+                        bd[bufIdx + 2] * srcContrib +
+                          canvasPixels[i + 2] * dstContrib,
+                      ),
+                    );
+                    outputPixels[i + 3] = Math.min(255, Math.round(outA * 255));
+                  } else {
+                    outputPixels[i] = 0;
+                    outputPixels[i + 1] = 0;
+                    outputPixels[i + 2] = 0;
+                    outputPixels[i + 3] = 0;
+                  }
+                }
 
                 lpx++;
                 if (lpx >= clampedW) {
@@ -855,11 +1056,11 @@ export function useStrokeEngine({
               ) {
                 _smearOutputImageData = new ImageData(clampedW, clampedH);
               }
-              _smearOutputImageData.data.set(paintData);
+              _smearOutputImageData.data.set(outputPixels);
               ctx.putImageData(_smearOutputImageData, clampedX, clampedY);
               markLayerBitmapDirty(activeLayerIdRef.current);
 
-              // Keep mirror in sync so subsequent stamps see updated pixels
+              // Keep mirror in sync so subsequent stamps read the updated canvas
               if (
                 _smudgeCanvasMirror &&
                 _smudgeCanvasMirrorW === cw &&
@@ -869,7 +1070,7 @@ export function useStrokeEngine({
                   const dstOff = ((clampedY + row) * cw + clampedX) * 4;
                   const srcOff = row * clampedW * 4;
                   _smudgeCanvasMirror.set(
-                    paintData.subarray(srcOff, srcOff + clampedW * 4),
+                    outputPixels.subarray(srcOff, srcOff + clampedW * 4),
                     dstOff,
                   );
                 }
@@ -944,6 +1145,9 @@ export function useStrokeEngine({
   );
 
   return {
+    // Path accumulation refs — must be reset at stroke start (pointer-down)
+    strokePathBufferRef,
+    lastStampPathIdxRef,
     // Stroke lifecycle refs
     tailRafIdRef,
     tailDoCommitRef,

@@ -19,10 +19,35 @@ export const _ImmutableObjectStorageRefillResult = IDL.Record({
   'success' : IDL.Opt(IDL.Bool),
   'topped_up_amount' : IDL.Opt(IDL.Nat),
 });
+export const ImageReference = IDL.Record({
+  'id' : IDL.Text,
+  'height' : IDL.Nat,
+  'assetUrl' : IDL.Text,
+  'width' : IDL.Nat,
+});
 export const UserRole = IDL.Variant({
   'admin' : IDL.Null,
   'user' : IDL.Null,
   'guest' : IDL.Null,
+});
+export const ImageSet = IDL.Record({
+  'id' : IDL.Text,
+  'name' : IDL.Text,
+  'tags' : IDL.Vec(IDL.Text),
+  'imageCount' : IDL.Nat,
+  'isFree' : IDL.Bool,
+  'previewThumbnail' : IDL.Text,
+  'isDefault' : IDL.Bool,
+  'priceICP' : IDL.Opt(IDL.Text),
+  'images' : IDL.Vec(ImageReference),
+});
+export const PublicImageSet = IDL.Record({
+  'id' : IDL.Text,
+  'name' : IDL.Text,
+  'imageCount' : IDL.Nat,
+  'isFree' : IDL.Bool,
+  'previewThumbnail' : IDL.Text,
+  'isDefault' : IDL.Bool,
 });
 export const UserProfile = IDL.Record({ 'name' : IDL.Text });
 export const CanvasSave = IDL.Text;
@@ -82,27 +107,59 @@ export const idlService = IDL.Service({
     ),
   '_immutableObjectStorageUpdateGatewayPrincipals' : IDL.Func([], [], []),
   '_initializeAccessControl' : IDL.Func([], [], []),
+  'addAdmin' : IDL.Func([IDL.Principal], [IDL.Bool], []),
+  'addImageToSet' : IDL.Func([IDL.Text, ImageReference], [IDL.Bool], []),
   'assignCallerUserRole' : IDL.Func([IDL.Principal, UserRole], [], []),
+  'checkUsernameAvailable' : IDL.Func([IDL.Text], [IDL.Bool], ['query']),
+  'createImageSet' : IDL.Func(
+      [IDL.Text, IDL.Bool, IDL.Bool, IDL.Opt(IDL.Text)],
+      [IDL.Opt(IDL.Text)],
+      [],
+    ),
   'deleteBrush' : IDL.Func([IDL.Text], [], []),
+  'deleteImageSet' : IDL.Func([IDL.Text], [IDL.Bool], []),
+  'getAllImageSetsAdmin' : IDL.Func([], [IDL.Vec(ImageSet)], []),
+  'getAllPublicImageSets' : IDL.Func([], [IDL.Vec(PublicImageSet)], ['query']),
+  'getAvailableImageSets' : IDL.Func([], [IDL.Vec(ImageSet)], ['query']),
   'getBrushPresets' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
   'getCallerUserProfile' : IDL.Func([], [IDL.Opt(UserProfile)], ['query']),
   'getCallerUserRole' : IDL.Func([], [UserRole], ['query']),
   'getCanvasHash' : IDL.Func([], [IDL.Opt(CanvasSave)], ['query']),
-  'getPreferences' : IDL.Func([], [IDL.Opt(UserPreferences)], ['query']),
+  'getMyUsername' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
+  'getPreferences' : IDL.Func([], [IDL.Opt(UserPreferences)], []),
   'getSchemaVersion' : IDL.Func([], [IDL.Nat], ['query']),
+  'getUserEntitlements' : IDL.Func([], [IDL.Vec(IDL.Text)], ['query']),
+  'getUserImageSets' : IDL.Func([], [IDL.Vec(ImageSet)], []),
   'getUserProfile' : IDL.Func(
       [IDL.Principal],
       [IDL.Opt(UserProfile)],
       ['query'],
     ),
   'getUserSettings' : IDL.Func([], [IDL.Opt(SettingsSave)], ['query']),
+  'getUsernameForPrincipal' : IDL.Func(
+      [IDL.Principal],
+      [IDL.Opt(IDL.Text)],
+      ['query'],
+    ),
+  'grantEntitlement' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], []),
+  'grantPackEntitlement' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], []),
+  'isAdmin' : IDL.Func([IDL.Principal], [IDL.Bool], ['query']),
   'isCallerAdmin' : IDL.Func([], [IDL.Bool], ['query']),
+  'registerUsername' : IDL.Func([IDL.Text], [IDL.Bool], []),
+  'removeAdmin' : IDL.Func([IDL.Principal], [IDL.Bool], []),
+  'removeImageFromSet' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
+  'renameSet' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
+  'revokeEntitlement' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], []),
   'saveBrush' : IDL.Func([BrushPreset], [], []),
   'saveBrushPresets' : IDL.Func([IDL.Text], [], []),
   'saveCallerUserProfile' : IDL.Func([UserProfile], [], []),
   'saveCanvasHash' : IDL.Func([CanvasSave], [], []),
   'savePreferences' : IDL.Func([UserPreferences], [], []),
   'saveUserSettings' : IDL.Func([SettingsSave], [], []),
+  'setImageSetDefault' : IDL.Func([IDL.Text], [IDL.Bool], []),
+  'setImageSetPrice' : IDL.Func([IDL.Text, IDL.Opt(IDL.Text)], [IDL.Bool], []),
+  'setPaymentsCanisterPrincipal' : IDL.Func([IDL.Principal], [IDL.Bool], []),
+  'updateSetTags' : IDL.Func([IDL.Text, IDL.Vec(IDL.Text)], [IDL.Bool], []),
 });
 
 export const idlInitArgs = [];
@@ -119,10 +176,35 @@ export const idlFactory = ({ IDL }) => {
     'success' : IDL.Opt(IDL.Bool),
     'topped_up_amount' : IDL.Opt(IDL.Nat),
   });
+  const ImageReference = IDL.Record({
+    'id' : IDL.Text,
+    'height' : IDL.Nat,
+    'assetUrl' : IDL.Text,
+    'width' : IDL.Nat,
+  });
   const UserRole = IDL.Variant({
     'admin' : IDL.Null,
     'user' : IDL.Null,
     'guest' : IDL.Null,
+  });
+  const ImageSet = IDL.Record({
+    'id' : IDL.Text,
+    'name' : IDL.Text,
+    'tags' : IDL.Vec(IDL.Text),
+    'imageCount' : IDL.Nat,
+    'isFree' : IDL.Bool,
+    'previewThumbnail' : IDL.Text,
+    'isDefault' : IDL.Bool,
+    'priceICP' : IDL.Opt(IDL.Text),
+    'images' : IDL.Vec(ImageReference),
+  });
+  const PublicImageSet = IDL.Record({
+    'id' : IDL.Text,
+    'name' : IDL.Text,
+    'imageCount' : IDL.Nat,
+    'isFree' : IDL.Bool,
+    'previewThumbnail' : IDL.Text,
+    'isDefault' : IDL.Bool,
   });
   const UserProfile = IDL.Record({ 'name' : IDL.Text });
   const CanvasSave = IDL.Text;
@@ -182,27 +264,71 @@ export const idlFactory = ({ IDL }) => {
       ),
     '_immutableObjectStorageUpdateGatewayPrincipals' : IDL.Func([], [], []),
     '_initializeAccessControl' : IDL.Func([], [], []),
+    'addAdmin' : IDL.Func([IDL.Principal], [IDL.Bool], []),
+    'addImageToSet' : IDL.Func([IDL.Text, ImageReference], [IDL.Bool], []),
     'assignCallerUserRole' : IDL.Func([IDL.Principal, UserRole], [], []),
+    'checkUsernameAvailable' : IDL.Func([IDL.Text], [IDL.Bool], ['query']),
+    'createImageSet' : IDL.Func(
+        [IDL.Text, IDL.Bool, IDL.Bool, IDL.Opt(IDL.Text)],
+        [IDL.Opt(IDL.Text)],
+        [],
+      ),
     'deleteBrush' : IDL.Func([IDL.Text], [], []),
+    'deleteImageSet' : IDL.Func([IDL.Text], [IDL.Bool], []),
+    'getAllImageSetsAdmin' : IDL.Func([], [IDL.Vec(ImageSet)], []),
+    'getAllPublicImageSets' : IDL.Func(
+        [],
+        [IDL.Vec(PublicImageSet)],
+        ['query'],
+      ),
+    'getAvailableImageSets' : IDL.Func([], [IDL.Vec(ImageSet)], ['query']),
     'getBrushPresets' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
     'getCallerUserProfile' : IDL.Func([], [IDL.Opt(UserProfile)], ['query']),
     'getCallerUserRole' : IDL.Func([], [UserRole], ['query']),
     'getCanvasHash' : IDL.Func([], [IDL.Opt(CanvasSave)], ['query']),
-    'getPreferences' : IDL.Func([], [IDL.Opt(UserPreferences)], ['query']),
+    'getMyUsername' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
+    'getPreferences' : IDL.Func([], [IDL.Opt(UserPreferences)], []),
     'getSchemaVersion' : IDL.Func([], [IDL.Nat], ['query']),
+    'getUserEntitlements' : IDL.Func([], [IDL.Vec(IDL.Text)], ['query']),
+    'getUserImageSets' : IDL.Func([], [IDL.Vec(ImageSet)], []),
     'getUserProfile' : IDL.Func(
         [IDL.Principal],
         [IDL.Opt(UserProfile)],
         ['query'],
       ),
     'getUserSettings' : IDL.Func([], [IDL.Opt(SettingsSave)], ['query']),
+    'getUsernameForPrincipal' : IDL.Func(
+        [IDL.Principal],
+        [IDL.Opt(IDL.Text)],
+        ['query'],
+      ),
+    'grantEntitlement' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], []),
+    'grantPackEntitlement' : IDL.Func(
+        [IDL.Principal, IDL.Text],
+        [IDL.Bool],
+        [],
+      ),
+    'isAdmin' : IDL.Func([IDL.Principal], [IDL.Bool], ['query']),
     'isCallerAdmin' : IDL.Func([], [IDL.Bool], ['query']),
+    'registerUsername' : IDL.Func([IDL.Text], [IDL.Bool], []),
+    'removeAdmin' : IDL.Func([IDL.Principal], [IDL.Bool], []),
+    'removeImageFromSet' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
+    'renameSet' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
+    'revokeEntitlement' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], []),
     'saveBrush' : IDL.Func([BrushPreset], [], []),
     'saveBrushPresets' : IDL.Func([IDL.Text], [], []),
     'saveCallerUserProfile' : IDL.Func([UserProfile], [], []),
     'saveCanvasHash' : IDL.Func([CanvasSave], [], []),
     'savePreferences' : IDL.Func([UserPreferences], [], []),
     'saveUserSettings' : IDL.Func([SettingsSave], [], []),
+    'setImageSetDefault' : IDL.Func([IDL.Text], [IDL.Bool], []),
+    'setImageSetPrice' : IDL.Func(
+        [IDL.Text, IDL.Opt(IDL.Text)],
+        [IDL.Bool],
+        [],
+      ),
+    'setPaymentsCanisterPrincipal' : IDL.Func([IDL.Principal], [IDL.Bool], []),
+    'updateSetTags' : IDL.Func([IDL.Text, IDL.Vec(IDL.Text)], [IDL.Bool], []),
   });
 };
 

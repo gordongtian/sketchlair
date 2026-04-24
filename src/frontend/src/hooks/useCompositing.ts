@@ -24,10 +24,12 @@ import {
   isFlatLayer,
 } from "@/utils/groupUtils";
 import type { FlatEntry } from "@/utils/groupUtils";
+import { drawQuadWarpHomography } from "@/utils/homographyWarp";
 import { useCallback, useRef } from "react";
 import type React from "react";
 import { isIPad } from "../utils/constants";
 import { getLiquifyStrokeActive } from "./useLiquifySystem";
+import { getTransformCornersWorld } from "./useTransformSystem";
 
 // ─── ImageBitmap cache ────────────────────────────────────────────────────────
 // GPU-resident bitmaps that avoid re-uploading layer pixel data on every drawImage call.
@@ -91,7 +93,11 @@ export function getBitmapOrCanvas(
   return lc;
 }
 
-// ─── scheduleComposite cancellation token ────────────────────────────────────
+// ─── Quad warp preview ────────────────────────────────────────────────────────
+// drawQuadWarpHomography (imported from @/utils/homographyWarp) is used for all
+// transform previews — it uses the same DLT homography + backward-mapping
+// bilinear interpolation as the commit path, so preview and result are identical.
+
 // Module-level RAF ID so external callers (e.g. liquify pointer-down) can cancel
 // a pending scheduleComposite RAF that has already been enqueued. Without this,
 // the two-RAF chain  (_liqRafPendingRef → scheduleComposite inner RAF) means
@@ -367,6 +373,19 @@ export interface UseCompositingParams {
    *  its per-layer float canvas at the current transform position instead of its
    *  raw (now-empty) layer canvas. */
   multiLayerResolvedIdsRef: React.MutableRefObject<string[]>;
+  /** Free-corner warp state — set when user Ctrl+drags a corner handle.
+   *  When present, the compositing loop uses homography preview instead of
+   *  the affine xfState path. */
+  freeCornerStateRef: React.MutableRefObject<{
+    corners: {
+      tl: { x: number; y: number };
+      tr: { x: number; y: number };
+      bl: { x: number; y: number };
+      br: { x: number; y: number };
+    };
+    draggedCorner: "tl" | "tr" | "bl" | "br";
+    origRect: { x: number; y: number; w: number; h: number };
+  } | null>;
   moveFloatCanvasRef: React.MutableRefObject<HTMLCanvasElement | null>;
   moveFloatOriginBoundsRef: React.MutableRefObject<{
     x: number;
@@ -378,6 +397,12 @@ export interface UseCompositingParams {
   transformOrigFloatCanvasRef: React.MutableRefObject<HTMLCanvasElement | null>;
   webglBrushRef: React.MutableRefObject<{ clear(): void } | null>;
   getActiveSize: () => number;
+  /** True while Ctrl+drag layer move is in progress — the moving layer is rendered offset. */
+  ctrlDragMoveActiveRef: React.MutableRefObject<boolean>;
+  /** Canvas-space offset accumulated during Ctrl+drag, applied to the moving layer during preview. */
+  ctrlDragOffsetRef: React.MutableRefObject<{ x: number; y: number }>;
+  /** ID of the layer being Ctrl+drag-moved (may differ from activeLayerIdRef when Ctrl+Shift picked a layer). */
+  ctrlDragMovingLayerIdRef: React.MutableRefObject<string>;
   /**
    * Canvas integrity utility — returns a correctly-sized HTMLCanvasElement for
    * the given layerId, creating or resizing it if necessary.
@@ -471,6 +496,7 @@ export function useCompositing({
   transformActiveRef,
   multiFloatCanvasesRef: _multiFloatCanvasesRef, // per-layer float canvases for multi-layer transform
   multiLayerResolvedIdsRef,
+  freeCornerStateRef,
   moveFloatCanvasRef,
   moveFloatOriginBoundsRef,
   xfStateRef,
@@ -478,6 +504,9 @@ export function useCompositing({
   webglBrushRef,
   getActiveSize,
   getOrCreateLayerCanvas,
+  ctrlDragMoveActiveRef,
+  ctrlDragOffsetRef,
+  ctrlDragMovingLayerIdRef,
 }: UseCompositingParams) {
   // ── composite ──────────────────────────────────────────────────────────────
   // Composite all visible layers onto display canvas.
@@ -835,57 +864,76 @@ export function useCompositing({
           layersBeingExtractedRef.current.has(layer.id);
 
         if (isMultiLayerParticipant && perLayerFloat) {
-          // Render this layer's per-layer float canvas at the current transform position.
-          // The float contains ONLY this layer's pixels — no masking needed.
-          const xf = xfStateRef.current;
-          const ob = moveFloatOriginBoundsRef.current;
-          // Use a temp canvas so we can apply the layer's blend mode correctly
-          if (
-            _clipTmpCanvas.width !== lc.width ||
-            _clipTmpCanvas.height !== lc.height
-          ) {
-            _clipTmpCanvas.width = lc.width;
-            _clipTmpCanvas.height = lc.height;
-            _clipTmpCtxCached = null;
-          }
-          if (!_clipTmpCtxCached)
-            _clipTmpCtxCached = _clipTmpCanvas.getContext("2d", {
-              willReadFrequently: !isIPad,
-            });
-          const tmpCtx = _clipTmpCtxCached!;
-          tmpCtx.clearRect(0, 0, lc.width, lc.height);
-          tmpCtx.globalAlpha = 1;
-          tmpCtx.globalCompositeOperation = "source-over";
-          // Draw the layer's cleared canvas first (it's empty but preserves blend-mode slot)
-          // then draw the float on top
-          if (xf && ob) {
-            const cx = xf.x + xf.w / 2;
-            const cy = xf.y + xf.h / 2;
-            tmpCtx.save();
-            tmpCtx.translate(cx, cy);
-            tmpCtx.rotate(xf.rotation);
-            tmpCtx.drawImage(
-              perLayerFloat,
-              ob.x,
-              ob.y,
-              ob.w,
-              ob.h,
-              -xf.w / 2,
-              -xf.h / 2,
-              xf.w,
-              xf.h,
-            );
-            tmpCtx.restore();
-          } else if (xf) {
-            tmpCtx.drawImage(perLayerFloat, xf.x, xf.y);
+          // ── Free-corner warp preview ───────────────────────────────────
+          // When freeCornerStateRef is active, use quad-warp (triangle-split affine)
+          // to preview the perspective deformation live during drag.
+          const fcs = freeCornerStateRef.current;
+          if (fcs) {
+            // Use moveFloatOriginBoundsRef directly (same ref the commit path reads as
+            // obCommit) so preview and commit always sample the identical source rect.
+            const or = moveFloatOriginBoundsRef.current ?? fcs.origRect;
+            if (
+              _clipTmpCanvas.width !== lc.width ||
+              _clipTmpCanvas.height !== lc.height
+            ) {
+              _clipTmpCanvas.width = lc.width;
+              _clipTmpCanvas.height = lc.height;
+              _clipTmpCtxCached = null;
+            }
+            if (!_clipTmpCtxCached)
+              _clipTmpCtxCached = _clipTmpCanvas.getContext("2d", {
+                willReadFrequently: !isIPad,
+              });
+            const tmpCtx = _clipTmpCtxCached!;
+            tmpCtx.clearRect(0, 0, lc.width, lc.height);
+            tmpCtx.globalAlpha = 1;
+            tmpCtx.globalCompositeOperation = "source-over";
+            drawQuadWarpHomography(tmpCtx, perLayerFloat, or, fcs.corners);
+            renderCtx.globalAlpha = effectiveOpacity;
+            renderCtx.globalCompositeOperation = (layer.blendMode ||
+              "source-over") as GlobalCompositeOperation;
+            renderCtx.drawImage(_clipTmpCanvas, 0, 0);
+            renderCtx.globalCompositeOperation = "source-over";
           } else {
-            tmpCtx.drawImage(perLayerFloat, 0, 0);
-          }
-          renderCtx.globalAlpha = effectiveOpacity;
-          renderCtx.globalCompositeOperation = (layer.blendMode ||
-            "source-over") as GlobalCompositeOperation;
-          renderCtx.drawImage(_clipTmpCanvas, 0, 0);
-          renderCtx.globalCompositeOperation = "source-over";
+            // ── Quad-warp (rotation + skew) multi-layer preview ────────────
+            // Render this layer's per-layer float canvas at the current transform position.
+            // Uses drawQuadWarpHomography — same algorithm as commit — so preview
+            // matches the committed result exactly, including when skew is applied.
+            const xf = xfStateRef.current;
+            const ob = moveFloatOriginBoundsRef.current;
+            // Use a temp canvas so we can apply the layer's blend mode correctly
+            if (
+              _clipTmpCanvas.width !== lc.width ||
+              _clipTmpCanvas.height !== lc.height
+            ) {
+              _clipTmpCanvas.width = lc.width;
+              _clipTmpCanvas.height = lc.height;
+              _clipTmpCtxCached = null;
+            }
+            if (!_clipTmpCtxCached)
+              _clipTmpCtxCached = _clipTmpCanvas.getContext("2d", {
+                willReadFrequently: !isIPad,
+              });
+            const tmpCtx = _clipTmpCtxCached!;
+            tmpCtx.clearRect(0, 0, lc.width, lc.height);
+            tmpCtx.globalAlpha = 1;
+            tmpCtx.globalCompositeOperation = "source-over";
+            if (xf && ob) {
+              // Compute the four destination corners in canvas-pixel space using the
+              // same transform (rotate then skew) that the commit path uses.
+              const dstCorners = getTransformCornersWorld(xf);
+              drawQuadWarpHomography(tmpCtx, perLayerFloat, ob, dstCorners);
+            } else if (xf) {
+              tmpCtx.drawImage(perLayerFloat, xf.x, xf.y);
+            } else {
+              tmpCtx.drawImage(perLayerFloat, 0, 0);
+            }
+            renderCtx.globalAlpha = effectiveOpacity;
+            renderCtx.globalCompositeOperation = (layer.blendMode ||
+              "source-over") as GlobalCompositeOperation;
+            renderCtx.drawImage(_clipTmpCanvas, 0, 0);
+            renderCtx.globalCompositeOperation = "source-over";
+          } // end fcs else
         } else if (isMultiLayerParticipant && !perLayerFloat) {
           // Float not yet available (extraction in progress) — render as empty slot
         } else if (isSingleLayerFloat) {
@@ -911,24 +959,27 @@ export function useCompositing({
           const ob = moveFloatOriginBoundsRef.current;
           const floatSource =
             transformOrigFloatCanvasRef.current || moveFloatCanvasRef.current!;
-          if (xf && ob && floatSource) {
-            const cx = xf.x + xf.w / 2;
-            const cy = xf.y + xf.h / 2;
-            tmpCtx.save();
-            tmpCtx.translate(cx, cy);
-            tmpCtx.rotate(xf.rotation);
-            tmpCtx.drawImage(
+          // ── Free-corner warp preview (single-layer) ─────────────────────
+          const fcsSL = freeCornerStateRef.current;
+          if (fcsSL && floatSource) {
+            // Use moveFloatOriginBoundsRef directly (same ref the commit path reads as
+            // obCommit) so preview and commit always sample the identical source rect.
+            const fcsSLRect =
+              moveFloatOriginBoundsRef.current ?? fcsSL.origRect;
+            drawQuadWarpHomography(
+              tmpCtx,
               floatSource,
-              ob.x,
-              ob.y,
-              ob.w,
-              ob.h,
-              -xf.w / 2,
-              -xf.h / 2,
-              xf.w,
-              xf.h,
+              fcsSLRect,
+              fcsSL.corners,
             );
-            tmpCtx.restore();
+          } else if (xf && ob && floatSource) {
+            // ── Quad-warp (rotation + skew) single-layer preview ───────────
+            // Uses drawQuadWarpHomography — same algorithm as commit — so the preview
+            // matches the committed result exactly, including when skew is applied.
+            // Destination corners are computed from the full transform matrix
+            // (rotate then skew) in canvas-pixel space.
+            const dstCorners = getTransformCornersWorld(xf);
+            drawQuadWarpHomography(tmpCtx, floatSource, ob, dstCorners);
           } else if (xf && floatSource) {
             tmpCtx.drawImage(floatSource, xf.x, xf.y);
           } else if (floatSource) {
@@ -940,11 +991,25 @@ export function useCompositing({
           renderCtx.drawImage(_clipTmpCanvas, 0, 0);
           renderCtx.globalCompositeOperation = "source-over";
         } else if (!isBeingExtracted) {
-          // Normal layer — draw from cache
+          // Normal layer — draw from cache.
+          // If this layer is being Ctrl+drag-moved, apply the preview offset.
+          const ctrlDragOffset =
+            ctrlDragMoveActiveRef.current &&
+            layer.id === ctrlDragMovingLayerIdRef.current
+              ? ctrlDragOffsetRef.current
+              : null;
           renderCtx.globalAlpha = effectiveOpacity;
           renderCtx.globalCompositeOperation = (layer.blendMode ||
             "source-over") as GlobalCompositeOperation;
-          renderCtx.drawImage(getBitmapOrCanvas(layer.id, lc), 0, 0);
+          if (ctrlDragOffset) {
+            renderCtx.drawImage(
+              getBitmapOrCanvas(layer.id, lc),
+              ctrlDragOffset.x,
+              ctrlDragOffset.y,
+            );
+          } else {
+            renderCtx.drawImage(getBitmapOrCanvas(layer.id, lc), 0, 0);
+          }
           renderCtx.globalCompositeOperation = "source-over";
         }
       }
@@ -1037,7 +1102,7 @@ export function useCompositing({
         previewCtx.globalCompositeOperation =
           tool === "eraser" || brushBlendModeRef.current === "clear"
             ? "destination-out"
-            : "source-over";
+            : (brushBlendModeRef.current as GlobalCompositeOperation);
         previewCtx.drawImage(_tempStrokeCanvas, cx, cy, cw, ch, cx, cy, cw, ch);
         previewCtx.globalAlpha = 1;
         previewCtx.globalCompositeOperation = "source-over";
@@ -1072,7 +1137,7 @@ export function useCompositing({
         previewCtx.globalCompositeOperation =
           tool === "eraser" || brushBlendModeRef.current === "clear"
             ? "destination-out"
-            : "source-over";
+            : (brushBlendModeRef.current as GlobalCompositeOperation);
         previewCtx.drawImage(sbuf, cx, cy, cw, ch, cx, cy, cw, ch);
         previewCtx.globalAlpha = 1;
         previewCtx.globalCompositeOperation = "source-over";
@@ -1354,6 +1419,17 @@ export function useCompositing({
     if (!belowCtx) return;
     if (!cacheValid) {
       belowCtx.clearRect(0, 0, W, H);
+      // Belt-and-suspenders: fill belowActiveCanvas with opaque white before
+      // drawing any layers. If getBitmapOrCanvas returns a stale (smaller)
+      // ImageBitmap for a layer that was just resized, the drawImage only fills
+      // the old (smaller) region — leaving the expanded area transparent.
+      // That transparent region bleeds into compositeWithStrokePreview's
+      // displayCtx.drawImage(below, ...) call, producing a visible transparency
+      // flash in the newly expanded canvas area.
+      // The white fill ensures the expanded area is always opaque, even when
+      // bitmaps are momentarily stale (they are invalidated async via markLayerBitmapDirty).
+      belowCtx.fillStyle = "#ffffff";
+      belowCtx.fillRect(0, 0, W, H);
       belowCtx.globalAlpha = 1;
       // Build a group scope stack for cascaded opacity/visibility while
       // iterating below layers (same bottom-to-top direction as composite()).

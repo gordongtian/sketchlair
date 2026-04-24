@@ -21,7 +21,6 @@ import {
   Ruler,
   Scissors,
   Trash2,
-  X,
 } from "lucide-react";
 import { memo, useCallback, useRef, useState } from "react";
 import type React from "react";
@@ -689,7 +688,7 @@ export const LayersPanel = memo(function LayersPanel({
   onCommitReorderHistory,
   onToggleLayerSelection,
   onCreateGroup,
-  onClose,
+  onClose: _onClose,
   shiftHeld = false,
 }: LayersPanelProps) {
   // ── Always-current refs ────────────────────────────────────────────────────
@@ -1057,17 +1056,14 @@ export const LayersPanel = memo(function LayersPanel({
       className="flex flex-col h-full"
       onPointerDown={(e) => e.stopPropagation()}
     >
-      {/* Top button row */}
-      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-border">
-        <span className="text-xs font-semibold text-foreground flex-1">
-          Layers
-        </span>
-        <TooltipProvider>
+      {/* Action buttons row — desktop only */}
+      <TooltipProvider>
+        <div className="flex items-center gap-0.5 px-2 py-1 border-b border-border/60 bg-muted/20">
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
-                onClick={onToggleAlphaLock.bind(null, activeLayerId)}
+                onClick={() => onToggleAlphaLock(activeLayerId)}
                 className={`p-1 rounded hover:bg-accent ${activeLayer?.alphaLock ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
                 data-ocid="layers.toggle.button"
               >
@@ -1087,7 +1083,7 @@ export const LayersPanel = memo(function LayersPanel({
                 <Scissors size={12} />
               </button>
             </TooltipTrigger>
-            <TooltipContent>Clipping Mask</TooltipContent>
+            <TooltipContent>Cut to New Layer</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -1107,16 +1103,13 @@ export const LayersPanel = memo(function LayersPanel({
               <button
                 type="button"
                 onClick={onMergeLayers}
-                disabled={
-                  (activeLayer as PaintLayer | undefined)?.isRuler === true
-                }
-                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed"
+                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
                 data-ocid="layers.merge_button"
               >
                 <Check size={12} />
               </button>
             </TooltipTrigger>
-            <TooltipContent>Merge Down (Shift+E)</TooltipContent>
+            <TooltipContent>Merge Down</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -1129,7 +1122,7 @@ export const LayersPanel = memo(function LayersPanel({
                 <FolderPlus size={12} />
               </button>
             </TooltipTrigger>
-            <TooltipContent>Create Layer Group (Shift+G)</TooltipContent>
+            <TooltipContent>New Layer Group</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -1142,28 +1135,10 @@ export const LayersPanel = memo(function LayersPanel({
                 <Plus size={12} />
               </button>
             </TooltipTrigger>
-            <TooltipContent>Add Layer</TooltipContent>
+            <TooltipContent>New Layer</TooltipContent>
           </Tooltip>
-          {onClose && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onClose?.();
-                  }}
-                  className="p-1 rounded text-[oklch(var(--accent-foreground))] bg-[oklch(var(--accent))] hover:brightness-110 active:brightness-90"
-                  data-ocid="layers.close_button"
-                >
-                  <X size={12} />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>Close</TooltipContent>
-            </Tooltip>
-          )}
-        </TooltipProvider>
-      </div>
+        </div>
+      </TooltipProvider>
 
       {/* Blend mode row */}
       {panelBlendMode !== null && (

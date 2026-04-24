@@ -78,7 +78,10 @@ export interface CursorSystemResult {
   ) => { r: number; g: number; b: number };
 
   // Transform handle cursor — called from pointer-move to update cursor based on hovered handle
-  updateTransformCursorForHandle: (handle: string | null) => void;
+  updateTransformCursorForHandle: (
+    handle: string | null,
+    ctrlHeld?: boolean,
+  ) => void;
 }
 
 export function useCursorSystem(
@@ -751,8 +754,13 @@ export function useCursorSystem(
    * Apply the appropriate transform cursor for the given handle name.
    * Called from pointer-move (hover) and during active dragging.
    * null / undefined = default Move cursor.
+   * When ctrlHeld is true and handle is an edge handle (n/s/e/w), show
+   * the skew cursor variant (opposite axis double arrow).
    */
-  const updateTransformCursorForHandle = (handle: string | null) => {
+  const updateTransformCursorForHandle = (
+    handle: string | null,
+    ctrlHeld?: boolean,
+  ) => {
     if (!containerRef.current) return;
     const sc = softwareCursorRef.current;
     if (sc) sc.style.display = "none";
@@ -761,13 +769,17 @@ export function useCursorSystem(
     if (handle === "rot") {
       result = buildRotateTransformCursor();
     } else if (handle === "nw" || handle === "se") {
-      result = buildScaleNESWCursor();
+      // Ctrl held on corner: free-corner mode — use 'move' cursor
+      result = ctrlHeld ? buildTransformIconCursor() : buildScaleNESWCursor();
     } else if (handle === "ne" || handle === "sw") {
-      result = buildScaleNWSECursor();
+      // Ctrl held on corner: free-corner mode — use 'move' cursor
+      result = ctrlHeld ? buildTransformIconCursor() : buildScaleNWSECursor();
     } else if (handle === "n" || handle === "s") {
-      result = buildScaleNSCursor();
+      // Ctrl held: skew mode — use EW (horizontal double arrow) for top/bottom edge
+      result = ctrlHeld ? buildScaleEWCursor() : buildScaleNSCursor();
     } else if (handle === "e" || handle === "w") {
-      result = buildScaleEWCursor();
+      // Ctrl held: skew mode — use NS (vertical double arrow) for left/right edge
+      result = ctrlHeld ? buildScaleNSCursor() : buildScaleEWCursor();
     } else {
       // move (inside bbox) or null (outside / default)
       result = buildTransformIconCursor();

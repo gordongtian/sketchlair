@@ -17,11 +17,29 @@ type BrushPreset__95671841 =
     settings : Text
   };
 type CanvasSave__864224653 = Text;
+type Data__159895909<T> = {var count : Nat__490723111; elements : [var ?T]};
 type Data__791452850<K, V> =
   {var count : Nat__490723111; kvs : [var ?(K, V)]};
 type HotkeyAssignments__223722748 = {assignments : Text; modifiedAt : Int};
+type ImageReference__173220989 =
+  {assetUrl : Text; height : Nat; id : Text; width : Nat};
+type ImageSet__635264586 =
+  {
+    id : Text;
+    imageCount : Nat;
+    images : [ImageReference__173220989];
+    isDefault : Bool;
+    isFree : Bool;
+    name : Text;
+    previewThumbnail : Text;
+    priceICP : ?Text;
+    tags : [Text]
+  };
+type Internal__667636161<T> =
+  {children : [var ?Node__92254746<T>]; data : Data__159895909<T>};
 type Internal__8484328<K, V> =
   {children : [var ?Node__46230540<K, V>]; data : Data__791452850<K, V>};
+type Leaf__520550824<T> = {data : Data__159895909<T>};
 type Leaf__809889148<K, V> = {data : Data__791452850<K, V>};
 type Map__158565046<K, V> = Map__297112838<K, V>;
 type Map__297112838<K, V> =
@@ -31,6 +49,8 @@ type Nat__490723111 = Nat__920180692;
 type Nat__920180692 = Nat;
 type Node__46230540<K, V> =
   {#internal : Internal__8484328<K, V>; #leaf : Leaf__809889148<K, V>};
+type Node__92254746<T> =
+  {#internal : Internal__667636161<T>; #leaf : Leaf__520550824<T>};
 type SettingsSave__419654141 = Text;
 type UserPreferences__810131452 =
   {
@@ -43,11 +63,17 @@ type UserPreferences__810131452 =
 type UserProfile__491224006 = {name : Text};
 type UserRole__1054455867 = {#admin; #guest; #user};
 actor {
+  stable var ADMIN_PRINCIPAL_DRAFT : Text;
+  stable var ADMIN_PRINCIPAL_GEN : Text;
+  stable HARDCODED_ADMINS : [Text];
   stable accessControlState :
     {
       var adminAssigned : Bool;
       userRoles : Map__605269027<Principal, UserRole__1054455867>
     };
+  stable var adminSeedApplied : Bool;
+  stable admins :
+    {var root : Node__92254746<Principal>; var size : Nat__490723111};
   stable brushPresetsMap :
     {var root : Node__46230540<Principal, Text>; var size : Nat__490723111};
   stable canvasSaveMap :
@@ -55,19 +81,33 @@ actor {
       var root : Node__46230540<Principal, CanvasSave__864224653>;
       var size : Nat__490723111
     };
+  stable entitlementsMap :
+    {var root : Node__46230540<Principal, [Text]>; var size : Nat__490723111};
+  stable var imageSetIdCounter : Nat;
+  stable imageSetRegistry :
+    {
+      var root : Node__46230540<Text, ImageSet__635264586>;
+      var size : Nat__490723111
+    };
+  stable var paymentsCanisterPrincipal : ?Principal;
   stable preferencesMap :
     {
       var root : Node__46230540<Principal, UserPreferences__810131452>;
       var size : Nat__490723111
     };
+  stable principalToUsername :
+    {var root : Node__46230540<Principal, Text>; var size : Nat__490723111};
   stable settingsMap :
     {
       var root : Node__46230540<Principal, SettingsSave__419654141>;
       var size : Nat__490723111
     };
+  stable var starterSetsCleared : Bool;
   stable userProfiles :
     {
       var root : Node__46230540<Principal, UserProfile__491224006>;
       var size : Nat__490723111
-    }
+    };
+  stable usernameToPrincipal :
+    {var root : Node__46230540<Text, Principal>; var size : Nat__490723111}
 };

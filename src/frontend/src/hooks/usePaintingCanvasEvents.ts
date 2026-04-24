@@ -49,8 +49,11 @@ import {
 } from "../utils/groupUtils";
 import {
   bfsFloodFill,
+  blurEdgesOnly,
   computeMaskBounds,
+  floatMaskToCanvas,
   growShrinkMask,
+  perceptualColorDistance,
 } from "../utils/selectionUtils";
 import type { WebGLBrushContext } from "../utils/webglBrush";
 import { markCanvasDirty, markLayerBitmapDirty } from "./useCompositing";
@@ -70,10 +73,13 @@ import {
 } from "./useLiquifySystem";
 import {
   PRESSURE_SMOOTHING,
+  type PathPoint,
   applyColorJitter,
+  clearSmudgeBuffer,
   evalPressureCurve,
   resetSmudgeInitialized,
 } from "./useStrokeEngine";
+import { getTransformCornersWorld } from "./useTransformSystem";
 
 // ─── Helper types (local, not exported) ──────────────────────────────────────
 type Point = { x: number; y: number };
@@ -154,26 +160,35 @@ export interface RulerHandlers {
 function _getCanvasPosTransformed(
   clientX: number,
   clientY: number,
-  container: HTMLElement,
+  _container: HTMLElement,
   canvas: HTMLCanvasElement,
   transform: ViewTransform,
   isFlipped = false,
 ) {
-  const cr = container.getBoundingClientRect();
+  // Use the canvas element's own bounding rect as the coordinate origin.
+  // getBoundingClientRect() on the canvas already accounts for the CSS
+  // translate(panX, panY) applied to the wrapper div — so centerX is the
+  // canvas's actual screen center including pan. We must NOT subtract
+  // transform.panX/panY again; doing so would double-count the translation.
+  const cr = canvas.getBoundingClientRect();
+  console.log(
+    `[CoordMap] getBoundingClientRect — left: ${cr.left} top: ${cr.top} width: ${cr.width} height: ${cr.height}`,
+  );
   const centerX = cr.left + cr.width / 2;
   const centerY = cr.top + cr.height / 2;
-  const ox = clientX - centerX - transform.panX;
-  const oy = clientY - centerY - transform.panY;
+  // ox/oy: pointer offset from the canvas's screen-space center.
+  // No additional panX/panY subtraction — the rect already encodes that shift.
+  const ox = clientX - centerX;
+  const oy = clientY - centerY;
   const sx = ox / transform.zoom;
   const sy = oy / transform.zoom;
   const px = isFlipped ? -sx : sx;
   const rad = (-transform.rotation * Math.PI) / 180;
   const rx = px * Math.cos(rad) - sy * Math.sin(rad);
   const ry = px * Math.sin(rad) + sy * Math.cos(rad);
-  return {
-    x: rx + canvas.width / 2,
-    y: ry + canvas.height / 2,
-  };
+  const mappedX = rx + canvas.width / 2;
+  const mappedY = ry + canvas.height / 2;
+  return { x: mappedX, y: mappedY };
 }
 
 function _getCanvasPosWithRect(
@@ -184,10 +199,13 @@ function _getCanvasPosWithRect(
   transform: ViewTransform,
   isFlipped = false,
 ) {
+  // cr must be canvas.getBoundingClientRect() — the canvas's actual screen rect
+  // including any CSS transform applied to the wrapper. Do NOT subtract panX/panY;
+  // the rect already encodes the translation from the wrapper's CSS transform.
   const centerX = cr.left + cr.width / 2;
   const centerY = cr.top + cr.height / 2;
-  const ox = clientX - centerX - transform.panX;
-  const oy = clientY - centerY - transform.panY;
+  const ox = clientX - centerX;
+  const oy = clientY - centerY;
   const sx = ox / transform.zoom;
   const sy = oy / transform.zoom;
   const px = isFlipped ? -sx : sx;
@@ -243,7 +261,10 @@ export interface PaintingCanvasEventsCallbacks {
   ) => { r: number; g: number; b: number };
   updateEyedropperCursorRef: React.MutableRefObject<() => void>;
   // Transform handle cursor — update cursor icon based on hovered handle
-  updateTransformCursorForHandle: (handle: string | null) => void;
+  updateTransformCursorForHandle: (
+    handle: string | null,
+    ctrlHeld?: boolean,
+  ) => void;
   // State setters
   setActiveTool: React.Dispatch<React.SetStateAction<Tool>>;
   setActiveSubpanel: React.Dispatch<React.SetStateAction<Tool | null>>;
@@ -327,6 +348,7 @@ export interface PaintingCanvasEventsCallbacks {
     size: number,
     settings: BrushSettings,
     strength: number,
+    opacity?: number,
   ) => void;
   initSmudgeBuffer: (lc: HTMLCanvasElement, pos: Point, size: number) => void;
   getSnapPosition: (pos: Point, origin: Point) => Point;
@@ -474,7 +496,7 @@ export interface PaintingCanvasEventsParams {
   activeToolRef: React.MutableRefObject<Tool>;
   hotkeysRef: React.MutableRefObject<Record<string, HotkeyAction>>;
   brushSizesRef: React.MutableRefObject<BrushSizes>;
-  toolSizesRef: React.MutableRefObject<Record<string, number>>;
+  toolSizesRef: React.MutableRefObject<Record<string, number | undefined>>;
   toolOpacitiesRef: React.MutableRefObject<Record<string, number>>;
   liquifySizeRef: React.MutableRefObject<number>;
   liquifyStrengthRef: React.MutableRefObject<number>;
@@ -547,6 +569,16 @@ export interface PaintingCanvasEventsParams {
     /** For scale handle drags: the canvas-space pivot point (opposite handle's position at drag start) */
     pivotX?: number;
     pivotY?: number;
+    /** Skew values captured at drag start — skew accumulates from these */
+    skewXAtDragStart?: number;
+    skewYAtDragStart?: number;
+    /** For free-corner drag (corner handle + Ctrl): the four corner world positions at drag start */
+    dragStartCorners?: {
+      tl: { x: number; y: number };
+      tr: { x: number; y: number };
+      bl: { x: number; y: number };
+      br: { x: number; y: number };
+    };
   } | null>;
   transformActionsRef: React.MutableRefObject<{
     hitTestTransformHandle: (x: number, y: number) => string | null;
@@ -557,6 +589,17 @@ export interface PaintingCanvasEventsParams {
     commitFloat: (opts?: { keepSelection?: boolean }) => void;
     revertTransform: () => void;
   }>;
+  /** Free-corner mode state ref — set when Ctrl+corner drag is active */
+  freeCornerStateRef: React.MutableRefObject<{
+    corners: {
+      tl: { x: number; y: number };
+      tr: { x: number; y: number };
+      bl: { x: number; y: number };
+      br: { x: number; y: number };
+    };
+    draggedCorner: "tl" | "tr" | "bl" | "br";
+    origRect: { x: number; y: number; w: number; h: number };
+  } | null>;
 
   // Fill system
   isGradientDraggingRef: React.MutableRefObject<boolean>;
@@ -620,6 +663,10 @@ export interface PaintingCanvasEventsParams {
   smearRafRef: React.MutableRefObject<number | null>;
   smearDirtyRef: React.MutableRefObject<boolean>;
   distAccumRef: React.MutableRefObject<number>;
+  /** Path accumulation buffer — cleared at stroke start, appended per-point. */
+  strokePathBufferRef: React.MutableRefObject<PathPoint[]>;
+  /** Index into strokePathBufferRef of the last segment that had a stamp placed. */
+  lastStampPathIdxRef: React.MutableRefObject<number>;
 
   // Layer tree (for multi-select/group handling)
   layerTreeRef: React.MutableRefObject<LayerNode[]>;
@@ -677,6 +724,24 @@ export interface PaintingCanvasEventsParams {
   pendingSpringKeyRef: React.MutableRefObject<string | null>;
   // The target tool waiting to be activated once the hold timer fires.
   pendingSpringToolRef: React.MutableRefObject<Tool | null>;
+
+  // ---- Ctrl+right-click layer menu ----
+  /** True when a figure drawing session is active — menu must not open. */
+  isFigureDrawingSessionRef: React.MutableRefObject<boolean>;
+  /** Called when Ctrl+right-click is detected with at least one hit layer. */
+  onCtrlRightClick: (payload: {
+    layers: Layer[];
+    x: number;
+    y: number;
+  }) => void;
+
+  // ---- Ctrl+drag layer move refs ----
+  /** True while a Ctrl+drag layer-move is in progress. */
+  ctrlDragMoveActiveRef: React.MutableRefObject<boolean>;
+  /** Accumulated canvas-space offset for the current Ctrl+drag move preview. */
+  ctrlDragOffsetRef: React.MutableRefObject<{ x: number; y: number }>;
+  /** The layer ID that is being moved by Ctrl+drag (may differ from activeLayerIdRef for Ctrl+Shift). */
+  ctrlDragMovingLayerIdRef: React.MutableRefObject<string>;
 }
 
 // ─── The hook ─────────────────────────────────────────────────────────────────
@@ -752,6 +817,31 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
   // scheduleComposite in useCompositing gates on that flag — this is the single
   // authoritative suppression point for all pre-warp renders (A4 fix).
 
+  // ── Line tool refs ────────────────────────────────────────────────────────
+  // Set true between pointerdown and pointerup when line tool is active.
+  const lineIsDrawingRef = useRef(false);
+  // Canvas-space start position captured at pointerdown.
+  const lineStartPosRef = useRef<Point | null>(null);
+  // Pressure at the start of the drag (captured on pointerdown).
+  const lineStartPressureRef = useRef(1.0);
+  // Snapshot of the active layer taken at pointerdown (for undo history).
+  const lineStartSnapshotRef = useRef<ImageData | null>(null);
+  // Continuous pressure samples recorded as the user drags the line out.
+  // Each entry stores the absolute distance from the start point and the pressure at that moment.
+  const linePressureSamplesRef = useRef<
+    Array<{ dist: number; pressure: number }>
+  >([]);
+  // The farthest distance the cursor has reached from the start point during the current drag.
+  const lineFarthestDistanceRef = useRef(0);
+
+  // ── Skew / Ctrl modifier refs ─────────────────────────────────────────────
+  // The transform handle the pointer is currently hovering over (not dragging).
+  // Updated by the hover pointer-move path and cleared when leaving the transform area.
+  // Used by the Ctrl keydown/keyup listener to re-apply cursor without needing pointer-move.
+  const hoveredTransformHandleRef = useRef<string | null>(null);
+  // True while Ctrl is held down — read on every pointer-move for skew vs scale branching.
+  const ctrlHeldRef = useRef(false);
+
   // ── Session max pressure (Linux/Wacom fix) ───────────────────────────────
   // True when a stroke started outside the canvas element (within the viewport
   // container background) and hasn't yet transitioned onto the canvas.
@@ -786,6 +876,33 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     >(),
   );
 
+  // ── Line tool: pressure interpolation helper ─────────────────────────────
+  // Linearly interpolates pressure at `targetDist` from the recorded samples.
+  // Samples before the first sample use the first sample's pressure.
+  // Samples after the last sample use the last sample's pressure.
+  function interpolateLinePressure(
+    samples: Array<{ dist: number; pressure: number }>,
+    targetDist: number,
+  ): number {
+    if (samples.length === 0) return 1.0;
+    if (samples.length === 1) return samples[0].pressure;
+    if (targetDist <= samples[0].dist) return samples[0].pressure;
+    if (targetDist >= samples[samples.length - 1].dist)
+      return samples[samples.length - 1].pressure;
+    for (let i = 0; i < samples.length - 1; i++) {
+      if (targetDist >= samples[i].dist && targetDist <= samples[i + 1].dist) {
+        const span = samples[i + 1].dist - samples[i].dist;
+        if (span === 0) return samples[i].pressure;
+        const alpha = (targetDist - samples[i].dist) / span;
+        return (
+          samples[i].pressure +
+          alpha * (samples[i + 1].pressure - samples[i].pressure)
+        );
+      }
+    }
+    return samples[samples.length - 1].pressure;
+  }
+
   // ── 1. Global hotkey handler ─────────────────────────────────────────────
   // biome-ignore lint/correctness/useExhaustiveDependencies: all mutable state accessed via stable refs / callbacksRef
   useEffect(() => {
@@ -812,7 +929,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           shiftHeldRef.current &&
           (currentTool === "brush" ||
             currentTool === "eraser" ||
-            currentTool === "liquify")
+            currentTool === "liquify" ||
+            currentTool === "smudge")
         ) {
           altSpaceModeRef.current = true;
           updateBrushCursorRef.current();
@@ -1056,6 +1174,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           { action: "brush", tool: "brush" },
           { action: "eraser", tool: "eraser" },
           { action: "smudge", tool: "smudge" },
+          { action: "line", tool: "line" },
           { action: "liquify", tool: "liquify" },
           { action: "fill", tool: "fill" },
           { action: "lasso", tool: "lasso" },
@@ -1245,10 +1364,10 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             const canvas = displayCanvasRef.current;
             if (canvas) {
               // Step 1: Capture the canvas-space point currently at the viewport center.
-              // The viewport center client coords cancel out in the _getCanvasPosTransformed
-              // formula (clientX - centerX = 0), leaving the pan offset as the sole term:
-              //   ox = 0 - vtE.panX = -vtE.panX
-              //   oy = 0 - vtE.panY = -vtE.panY
+              // In _getCanvasPosTransformed, centerX = canvas.getBoundingClientRect() center
+              // = viewport_center + panX. So at clientX = viewport_center:
+              //   ox = viewport_center - (viewport_center + panX) = -panX
+              //   oy = viewport_center_y - (viewport_center_y + panY) = -panY
               const ox = -vtE.panX;
               const oy = -vtE.panY;
               const sx = ox / vtE.zoom;
@@ -1779,6 +1898,55 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     };
   }, []);
 
+  // ── 2b. Ctrl key listener — updates skew cursor when Ctrl pressed/released ──
+  // biome-ignore lint/correctness/useExhaustiveDependencies: stable refs only
+  useEffect(() => {
+    const onCtrlDown = (e: KeyboardEvent) => {
+      if (e.key !== "Control") return;
+      ctrlHeldRef.current = true;
+      // Re-apply cursor if pointer is currently over a transform handle
+      // Corner handles get 'move' cursor (free-corner mode); edge handles get skew cursor
+      const hovHandle = hoveredTransformHandleRef.current;
+      if (hovHandle && hovHandle !== "move" && hovHandle !== "rot") {
+        callbacksRef.current.updateTransformCursorForHandle(hovHandle, true);
+      } else if (
+        !hovHandle &&
+        !p.isFigureDrawingSessionRef.current &&
+        !p.isDrawingRef.current &&
+        !p.isPanningRef.current
+      ) {
+        // Show grab cursor to indicate Ctrl+drag layer move is available
+        const _cont = containerRef.current;
+        if (_cont) _cont.style.cursor = "grab";
+      }
+    };
+    const onCtrlUp = (e: KeyboardEvent) => {
+      if (e.key !== "Control") return;
+      ctrlHeldRef.current = false;
+      // If a Ctrl+drag is in progress, commit it immediately on Ctrl release
+      // (edge case: user releases Ctrl while still holding the pointer down —
+      //  cancel the move and restore the original layer data by re-applying the
+      //  before snapshot rather than committing the partial move)
+      // In practice the pointer-up path handles commit; we only restore cursor here.
+      if (!p.ctrlDragMoveActiveRef.current) {
+        // Re-apply cursor if pointer is currently over a transform handle
+        const hovHandle = hoveredTransformHandleRef.current;
+        if (hovHandle) {
+          callbacksRef.current.updateTransformCursorForHandle(hovHandle, false);
+        } else {
+          // Restore normal tool cursor
+          updateBrushCursorRef.current();
+        }
+      }
+    };
+    window.addEventListener("keydown", onCtrlDown);
+    window.addEventListener("keyup", onCtrlUp);
+    return () => {
+      window.removeEventListener("keydown", onCtrlDown);
+      window.removeEventListener("keyup", onCtrlUp);
+    };
+  }, []);
+
   // ── 3. Wheel zoom ────────────────────────────────────────────────────────
   // biome-ignore lint/correctness/useExhaustiveDependencies: stable refs only
   useEffect(() => {
@@ -2225,6 +2393,157 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     const lc = p.layerCanvasesRef.current.get(layerId);
     const cb = callbacksRef.current;
 
+    console.log(
+      "[Paint] pointerdown received — tool:",
+      tool,
+      "layer:",
+      layerId,
+      "canvas:",
+      lc?.width,
+      "x",
+      lc?.height,
+    );
+
+    // ── Ctrl+drag / Ctrl+Shift+drag layer move ────────────────────────────
+    // Intercept before any tool dispatch. Guards:
+    //   - Ctrl must be held (ctrlHeldRef, or e.ctrlKey as fallback)
+    //   - Not figure drawing session
+    //   - Stroke not in progress
+    //   - Not panning
+    //   - No focused text input / contenteditable
+    //   - Not during transform tool handle interaction (isDraggingFloatRef guard)
+    if (
+      (ctrlHeldRef.current || e.ctrlKey) &&
+      !p.isFigureDrawingSessionRef.current &&
+      !p.isDrawingRef.current &&
+      !p.isPanningRef.current &&
+      !p.isDraggingFloatRef.current
+    ) {
+      const _activeEl = document.activeElement;
+      const _elTag = _activeEl?.tagName ?? "";
+      const _elEditable = (_activeEl as HTMLElement | null)?.isContentEditable;
+      const _inputFocused =
+        _elTag === "INPUT" || _elTag === "TEXTAREA" || _elEditable === true;
+      if (!_inputFocused) {
+        const _isCtrlShift = e.ctrlKey && e.shiftKey;
+        const _cW = p.canvasWidthRef.current;
+        const _cH = p.canvasHeightRef.current;
+        // Bounds check
+        if (pos.x >= 0 && pos.y >= 0 && pos.x < _cW && pos.y < _cH) {
+          let _movingLayerId = p.activeLayerIdRef.current;
+
+          if (_isCtrlShift) {
+            // ── Ctrl+Shift: pick topmost non-locked non-ruler layer with content ──
+            const _cx = Math.round(pos.x);
+            const _cy = Math.round(pos.y);
+            let _picked: string | null = null;
+            for (const _lay of p.layersRef.current) {
+              const _lt = (_lay as { type?: string }).type;
+              if (_lt === "group" || _lt === "end_group") continue;
+              if ((_lay as { isRuler?: boolean }).isRuler) continue;
+              if ((_lay as { isLocked?: boolean }).isLocked) continue;
+              const _layLc = p.layerCanvasesRef.current.get(_lay.id);
+              if (!_layLc || _layLc.width === 0 || _layLc.height === 0)
+                continue;
+              if (_cx >= _layLc.width || _cy >= _layLc.height) continue;
+              const _layCtx = _layLc.getContext("2d", {
+                willReadFrequently: true,
+              });
+              if (!_layCtx) continue;
+              const _alpha = _layCtx.getImageData(_cx, _cy, 1, 1).data[3];
+              if (_alpha > 0) {
+                _picked = _lay.id;
+                break;
+              }
+            }
+            if (!_picked) {
+              // No content at cursor — do nothing
+            } else {
+              _movingLayerId = _picked;
+              // Switch active layer if different
+              if (_picked !== p.activeLayerIdRef.current) {
+                p.activeLayerIdRef.current = _picked;
+                cb.setActiveLayerId(_picked);
+              }
+              // Start the move
+              p.ctrlDragMoveActiveRef.current = true;
+              p.ctrlDragMovingLayerIdRef.current = _movingLayerId;
+              p.ctrlDragOffsetRef.current = { x: 0, y: 0 };
+              // Snapshot the layer canvas for undo (before state)
+              const _moveLc = p.layerCanvasesRef.current.get(_movingLayerId);
+              if (_moveLc) {
+                const _moveCtx = _moveLc.getContext("2d", {
+                  willReadFrequently: true,
+                });
+                if (_moveCtx) {
+                  p.strokeStartSnapshotRef.current = {
+                    pixels: _moveCtx.getImageData(
+                      0,
+                      0,
+                      _moveLc.width,
+                      _moveLc.height,
+                    ),
+                    x: 0,
+                    y: 0,
+                  };
+                }
+              }
+              p.lastPosRef.current = pos;
+              if (p.containerRef.current)
+                p.containerRef.current.style.cursor = "grab";
+              return;
+            }
+          } else {
+            // ── Ctrl only: move active layer ──────────────────────────────
+            const _activeLayer = p.layersRef.current.find(
+              (l) => l.id === _movingLayerId,
+            );
+            const _lt = (_activeLayer as { type?: string } | undefined)?.type;
+            const _isRuler = (_activeLayer as { isRuler?: boolean } | undefined)
+              ?.isRuler;
+            const _isLocked = (
+              _activeLayer as { isLocked?: boolean } | undefined
+            )?.isLocked;
+            if (
+              _activeLayer &&
+              _lt !== "group" &&
+              _lt !== "end_group" &&
+              !_isRuler &&
+              !_isLocked
+            ) {
+              p.ctrlDragMoveActiveRef.current = true;
+              p.ctrlDragMovingLayerIdRef.current = _movingLayerId;
+              p.ctrlDragOffsetRef.current = { x: 0, y: 0 };
+              // Snapshot for undo
+              const _moveLc2 = p.layerCanvasesRef.current.get(_movingLayerId);
+              if (_moveLc2) {
+                const _moveCtx2 = _moveLc2.getContext("2d", {
+                  willReadFrequently: true,
+                });
+                if (_moveCtx2) {
+                  p.strokeStartSnapshotRef.current = {
+                    pixels: _moveCtx2.getImageData(
+                      0,
+                      0,
+                      _moveLc2.width,
+                      _moveLc2.height,
+                    ),
+                    x: 0,
+                    y: 0,
+                  };
+                }
+              }
+              p.lastPosRef.current = pos;
+              if (p.containerRef.current)
+                p.containerRef.current.style.cursor = "grab";
+              return;
+            }
+          }
+        }
+      }
+    }
+    // ── End Ctrl+drag layer move intercept ────────────────────────────────
+
     // Hard guard: never allow painting on an invisible layer
     {
       const activeLayerCheck2 = p.layersRef.current.find(
@@ -2527,28 +2846,180 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           p.canvasHeightRef.current,
         );
         const md = maskImgData.data;
-        const rawMask = bfsFloodFill(
-          srcData,
-          p.canvasWidthRef.current,
-          p.canvasHeightRef.current,
-          wx,
-          wy,
-          p.wandToleranceRef.current,
-          p.wandContiguousRef.current,
-        );
-        const grownMask = growShrinkMask(
-          rawMask,
-          p.canvasWidthRef.current,
-          p.canvasHeightRef.current,
-          p.wandGrowShrinkRef.current,
-        );
-        for (let i = 0; i < grownMask.length; i++) {
-          if (grownMask[i]) {
-            const pi = i * 4;
-            md[pi] = 255;
-            md[pi + 1] = 255;
-            md[pi + 2] = 255;
-            md[pi + 3] = 255;
+        // ── Soft flood fill ────────────────────────────────────────────────
+        // Tolerance maps directly to perceptual distance threshold (0–255).
+        const W = p.canvasWidthRef.current;
+        const H = p.canvasHeightRef.current;
+        const tol = p.wandToleranceRef.current; // direct 0–255 scale
+        const contiguous = p.wandContiguousRef.current;
+
+        // Unpremultiply seed pixel color
+        const sidx = (wy * W + wx) * 4;
+        const sa = srcData[sidx + 3];
+        const seedR = sa > 0 ? Math.round((srcData[sidx] * 255) / sa) : 0;
+        const seedG = sa > 0 ? Math.round((srcData[sidx + 1] * 255) / sa) : 0;
+        const seedB = sa > 0 ? Math.round((srcData[sidx + 2] * 255) / sa) : 0;
+
+        const transitionZone = tol * 0.12;
+        const lowerBound = tol - transitionZone;
+        const upperBound = tol + transitionZone;
+
+        // Helper: compute weight (0.0–1.0) for a pixel at flat index i
+        const pixelWeight = (i: number): number => {
+          const pi = i * 4;
+          const a = srcData[pi + 3];
+          if (a === 0) return 0;
+          const r = Math.round((srcData[pi] * 255) / a);
+          const g = Math.round((srcData[pi + 1] * 255) / a);
+          const b = Math.round((srcData[pi + 2] * 255) / a);
+          const dist = perceptualColorDistance(r, g, b, seedR, seedG, seedB);
+          if (dist <= lowerBound) return 1.0;
+          if (dist >= upperBound) return 0.0;
+          return 1.0 - (dist - lowerBound) / (2 * transitionZone);
+        };
+
+        const floatMask = new Float32Array(W * H);
+
+        if (contiguous) {
+          // BFS from tap position
+          const visited = new Uint8Array(W * H);
+          const queue: number[] = [wy * W + wx];
+          let head = 0;
+          while (head < queue.length) {
+            const pos = queue[head++];
+            if (visited[pos]) continue;
+            visited[pos] = 1;
+            const x = pos % W;
+            const y = Math.floor(pos / W);
+            const w = pixelWeight(pos);
+            if (w <= 0) continue;
+            floatMask[pos] = w;
+            const neighbors = [
+              x > 0 ? pos - 1 : -1,
+              x < W - 1 ? pos + 1 : -1,
+              y > 0 ? pos - W : -1,
+              y < H - 1 ? pos + W : -1,
+            ];
+            for (const nb of neighbors) {
+              if (nb >= 0 && !visited[nb]) queue.push(nb);
+            }
+          }
+        } else {
+          // Non-contiguous: scan entire canvas
+          for (let i = 0; i < W * H; i++) {
+            floatMask[i] = pixelWeight(i);
+          }
+        }
+
+        // ── Hard boundary penalty (Fix 2d) ─────────────────────────────────
+        // Reduce weight at anti-aliased pixels near hard color boundaries
+        const penalized = new Float32Array(floatMask);
+        for (let y = 0; y < H; y++) {
+          for (let x = 0; x < W; x++) {
+            const pos = y * W + x;
+            if (floatMask[pos] <= 0) continue;
+            const pi = pos * 4;
+            const pa = srcData[pi + 3];
+            if (pa === 0) continue;
+            const pr = Math.round((srcData[pi] * 255) / pa);
+            const pg = Math.round((srcData[pi + 1] * 255) / pa);
+            const pb = Math.round((srcData[pi + 2] * 255) / pa);
+
+            let nearHardBoundary = false;
+            const ns = [
+              x > 0 ? pos - 1 : -1,
+              x < W - 1 ? pos + 1 : -1,
+              y > 0 ? pos - W : -1,
+              y < H - 1 ? pos + W : -1,
+            ];
+            for (const nb of ns) {
+              if (nb < 0) continue;
+              const npi = nb * 4;
+              const na = srcData[npi + 3];
+              if (na === 0) continue;
+              const nr = Math.round((srcData[npi] * 255) / na);
+              const ng = Math.round((srcData[npi + 1] * 255) / na);
+              const nbCol = Math.round((srcData[npi + 2] * 255) / na);
+              const distToSeed = perceptualColorDistance(
+                nr,
+                ng,
+                nbCol,
+                seedR,
+                seedG,
+                seedB,
+              );
+              const distToPixel = perceptualColorDistance(
+                nr,
+                ng,
+                nbCol,
+                pr,
+                pg,
+                pb,
+              );
+              if (distToSeed > tol * 2.0 && distToPixel > 50) {
+                nearHardBoundary = true;
+                break;
+              }
+            }
+            if (nearHardBoundary) penalized[pos] *= 0.5;
+          }
+        }
+
+        // ── Erosion pass (Fix 2d continued) — 1px edge shrink ─────────────
+        const eroded = new Float32Array(penalized);
+        for (let y = 0; y < H; y++) {
+          for (let x = 0; x < W; x++) {
+            const pos = y * W + x;
+            if (penalized[pos] <= 0) continue;
+            const ns2 = [
+              x > 0 ? pos - 1 : -1,
+              x < W - 1 ? pos + 1 : -1,
+              y > 0 ? pos - W : -1,
+              y < H - 1 ? pos + W : -1,
+            ];
+            for (const nb of ns2) {
+              if (nb < 0 || penalized[nb] <= 0.05) {
+                eroded[pos] *= 0.4;
+                break;
+              }
+            }
+          }
+        }
+
+        // ── Edge blur (Fix 2c) ─────────────────────────────────────────────
+        const blurred = blurEdgesOnly(eroded, W, H, 1);
+
+        // ── Grow/Shrink on binary representation then convert back ─────────
+        const growShrinkPx = p.wandGrowShrinkRef.current;
+        let finalMaskCanvas: HTMLCanvasElement;
+        if (growShrinkPx !== 0) {
+          // Convert float mask to binary Uint8Array for growShrinkMask
+          const binaryMask = new Uint8Array(W * H);
+          for (let i = 0; i < W * H; i++) {
+            binaryMask[i] = blurred[i] >= 0.5 ? 1 : 0;
+          }
+          const grown = growShrinkMask(binaryMask, W, H, growShrinkPx);
+          // Convert grown binary back to float for floatMaskToCanvas
+          const grownFloat = new Float32Array(W * H);
+          for (let i = 0; i < W * H; i++) {
+            // Blend: if a pixel was grown into, give it weight 0.8; if already selected, keep its weight
+            if (grown[i]) {
+              grownFloat[i] = binaryMask[i] ? blurred[i] : 0.8;
+            }
+          }
+          finalMaskCanvas = floatMaskToCanvas(grownFloat, W, H);
+        } else {
+          finalMaskCanvas = floatMaskToCanvas(blurred, W, H);
+        }
+
+        // Copy finalMaskCanvas pixel data into maskImgData for shift-key union below
+        const finalCtx = finalMaskCanvas.getContext("2d", {
+          willReadFrequently: !isIPad,
+        });
+        if (finalCtx) {
+          const fd = finalCtx.getImageData(0, 0, W, H).data;
+          for (let i = 0; i < fd.length; i++) {
+            md[i] = fd[i];
           }
         }
         if (e.shiftKey && p.selectionMaskRef.current) {
@@ -2664,7 +3135,40 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             initRotation: xfDown ? xfDown.rotation : 0,
             pivotX,
             pivotY,
+            skewXAtDragStart: xfDown?.skewX ?? 0,
+            skewYAtDragStart: xfDown?.skewY ?? 0,
+            // For free-corner drag: store the four corner world positions at drag start.
+            // If freeCornerStateRef is active (from a previous Ctrl+corner drag in this
+            // session), use those corners as the baseline so the next drag starts from
+            // the actual current quad geometry rather than the stale xfState geometry.
+            dragStartCorners:
+              hitHandle === "nw" ||
+              hitHandle === "ne" ||
+              hitHandle === "sw" ||
+              hitHandle === "se" ||
+              ((hitHandle === "n" ||
+                hitHandle === "s" ||
+                hitHandle === "w" ||
+                hitHandle === "e") &&
+                e.ctrlKey)
+                ? (p.freeCornerStateRef.current?.corners ??
+                  (xfDown ? getTransformCornersWorld(xfDown) : undefined))
+                : undefined,
           };
+          // Reset freeCornerStateRef so the new drag starts fresh.
+          // It will be re-initialized on the first pointer-move.
+          if (
+            hitHandle === "nw" ||
+            hitHandle === "ne" ||
+            hitHandle === "sw" ||
+            hitHandle === "se" ||
+            hitHandle === "n" ||
+            hitHandle === "s" ||
+            hitHandle === "w" ||
+            hitHandle === "e"
+          ) {
+            p.freeCornerStateRef.current = null;
+          }
         }
         return;
       }
@@ -2704,6 +3208,37 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       return;
     }
 
+    // ── Line tool: capture start state and bail — no normal stroke pipeline ──
+    if (tool === "line") {
+      // Ruler-layer guard (same as brush)
+      {
+        const _lineActiveLayer = p.layersRef.current.find(
+          (l) => l.id === layerId,
+        );
+        if (_lineActiveLayer?.isRuler) return;
+      }
+      const rawPressureLine =
+        e.pointerType === "mouse"
+          ? 1.0
+          : Math.max(0, Math.min(1, e.pressure || 1.0));
+      lineIsDrawingRef.current = true;
+      lineStartPosRef.current = pos;
+      lineStartPressureRef.current = rawPressureLine;
+      // Initialize continuous pressure sampling — record initial pressure at dist=0
+      linePressureSamplesRef.current = [{ dist: 0, pressure: rawPressureLine }];
+      lineFarthestDistanceRef.current = 0;
+      // Snapshot for undo
+      const _lineCtx = lc.getContext("2d", { willReadFrequently: !isIPad });
+      if (_lineCtx) {
+        const _lineSnap = _lineCtx.getImageData(0, 0, lc.width, lc.height);
+        lineStartSnapshotRef.current = _lineSnap;
+        // CRITICAL: flushStrokeBuffer bails immediately if strokeStartSnapshotRef
+        // is null — set it here so the commit path succeeds at pointer-up.
+        p.strokeStartSnapshotRef.current = { pixels: _lineSnap, x: 0, y: 0 };
+      }
+      return;
+    }
+
     if (p.tailRafIdRef.current !== null) {
       cancelAnimationFrame(p.tailRafIdRef.current);
       p.tailRafIdRef.current = null;
@@ -2720,6 +3255,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     p.elasticRawPrevRef.current = null;
     p.strokeStampsPlacedRef.current = 0;
     p.distAccumRef.current = 0;
+    // Reset path accumulation buffer — must be cleared for every new stroke.
+    p.strokePathBufferRef.current = [];
+    p.lastStampPathIdxRef.current = 1;
     p.strokeSnapOriginRef.current = pos;
     p.strokeSnapDirRef.current = null;
     p.gridSnapLineRef.current = null;
@@ -3023,6 +3561,13 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     const isIPad = p.isIPadRef.current;
     p.currentPointerTypeRef.current = e.pointerType;
     p.pointerScreenPosRef.current = { x: e.clientX, y: e.clientY };
+    // ── Diagnostic: confirm coalesced event delivery for Apple Pencil ───────
+    if (e.pointerType === "pen") {
+      const _diagCoalesced = e.getCoalescedEvents?.() ?? [e];
+      console.log(
+        `[Pencil] pointermove — coalesced count: ${_diagCoalesced.length}, primary: (${e.clientX.toFixed(1)}, ${e.clientY.toFixed(1)})`,
+      );
+    }
     {
       const sc = p.softwareCursorRef.current;
       if (sc) {
@@ -3034,7 +3579,6 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       }
     }
     const cb = callbacksRef.current;
-    // Handle crop drag
     if (p.cropDragRef.current && p.isCropActiveRef.current) {
       const drag = p.cropDragRef.current;
       const vt = p.viewTransformRef.current;
@@ -3104,6 +3648,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           p.activeToolRef.current === "eraser" ? "eraser" : "brush";
         cb.setBrushSizes((prev) => ({ ...prev, [sizeKey]: newSize }));
         p.toolSizesRef.current[p.activeToolRef.current] = newSize;
+        if (p.activeToolRef.current === "smudge") {
+          p.toolSizesRef.current.brush = newSize;
+        }
       }
       if (p.brushSizeOverlayRef.current) {
         const screenSize = newSize * p.viewTransformRef.current.zoom;
@@ -3181,6 +3728,35 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       cb.scheduleRulerOverlay();
       return;
     }
+
+    // ── Ctrl+drag layer move: update offset ──────────────────────────────
+    if (p.ctrlDragMoveActiveRef.current) {
+      const _dispCtrl = p.displayCanvasRef.current;
+      const _contCtrl = p.containerRef.current;
+      if (_dispCtrl && _contCtrl) {
+        const _posCtrl = _getCanvasPosTransformed(
+          e.clientX,
+          e.clientY,
+          _contCtrl,
+          _dispCtrl,
+          p.viewTransformRef.current,
+          p.isFlippedRef.current,
+        );
+        const _prev = p.lastPosRef.current;
+        if (_prev) {
+          p.ctrlDragOffsetRef.current = {
+            x: p.ctrlDragOffsetRef.current.x + (_posCtrl.x - _prev.x),
+            y: p.ctrlDragOffsetRef.current.y + (_posCtrl.y - _prev.y),
+          };
+        }
+        p.lastPosRef.current = _posCtrl;
+      }
+      if (p.containerRef.current)
+        p.containerRef.current.style.cursor = "grabbing";
+      cb.scheduleComposite();
+      return;
+    }
+    // ── End Ctrl+drag layer move pointer-move ─────────────────────────────
 
     // Handle gradient fill drag preview and lasso fill drawing
     if (p.isGradientDraggingRef.current || p.isLassoFillDrawingRef.current) {
@@ -3297,7 +3873,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           }
         }
         if (p.lassoIsDraggingRef.current) {
-          const _containerRect2 = container2.getBoundingClientRect();
+          const _containerRect2 = display2.getBoundingClientRect();
           const _rawLasso = e.getCoalescedEvents?.();
           const lassoEvents =
             _rawLasso && _rawLasso.length > 0 ? _rawLasso : [e];
@@ -3358,9 +3934,12 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       const dx = pos3.x - drag.px;
       const dy = pos3.y - drag.py;
 
-      // Keep cursor matching the active drag handle while dragging
+      // Keep cursor matching the active drag handle while dragging, with skew variant if Ctrl held
       if (p.transformHandleRef.current) {
-        cb.updateTransformCursorForHandle(p.transformHandleRef.current);
+        cb.updateTransformCursorForHandle(
+          p.transformHandleRef.current,
+          e.ctrlKey,
+        );
       }
 
       if (
@@ -3384,7 +3963,172 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           const initRot = drag.initRotation ?? 0;
           const angle = curAngle - startAngle + initRot;
           p.xfStateRef.current = { ...xfRot, rotation: angle };
+        } else if (
+          e.ctrlKey &&
+          (handle === "nw" ||
+            handle === "ne" ||
+            handle === "sw" ||
+            handle === "se")
+        ) {
+          // ── Free-corner mode: Ctrl held + corner handle ──────────────────
+          // The dragged corner follows the cursor exactly.
+          // The other three corners stay at their recorded drag-start positions.
+          // No affine decomposition — store the four corner positions directly.
+          const dc = drag.dragStartCorners;
+          if (!dc) return;
+
+          // Map handle name to corner key
+          const cornerKey =
+            handle === "nw"
+              ? "tl"
+              : handle === "ne"
+                ? "tr"
+                : handle === "sw"
+                  ? "bl"
+                  : "br";
+
+          // Initialize or update freeCornerStateRef
+          if (!p.freeCornerStateRef.current) {
+            // First pointer-move after drag start: initialize free-corner state
+            const ob = p.moveFloatOriginBoundsRef.current;
+            p.freeCornerStateRef.current = {
+              corners: { ...dc },
+              draggedCorner: cornerKey as "tl" | "tr" | "bl" | "br",
+              origRect: ob
+                ? { x: ob.x, y: ob.y, w: ob.w, h: ob.h }
+                : { x: 0, y: 0, w: 1, h: 1 },
+            };
+          }
+
+          // Update only the dragged corner to the current cursor position.
+          // The other three corners remain exactly at their drag-start positions.
+          const fc = p.freeCornerStateRef.current;
+          fc.corners = {
+            tl: cornerKey === "tl" ? { x: pos3.x, y: pos3.y } : dc.tl,
+            tr: cornerKey === "tr" ? { x: pos3.x, y: pos3.y } : dc.tr,
+            bl: cornerKey === "bl" ? { x: pos3.x, y: pos3.y } : dc.bl,
+            br: cornerKey === "br" ? { x: pos3.x, y: pos3.y } : dc.br,
+          };
+          // xfStateRef is kept as-is — rendering uses freeCornerStateRef directly
+          // (getTransformHandles and PaintingApp rendering read freeCornerStateRef)
+        } else if (
+          e.ctrlKey &&
+          (handle === "n" || handle === "s" || handle === "e" || handle === "w")
+        ) {
+          // ── Edge-translate mode: Ctrl held + edge handle ─────────────────
+          // The entire edge (both corners on that side) translates together.
+          // The opposite edge stays completely fixed. Result is a parallelogram.
+          const origBounds = drag.origBounds;
+          if (!origBounds) return;
+
+          // Get the four corner world positions captured at drag-start.
+          // If dragStartCorners was set at pointer-down, use those directly.
+          // Otherwise recompute from origBounds + rotation.
+          let dragStartTL: { x: number; y: number };
+          let dragStartTR: { x: number; y: number };
+          let dragStartBL: { x: number; y: number };
+          let dragStartBR: { x: number; y: number };
+
+          const dsc = drag.dragStartCorners;
+          if (dsc) {
+            dragStartTL = dsc.tl;
+            dragStartTR = dsc.tr;
+            dragStartBL = dsc.bl;
+            dragStartBR = dsc.br;
+          } else {
+            // Fallback: compute corners from origBounds + current rotation
+            const rotation = p.xfStateRef.current?.rotation ?? 0;
+            const cx = origBounds.x + origBounds.w / 2;
+            const cy = origBounds.y + origBounds.h / 2;
+            const halfW = origBounds.w / 2;
+            const halfH = origBounds.h / 2;
+            const cosF = Math.cos(rotation);
+            const sinF = Math.sin(rotation);
+            dragStartTL = {
+              x: cx + -halfW * cosF - -halfH * sinF,
+              y: cy + -halfW * sinF + -halfH * cosF,
+            };
+            dragStartTR = {
+              x: cx + halfW * cosF - -halfH * sinF,
+              y: cy + halfW * sinF + -halfH * cosF,
+            };
+            dragStartBL = {
+              x: cx + -halfW * cosF - halfH * sinF,
+              y: cy + -halfW * sinF + halfH * cosF,
+            };
+            dragStartBR = {
+              x: cx + halfW * cosF - halfH * sinF,
+              y: cy + halfW * sinF + halfH * cosF,
+            };
+          }
+
+          // Compute raw drag delta from drag-start position
+          const rawDx = pos3.x - drag.px;
+          const rawDy = pos3.y - drag.py;
+          const rotation = p.xfStateRef.current?.rotation ?? 0;
+
+          // Convert to local coordinate frame (rotate by -rotation)
+          const cosR = Math.cos(-rotation);
+          const sinR = Math.sin(-rotation);
+          const localDx = rawDx * cosR - rawDy * sinR;
+          const localDy = rawDx * sinR + rawDy * cosR;
+
+          // Both axes are fully applied — no constraint on edge handle skew
+          const constrainedLocalDx = localDx;
+          const constrainedLocalDy = localDy;
+
+          // Forward-rotate the constrained local delta back to world space
+          const cosF2 = Math.cos(rotation);
+          const sinF2 = Math.sin(rotation);
+          const worldDx =
+            constrainedLocalDx * cosF2 - constrainedLocalDy * sinF2;
+          const worldDy =
+            constrainedLocalDx * sinF2 + constrainedLocalDy * cosF2;
+
+          // Apply delta to the two corners on the dragged edge; keep opposite edge fixed
+          let newTL = { ...dragStartTL };
+          let newTR = { ...dragStartTR };
+          let newBL = { ...dragStartBL };
+          let newBR = { ...dragStartBR };
+
+          if (handle === "n") {
+            newTL = { x: dragStartTL.x + worldDx, y: dragStartTL.y + worldDy };
+            newTR = { x: dragStartTR.x + worldDx, y: dragStartTR.y + worldDy };
+            // BL, BR stay fixed
+          } else if (handle === "s") {
+            newBL = { x: dragStartBL.x + worldDx, y: dragStartBL.y + worldDy };
+            newBR = { x: dragStartBR.x + worldDx, y: dragStartBR.y + worldDy };
+            // TL, TR stay fixed
+          } else if (handle === "w") {
+            newTL = { x: dragStartTL.x + worldDx, y: dragStartTL.y + worldDy };
+            newBL = { x: dragStartBL.x + worldDx, y: dragStartBL.y + worldDy };
+            // TR, BR stay fixed
+          } else if (handle === "e") {
+            newTR = { x: dragStartTR.x + worldDx, y: dragStartTR.y + worldDy };
+            newBR = { x: dragStartBR.x + worldDx, y: dragStartBR.y + worldDy };
+            // TL, BL stay fixed
+          }
+
+          // Store in freeCornerStateRef so:
+          //   - rendering already deforms the bounding box using these corners
+          //   - commitFloat() already calls solveHomography() with these corners
+          // No changes needed to those paths.
+          const origRect = {
+            x: origBounds.x,
+            y: origBounds.y,
+            w: origBounds.w,
+            h: origBounds.h,
+          };
+          p.freeCornerStateRef.current = {
+            corners: { tl: newTL, tr: newTR, bl: newBL, br: newBR },
+            // Edge-translate mode has no single dragged corner — use "tl" as a
+            // required-field placeholder; commitFloat() only reads .corners and .origRect.
+            draggedCorner: "tl" as const,
+            origRect,
+          };
+          // xfStateRef is kept as-is — rendering uses freeCornerStateRef directly
         } else {
+          // ── Scale mode: no Ctrl, or corner handle ───────────────────────
           const origBounds = drag.origBounds;
           if (!origBounds) return;
           const rawDx = pos3.x - drag.px;
@@ -3480,6 +4224,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             w: newW,
             h: newH,
             rotation: xfScale ? xfScale.rotation : 0,
+            skewX: xfScale?.skewX ?? 0,
+            skewY: xfScale?.skewY ?? 0,
           };
         }
       } else {
@@ -3496,6 +4242,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             : (p.moveFloatOriginBoundsRef.current?.h ??
               p.canvasHeightRef.current),
           rotation: xfMv ? xfMv.rotation : 0,
+          skewX: xfMv?.skewX ?? 0,
+          skewY: xfMv?.skewY ?? 0,
         };
       }
       cb.scheduleComposite();
@@ -3524,8 +4272,176 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           posHov.x,
           posHov.y,
         );
-        cb.updateTransformCursorForHandle(hovHandle);
+        // Track hovered handle so Ctrl key listener can update cursor without pointer-move
+        hoveredTransformHandleRef.current = hovHandle;
+        cb.updateTransformCursorForHandle(hovHandle, e.ctrlKey);
       }
+    }
+
+    // ── Line tool: stamp-based preview ───────────────────────────────────────
+    if (p.activeToolRef.current === "line" && lineIsDrawingRef.current) {
+      const _lineDisplay = p.displayCanvasRef.current;
+      const _lineCont = p.containerRef.current;
+      if (!_lineDisplay || !_lineCont) return;
+      const _linePos = _getCanvasPosTransformed(
+        e.clientX,
+        e.clientY,
+        _lineCont,
+        _lineDisplay,
+        p.viewTransformRef.current,
+        p.isFlippedRef.current,
+      );
+      const _lineStart = lineStartPosRef.current;
+      if (!_lineStart) return;
+
+      // ── Continuous pressure sampling ────────────────────────────────────
+      const _lpCurrentPressure =
+        e.pointerType === "mouse"
+          ? 1.0
+          : Math.max(0, Math.min(1, e.pressure || 1.0));
+      const _lpMoveDx = _linePos.x - _lineStart.x;
+      const _lpMoveDy = _linePos.y - _lineStart.y;
+      const _lpCurrentDist = Math.sqrt(
+        _lpMoveDx * _lpMoveDx + _lpMoveDy * _lpMoveDy,
+      );
+      if (_lpCurrentDist > lineFarthestDistanceRef.current) {
+        // Line is extending — add a new sample at the current distance
+        lineFarthestDistanceRef.current = _lpCurrentDist;
+        linePressureSamplesRef.current.push({
+          dist: _lpCurrentDist,
+          pressure: _lpCurrentPressure,
+        });
+      } else {
+        // Line is shrinking — discard samples beyond the new endpoint
+        linePressureSamplesRef.current = linePressureSamplesRef.current.filter(
+          (s) => s.dist <= _lpCurrentDist,
+        );
+        lineFarthestDistanceRef.current = _lpCurrentDist;
+      }
+
+      const _lpLayerId = p.activeLayerIdRef.current;
+      const _lpSettings = p.brushSettingsRef.current;
+      const _lpBaseSize = cb.getActiveSize();
+      const _lpBaseOpacity = p.brushOpacityRef.current;
+      const _lpFillStyle = p.colorFillStyleRef.current;
+      // Reset FBOs fresh for this preview frame so stamps accumulate cleanly
+      p.webglBrushRef.current?.clear();
+      cb.buildStrokeCanvases(_lpLayerId);
+      p.strokeCommitOpacityRef.current = _lpBaseOpacity;
+      const _lpFlushCap = _lpSettings.pressureOpacity ? _lpBaseOpacity : 1.0;
+      p.flushDisplayCapRef.current = _lpFlushCap;
+      p.lastCompositeOpacityRef.current = _lpSettings.pressureOpacity
+        ? 1.0
+        : _lpBaseOpacity;
+      // Compute line geometry
+      const _lpDx = _linePos.x - _lineStart.x;
+      const _lpDy = _linePos.y - _lineStart.y;
+      const _lpLineDist = Math.sqrt(_lpDx * _lpDx + _lpDy * _lpDy);
+      const _lpStrokeAngle = Math.atan2(_lpDy, _lpDx);
+      const _lpSpacingPixels = Math.max(
+        0.5,
+        (_lpSettings.spacing / 100) * _lpBaseSize,
+      );
+      if (_lpLineDist < 0.5) {
+        // Single stamp for near-zero-length drag
+        const _lpPressure = interpolateLinePressure(
+          linePressureSamplesRef.current,
+          0,
+        );
+        const _lpCurved = evalPressureCurve(
+          _lpPressure,
+          p.universalPressureCurveRef.current as [
+            number,
+            number,
+            number,
+            number,
+          ],
+        );
+        const _lpSize = _lpSettings.pressureSize
+          ? _lpBaseSize *
+            (_lpSettings.minSize / 100 +
+              (1 - _lpSettings.minSize / 100) * _lpCurved)
+          : _lpBaseSize;
+        const _lpFlow = _lpSettings.flow ?? 1.0;
+        const _lpCapAlpha = _lpSettings.pressureOpacity
+          ? _lpCurved * _lpBaseOpacity
+          : undefined;
+        cb.stampWebGL(
+          _lineStart.x,
+          _lineStart.y,
+          _lpSize,
+          _lpFlow,
+          _lpSettings,
+          _lpSettings.rotateMode === "follow"
+            ? 0
+            : (_lpSettings.rotation * Math.PI) / 180,
+          _lpFillStyle,
+          undefined,
+          _lpCapAlpha,
+        );
+      } else {
+        let _lpAccDist = 0;
+        let _lpStampCount = 0;
+        while (_lpAccDist <= _lpLineDist) {
+          const _lpSx =
+            _lineStart.x +
+            _lpDx * (_lpLineDist > 0 ? _lpAccDist / _lpLineDist : 0);
+          const _lpSy =
+            _lineStart.y +
+            _lpDy * (_lpLineDist > 0 ? _lpAccDist / _lpLineDist : 0);
+          const _lpPressure = interpolateLinePressure(
+            linePressureSamplesRef.current,
+            _lpAccDist,
+          );
+          const _lpCurved = evalPressureCurve(
+            _lpPressure,
+            p.universalPressureCurveRef.current as [
+              number,
+              number,
+              number,
+              number,
+            ],
+          );
+          const _lpSize = _lpSettings.pressureSize
+            ? _lpBaseSize *
+              (_lpSettings.minSize / 100 +
+                (1 - _lpSettings.minSize / 100) * _lpCurved)
+            : _lpBaseSize;
+          const _lpFlow = _lpSettings.flow ?? 1.0;
+          const _lpStampOpacity = _lpSettings.pressureOpacity
+            ? _lpFlow
+            : _lpSettings.pressureFlow
+              ? _lpFlow *
+                ((_lpSettings.minFlow ?? 0) +
+                  (1 - (_lpSettings.minFlow ?? 0)) * _lpCurved)
+              : _lpFlow;
+          const _lpCapAlpha = _lpSettings.pressureOpacity
+            ? _lpCurved * _lpBaseOpacity
+            : undefined;
+          const _lpBaseAngle =
+            _lpSettings.rotateMode === "follow"
+              ? _lpStrokeAngle
+              : (_lpSettings.rotation * Math.PI) / 180;
+          cb.stampWebGL(
+            _lpSx,
+            _lpSy,
+            _lpSize,
+            _lpStampOpacity,
+            _lpSettings,
+            _lpBaseAngle,
+            _lpFillStyle,
+            undefined,
+            _lpCapAlpha,
+          );
+          _lpAccDist += _lpSpacingPixels;
+          _lpStampCount++;
+          if (_lpStampCount > 20000) break;
+        }
+      }
+      // Show mid-stroke preview using the stamp FBOs
+      p.webglBrushRef.current?.flushDisplay(_lpFlushCap);
+      cb.compositeWithStrokePreview(_lpBaseOpacity, "brush");
+      return;
     }
 
     if (!p.isDrawingRef.current) return;
@@ -3574,7 +4490,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         _rawCoalescedSmear && _rawCoalescedSmear.length > 0
           ? _rawCoalescedSmear
           : [e];
-      const _smearContainerRect = container.getBoundingClientRect();
+      // Use canvas rect (not container rect) so the side reference canvas
+      // insertion doesn't shift the coordinate origin.
+      const _smearContainerRect = display.getBoundingClientRect();
       const _smearXform = p.viewTransformRef.current;
       const _smearFlipped = p.isFlippedRef.current;
       const baseStrength = settings.smearStrength ?? 0.8;
@@ -3582,7 +4500,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       const _smearCurrentPrimary = e.pressure > 0 ? e.pressure : 0.5;
       for (let i = 0; i < smearCoalescedEvents.length; i++) {
         const sce = smearCoalescedEvents[i];
-        const scePos = _getCanvasPosWithRect(
+        let scePos = _getCanvasPosWithRect(
           sce.clientX,
           sce.clientY,
           _smearContainerRect,
@@ -3604,8 +4522,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           rawSmearPressure * PRESSURE_SMOOTHING;
         const smearPressure = p.smoothedPressureRef.current;
         const effectiveSmearStrength = settings.pressureStrength
-          ? (settings.minStrength ?? 0) +
-            (1 - (settings.minStrength ?? 0)) * smearPressure
+          ? baseStrength *
+            ((settings.minStrength ?? 0) +
+              (1 - (settings.minStrength ?? 0)) * smearPressure)
           : baseStrength;
         p.rawStylusPosRef.current = { ...scePos, size: activeSize, opacity: 1 };
         if (smoothing > 0) {
@@ -3638,6 +4557,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
                       activeSize,
                       settings,
                       effectiveSmearStrength,
+                      p.brushOpacityRef.current,
                     );
                     // Invalidate bitmap cache so compositor re-reads live canvas on next frame
                     markLayerBitmapDirty(layerItem.id);
@@ -3650,6 +4570,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
                   activeSize,
                   settings,
                   effectiveSmearStrength,
+                  p.brushOpacityRef.current,
                 );
               }
               p.stabBrushPosRef.current = newStab;
@@ -3673,6 +4594,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
                       activeSize,
                       settings,
                       effectiveSmearStrength,
+                      p.brushOpacityRef.current,
                     );
                     // Invalidate bitmap cache so compositor re-reads live canvas on next frame
                     markLayerBitmapDirty(layerItem.id);
@@ -3685,6 +4607,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
                   activeSize,
                   settings,
                   effectiveSmearStrength,
+                  p.brushOpacityRef.current,
                 );
               }
             }
@@ -3739,7 +4662,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             coalescedEvents && coalescedEvents.length > 0
               ? coalescedEvents
               : [e];
-          const containerRect = container.getBoundingClientRect();
+          // Use canvas rect (not container rect) — correct for all zoom levels
+          // and unaffected by sibling canvas insertions.
+          const containerRect = display.getBoundingClientRect();
           // Use the multi/stride flags captured at stroke-start — fixed for the
           // entire stroke duration, no per-event recalculation.
           const _liqMoveIsMulti = _liqIsMultiRef.current;
@@ -3761,7 +4686,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               if (_liqThrottleCounterRef.current % 2 !== 0) continue;
             }
 
-            const cePos = _getCanvasPosWithRect(
+            let cePos = _getCanvasPosWithRect(
               ce.clientX,
               ce.clientY,
               containerRect,
@@ -3847,7 +4772,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       const _rawCoalesced = e.getCoalescedEvents?.();
       const coalescedEvents: PointerEvent[] =
         _rawCoalesced && _rawCoalesced.length > 0 ? _rawCoalesced : [e];
-      const _containerRect = container.getBoundingClientRect();
+      // Use canvas rect (not container rect) so strokes are correct at all
+      // zoom levels and regardless of whether the side reference canvas is present.
+      const _containerRect = display.getBoundingClientRect();
       const _xform = p.viewTransformRef.current;
       const _flipped = p.isFlippedRef.current;
       let anyWork = false;
@@ -4353,6 +5280,53 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       return;
     }
 
+    // ── Ctrl+drag layer move: commit pixel data ───────────────────────────
+    if (p.ctrlDragMoveActiveRef.current) {
+      const _movId = p.ctrlDragMovingLayerIdRef.current;
+      const _offset = p.ctrlDragOffsetRef.current;
+      const _movLc = p.layerCanvasesRef.current.get(_movId);
+      const _beforeSnap = p.strokeStartSnapshotRef.current;
+      if (_movLc && _beforeSnap) {
+        const _w = _movLc.width;
+        const _h = _movLc.height;
+        const _movCtx = _movLc.getContext("2d");
+        if (_movCtx) {
+          // Create a temp canvas of the same size, draw the layer into it at the offset
+          const _tmp = document.createElement("canvas");
+          _tmp.width = _w;
+          _tmp.height = _h;
+          const _tmpCtx = _tmp.getContext("2d");
+          if (_tmpCtx) {
+            _tmpCtx.drawImage(_movLc, _offset.x, _offset.y);
+            // Clear the original and draw temp back (pixels outside bounds are cropped)
+            _movCtx.clearRect(0, 0, _w, _h);
+            _movCtx.drawImage(_tmp, 0, 0);
+          }
+          // Read after state for undo
+          const _afterData = _movCtx.getImageData(0, 0, _w, _h);
+          cb.pushHistory({
+            type: "pixels",
+            layerId: _movId,
+            before: _beforeSnap.pixels,
+            after: _afterData,
+          });
+          markLayerBitmapDirty(_movId);
+          markCanvasDirty(_movId);
+        }
+      }
+      // Reset ctrl drag state
+      p.ctrlDragMoveActiveRef.current = false;
+      p.ctrlDragOffsetRef.current = { x: 0, y: 0 };
+      p.ctrlDragMovingLayerIdRef.current = "";
+      p.strokeStartSnapshotRef.current = null;
+      p.lastPosRef.current = null;
+      // Restore cursor
+      p.updateBrushCursorRef.current();
+      cb.composite();
+      return;
+    }
+    // ── End Ctrl+drag layer move commit ───────────────────────────────────
+
     // Handle gradient fill pointer up and lasso fill pointer up
     if (p.isGradientDraggingRef.current || p.isLassoFillDrawingRef.current) {
       cb.handleFillPointerUp();
@@ -4731,6 +5705,247 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       return;
     }
 
+    // ── Line tool commit ──────────────────────────────────────────────────────
+    // Must be checked BEFORE the isDrawingRef guard below — the line tool never
+    // sets isDrawingRef, so it would be incorrectly skipped by that guard.
+    if (p.activeToolRef.current === "line" && lineIsDrawingRef.current) {
+      lineIsDrawingRef.current = false;
+      const _lStart = lineStartPosRef.current;
+      lineStartPosRef.current = null;
+      const _lBefore = lineStartSnapshotRef.current;
+      lineStartSnapshotRef.current = null;
+      const _lLayerId = p.activeLayerIdRef.current;
+      const _lLc = p.layerCanvasesRef.current.get(_lLayerId);
+      if (_lStart && _lLc) {
+        const _lDisplay = p.displayCanvasRef.current;
+        const _lContainer = p.containerRef.current;
+        const _lEndPos =
+          e && _lDisplay && _lContainer
+            ? _getCanvasPosTransformed(
+                e.clientX,
+                e.clientY,
+                _lContainer,
+                _lDisplay,
+                p.viewTransformRef.current,
+                p.isFlippedRef.current,
+              )
+            : _lStart;
+        const _lEndPressure = e
+          ? e.pointerType === "mouse"
+            ? 1.0
+            : Math.max(0, Math.min(1, e.pressure || 1.0))
+          : lineStartPressureRef.current;
+        // Finalize the pressure sample array:
+        // add the endpoint pressure at the final dist, discard any samples beyond it
+        const _lFinalDx = _lEndPos.x - _lStart.x;
+        const _lFinalDy = _lEndPos.y - _lStart.y;
+        const _lFinalDist = Math.sqrt(
+          _lFinalDx * _lFinalDx + _lFinalDy * _lFinalDy,
+        );
+        linePressureSamplesRef.current = linePressureSamplesRef.current.filter(
+          (s) => s.dist <= _lFinalDist,
+        );
+        linePressureSamplesRef.current.push({
+          dist: _lFinalDist,
+          pressure: _lEndPressure,
+        });
+        // Ensure sample at dist=0 always exists
+        if (
+          linePressureSamplesRef.current.length === 0 ||
+          linePressureSamplesRef.current[0].dist > 0
+        ) {
+          linePressureSamplesRef.current.unshift({
+            dist: 0,
+            pressure: lineStartPressureRef.current,
+          });
+        }
+
+        const _lSettings = p.brushSettingsRef.current;
+        const _lBaseSize = cb.getActiveSize();
+        const _lBaseOpacity = p.brushOpacityRef.current;
+        const _lFillStyle = p.colorFillStyleRef.current;
+        const _lFlushCap = _lSettings.pressureOpacity ? _lBaseOpacity : 1.0;
+
+        // STEP 1: Clear the preview FBOs so the line preview is removed before
+        // the commit stamps are placed. Do NOT composite here — compositing on
+        // empty FBOs before any stamps are placed wipes the display canvas and
+        // causes the stroke to be lost. The composite fires AFTER flushStrokeBuffer
+        // (see STEP 3 below), matching the brush tool's commit pattern exactly.
+        p.webglBrushRef.current?.clear();
+
+        // STEP 2: Initialise WebGL brush FBOs for the committed stroke.
+        // isDrawingRef must be true so flushStrokeBuffer treats this as an
+        // active stroke rather than a no-op.
+        p.isDrawingRef.current = true;
+        cb.buildStrokeCanvases(_lLayerId);
+        p.strokeCommitOpacityRef.current = _lBaseOpacity;
+        p.flushDisplayCapRef.current = _lFlushCap;
+        p.lastCompositeOpacityRef.current = _lSettings.pressureOpacity
+          ? 1.0
+          : _lBaseOpacity;
+
+        // Compute line length and spacing
+        const _lDx = _lEndPos.x - _lStart.x;
+        const _lDy = _lEndPos.y - _lStart.y;
+        const _lLineDist = Math.sqrt(_lDx * _lDx + _lDy * _lDy);
+        const _lStrokeAngle = Math.atan2(_lDy, _lDx);
+        const _lSpacingPixels = Math.max(
+          0.5,
+          (_lSettings.spacing / 100) * _lBaseSize,
+        );
+        if (_lLineDist < 0.5) {
+          // Tap: place a single stamp at the start
+          const _ltPressure = interpolateLinePressure(
+            linePressureSamplesRef.current,
+            0,
+          );
+          const _ltCurved = evalPressureCurve(
+            _ltPressure,
+            p.universalPressureCurveRef.current as [
+              number,
+              number,
+              number,
+              number,
+            ],
+          );
+          const _ltSize = _lSettings.pressureSize
+            ? _lBaseSize *
+              (_lSettings.minSize / 100 +
+                (1 - _lSettings.minSize / 100) * _ltCurved)
+            : _lBaseSize;
+          const _ltFlow = _lSettings.flow ?? 1.0;
+          const _ltCapAlpha = _lSettings.pressureOpacity
+            ? _ltCurved * _lBaseOpacity
+            : undefined;
+          cb.stampWebGL(
+            _lStart.x,
+            _lStart.y,
+            _ltSize,
+            _ltFlow,
+            _lSettings,
+            _lSettings.rotateMode === "follow"
+              ? 0
+              : (_lSettings.rotation * Math.PI) / 180,
+            _lFillStyle,
+            undefined,
+            _ltCapAlpha,
+          );
+        } else {
+          // Interpolate stamps along the line using the continuous pressure samples
+          let _lAccDist = 0;
+          let _lStampCount = 0;
+          while (_lAccDist <= _lLineDist) {
+            const _lt = _lLineDist > 0 ? _lAccDist / _lLineDist : 0;
+            const _lSx = _lStart.x + _lDx * _lt;
+            const _lSy = _lStart.y + _lDy * _lt;
+            // Interpolate pressure from the continuous samples array
+            const _lPressure = interpolateLinePressure(
+              linePressureSamplesRef.current,
+              _lAccDist,
+            );
+            const _lCurved = evalPressureCurve(
+              _lPressure,
+              p.universalPressureCurveRef.current as [
+                number,
+                number,
+                number,
+                number,
+              ],
+            );
+            const _lSize = _lSettings.pressureSize
+              ? _lBaseSize *
+                (_lSettings.minSize / 100 +
+                  (1 - _lSettings.minSize / 100) * _lCurved)
+              : _lBaseSize;
+            const _lFlow = _lSettings.flow ?? 1.0;
+            const _lStampOpacity = _lSettings.pressureOpacity
+              ? _lFlow
+              : _lSettings.pressureFlow
+                ? _lFlow *
+                  ((_lSettings.minFlow ?? 0) +
+                    (1 - (_lSettings.minFlow ?? 0)) * _lCurved)
+                : _lFlow;
+            const _lCapAlpha = _lSettings.pressureOpacity
+              ? _lCurved * _lBaseOpacity
+              : undefined;
+            const _lBaseAngle =
+              _lSettings.rotateMode === "follow"
+                ? _lStrokeAngle
+                : (_lSettings.rotation * Math.PI) / 180;
+            cb.stampWebGL(
+              _lSx,
+              _lSy,
+              _lSize,
+              _lStampOpacity,
+              _lSettings,
+              _lBaseAngle,
+              _lFillStyle,
+              undefined,
+              _lCapAlpha,
+            );
+            _lAccDist += _lSpacingPixels;
+            _lStampCount++;
+            // Safety cap to avoid infinite loop on degenerate spacing
+            if (_lStampCount > 20000) break;
+          }
+        }
+        // STEP 3: Transfer WebGL FBO contents to the 2D stroke buffer canvas, then flush to layer
+        p.webglBrushRef.current?.flushDisplay(p.flushDisplayCapRef.current);
+        cb.flushStrokeBuffer(
+          _lLc,
+          _lSettings.pressureOpacity ? 1.0 : _lBaseOpacity,
+          "brush",
+        );
+        p.isDrawingRef.current = false;
+        p.webglBrushRef.current?.clearMask();
+        cb.composite();
+        // Push history
+        if (_lBefore) {
+          const _lCtxAfter = _lLc.getContext("2d", {
+            willReadFrequently: false,
+          });
+          if (_lCtxAfter) {
+            const _lAfter = _lCtxAfter.getImageData(
+              0,
+              0,
+              _lLc.width,
+              _lLc.height,
+            );
+            cb.pushHistory({
+              type: "pixels",
+              layerId: _lLayerId,
+              before: _lBefore,
+              after: _lAfter,
+            });
+          }
+        }
+        markCanvasDirty(_lLayerId);
+      }
+      // Reset all stroke state so spring-load restore works correctly
+      p.isCommittingRef.current = false;
+      p.strokeStartSnapshotRef.current = null;
+      p.lastPosRef.current = null;
+      linePressureSamplesRef.current = [];
+      lineFarthestDistanceRef.current = 0;
+      // Deferred spring-load restore (same pattern as normal stroke)
+      if (
+        p.pendingSpringRestoreRef.current &&
+        p.springLoadedPreviousToolRef.current !== null
+      ) {
+        const _lRestoreTool = p.springLoadedPreviousToolRef.current;
+        p.springLoadedPreviousToolRef.current = null;
+        p.springLoadedKeyRef.current = null;
+        p.pendingSpringRestoreRef.current = false;
+        p.holdTimerRef.current = null;
+        p.pendingSpringKeyRef.current = null;
+        p.pendingSpringToolRef.current = null;
+        Promise.resolve().then(() => {
+          callbacksRef.current.handleToolChange(_lRestoreTool);
+        });
+      }
+      return;
+    }
+
     if (!p.isDrawingRef.current) return;
 
     if (p.smearRafRef.current) {
@@ -4754,6 +5969,10 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           _smearUpDisp.height,
           Math.ceil(_smearUpDR.maxY) + _smearUpPad,
         );
+        void _ux;
+        void _uy;
+        void _ux2;
+        void _uy2;
         cb.composite();
       } else {
         cb.composite();
@@ -4767,6 +5986,15 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     const tool = p.activeToolRef.current;
     const layerId = p.activeLayerIdRef.current;
     const lc = p.layerCanvasesRef.current.get(layerId);
+
+    console.log(
+      "[Paint] stroke commit — layerId:",
+      layerId,
+      "canvas in map:",
+      !!p.layerCanvasesRef.current.get(layerId),
+      "canvas size:",
+      p.layerCanvasesRef.current.get(layerId)?.width,
+    );
 
     const _baseOpacity = p.brushOpacityRef.current;
     const _upPressure = p.smoothedPressureRef.current;
@@ -4825,9 +6053,10 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           if (tool === "smudge") {
             const baseStrengthUp = settings.smearStrength ?? 0.8;
             const effectiveSmearStrengthUp = settings.pressureStrength
-              ? (settings.minStrength ?? 0) +
-                (1 - (settings.minStrength ?? 0)) *
-                  p.smoothedPressureRef.current
+              ? baseStrengthUp *
+                ((settings.minStrength ?? 0) +
+                  (1 - (settings.minStrength ?? 0)) *
+                    p.smoothedPressureRef.current)
               : baseStrengthUp;
             cb.renderSmearAlongPoints(
               lc,
@@ -4835,6 +6064,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               cb.getActiveSize(),
               settings,
               effectiveSmearStrengthUp,
+              p.brushOpacityRef.current,
             );
             cb.composite();
           } else if (tool === "brush" || tool === "eraser") {
@@ -5171,6 +6401,11 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       p.lastPosRef.current = null;
     }
 
+    // Spec: carriedBuffer must be null between strokes — reset at every pointer-up
+    if (tool === "smudge") {
+      clearSmudgeBuffer();
+    }
+
     if (p.tailRafIdRef.current === null) {
       if (lc) {
         p.thumbDebounceLcRef.current = lc;
@@ -5233,6 +6468,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       // Reset stored position so updateBrushCursor won't re-show the software
       // cursor at a stale (off-canvas) coordinate after a tool switch.
       p.pointerScreenPosRef.current = { x: 0, y: 0 };
+      // Clear hovered transform handle when pointer leaves the canvas
+      hoveredTransformHandleRef.current = null;
       if (activeToolRef.current === "eyedropper") {
         p.eyedropperIsPressedRef.current = false;
         return;
@@ -5261,6 +6498,75 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       }
     };
 
+    // ── Ctrl+right-click layer picker ─────────────────────────────────────
+    const onContextMenu = (e: MouseEvent) => {
+      // Only intercept when Ctrl (or Cmd on Mac) is held.
+      if (!e.ctrlKey && !e.metaKey) return;
+      // Disabled during figure drawing sessions.
+      if (p.isFigureDrawingSessionRef.current) return;
+
+      e.preventDefault();
+
+      const display = displayCanvasRef.current;
+      const container = p.containerRef.current;
+      if (!display || !container) return;
+
+      // Convert screen coords to canvas coords using the same helper used by
+      // pointer handlers.  getBoundingClientRect() is called fresh here — never
+      // cached — so pan/zoom changes are always reflected correctly.
+      const vt = p.viewTransformRef.current;
+      const flipped = p.isFlippedRef.current;
+      const pos = _getCanvasPosTransformed(
+        e.clientX,
+        e.clientY,
+        container,
+        display,
+        vt,
+        flipped,
+      );
+
+      // Bounds check — if outside the canvas document, do nothing.
+      const cw = p.canvasWidthRef.current;
+      const ch = p.canvasHeightRef.current;
+      if (pos.x < 0 || pos.y < 0 || pos.x >= cw || pos.y >= ch) return;
+
+      const cx = Math.round(pos.x);
+      const cy = Math.round(pos.y);
+
+      // Sample alpha of every paint layer at this canvas coordinate.
+      // Layers are iterated in flat-array order (lowest index = topmost).
+      const layersSnapshot = p.layersRef.current;
+      const canvasMap = p.layerCanvasesRef.current;
+      const hitLayers: typeof layersSnapshot = [];
+
+      for (const layer of layersSnapshot) {
+        // Skip group headers, end_group markers, and ruler layers.
+        const t = (layer as { type?: string }).type;
+        if (t === "group" || t === "end_group") continue;
+        if ((layer as { isRuler?: boolean }).isRuler) continue;
+
+        const lc = canvasMap.get(layer.id);
+        if (!lc || lc.width === 0 || lc.height === 0) continue;
+        if (cx >= lc.width || cy >= lc.height) continue;
+
+        const ctx = lc.getContext("2d", { willReadFrequently: true });
+        if (!ctx) continue;
+        const alpha = ctx.getImageData(cx, cy, 1, 1).data[3];
+        if (alpha > 0) {
+          hitLayers.push(layer);
+        }
+      }
+
+      if (hitLayers.length === 0) return;
+
+      p.onCtrlRightClick({
+        layers: hitLayers as import("../components/LayersPanel").Layer[],
+        x: e.clientX,
+        y: e.clientY,
+      });
+    };
+
+    canvas.addEventListener("contextmenu", onContextMenu);
     canvas.addEventListener("pointerenter", onEnter, { passive: true });
     canvas.addEventListener("pointerdown", handlePointerDown, {
       passive: false,
@@ -5278,6 +6584,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     );
     canvas.addEventListener("pointerleave", onLeave, { passive: false });
     return () => {
+      canvas.removeEventListener("contextmenu", onContextMenu);
       canvas.removeEventListener("pointerenter", onEnter);
       canvas.removeEventListener("pointerdown", handlePointerDown);
       canvas.removeEventListener("pointermove", handlePointerMove);

@@ -1,4 +1,5 @@
 import type { DocumentState } from "@/types/DocumentTypes";
+import { DEFAULT_PRESETS } from "@/utils/toolPresets";
 import { useCallback, useRef, useState } from "react";
 
 // ── DocumentManagerResult ─────────────────────────────────────────────────────
@@ -65,7 +66,12 @@ export interface DocumentManagerResult {
    * Create a blank document with the given dimensions, add it to the store,
    * and queue a three-phase swap into it. Returns the new document id.
    */
-  createDocument: (width: number, height: number, filename?: string) => string;
+  createDocument: (
+    width: number,
+    height: number,
+    filename?: string,
+    brushSizes?: { brush: number; eraser: number },
+  ) => string;
 
   /**
    * Register a callback that DocumentManager will call to load a .sktch file
@@ -111,7 +117,14 @@ export function buildBlankDocState(
   filename: string,
   canvasWidth: number,
   canvasHeight: number,
+  brushSizes?: { brush: number; eraser: number },
 ): DocumentState {
+  // Default brush sizes match the active preset's defaultSize so new documents
+  // always open at the preset's intended size rather than a hardcoded fallback.
+  const defaultBrushSizes = {
+    brush: DEFAULT_PRESETS.brush[0]?.defaultSize ?? 24,
+    eraser: DEFAULT_PRESETS.eraser[0]?.defaultSize ?? 24,
+  };
   return {
     id,
     filename,
@@ -131,7 +144,7 @@ export function buildBlankDocState(
     redoStack: [],
     activeTool: "brush",
     brushSettings: null,
-    brushSizes: { brush: 20, eraser: 30 },
+    brushSizes: brushSizes ?? defaultBrushSizes,
     brushBlendMode: "normal",
     color: null,
     recentColors: [],
@@ -371,11 +384,16 @@ export function useDocumentManager(): DocumentManagerResult {
    * Returns the new document id.
    */
   const createDocument = useCallback(
-    (width: number, height: number, filename?: string): string => {
+    (
+      width: number,
+      height: number,
+      filename?: string,
+      brushSizes?: { brush: number; eraser: number },
+    ): string => {
       const idx = getNextUntitledIndex();
       const id = makeId();
       const name = filename ?? `Untitled-${idx}.sktch`;
-      const newDoc = buildBlankDocState(id, name, width, height);
+      const newDoc = buildBlankDocState(id, name, width, height, brushSizes);
       addDocument(newDoc);
 
       // Queue the swap after React has committed the new document to state.

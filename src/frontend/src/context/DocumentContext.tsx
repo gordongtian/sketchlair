@@ -33,7 +33,12 @@ export interface DocumentContextValue {
     fn: (doc: DocumentState, isActiveDoc: boolean) => void,
   ) => void;
   /** Create a blank document with exact dimensions, add it, and queue a swap into it. */
-  createDocument: (width: number, height: number, filename?: string) => string;
+  createDocument: (
+    width: number,
+    height: number,
+    filename?: string,
+    brushSizes?: { brush: number; eraser: number },
+  ) => string;
   /** Register PaintingApp's loadFile function (called after swap when opening a file). */
   registerLoadFileFn: (fn: (file: File) => Promise<void>) => void;
   /** Open a .sktch file as a new document tab. */

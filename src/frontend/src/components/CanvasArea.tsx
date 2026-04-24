@@ -1,11 +1,29 @@
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type { HSVAColor } from "@/utils/colorUtils";
 import type { Preset } from "@/utils/toolPresets";
 import {
+  Check,
+  Eraser,
+  FolderPlus,
   Layers,
+  Lock,
+  MapPin,
   Palette,
-  SlidersHorizontal as PresetsIcon,
+  Plus,
+  Scissors,
 } from "lucide-react";
-import type { ReactNode, RefObject } from "react";
+import {
+  type ReactNode,
+  type RefObject,
+  useCallback,
+  useRef,
+  useState,
+} from "react";
 import type { ViewTransform } from "../types";
 import type { BrushSettings } from "./BrushSettingsPanel";
 import { ColorPickerPanel } from "./ColorPickerPanel";
@@ -13,10 +31,284 @@ import { FillPresetsPanel } from "./FillPresetsPanel";
 import type { FillMode, FillSettings } from "./FillPresetsPanel";
 import { LassoPresetsPanel } from "./LassoPresetsPanel";
 import type { Layer } from "./LayersPanel";
+import { LayersPanel } from "./LayersPanel";
 import { MobileCanvasSliders } from "./MobileCanvasSliders";
 import { type RulerPresetType, RulerPresetsPanel } from "./RulerPresetsPanel";
 import { ToolPresetsPanel } from "./ToolPresetsPanel";
 import type { LassoMode, Tool } from "./Toolbar";
+
+// --- Mobile panel dragging infrastructure ---
+
+interface PanelPosition {
+  x: number;
+  y: number;
+}
+
+/** LP tab width in px (the 40px button stack on the right edge) */
+const LP_TAB_WIDTH = 40;
+
+/** Left toolbar width in px (tool buttons column) */
+const TOOLBAR_WIDTH = 46;
+
+/**
+ * Auto-pin threshold: if the user drags more than this many pixels from the
+ * pointer-down origin, the panel is silently pinned mid-drag.
+ */
+export const PANEL_DRAG_AUTOPIN_THRESHOLD = 50;
+
+/** Side the panel opens on — right (LP panels) or left (presets from toolbar) */
+type PanelSide = "right" | "left";
+
+/**
+ * Hook that provides pin state + drag behaviour for a single mobile panel.
+ * Position is tracked in a ref during drag to avoid re-renders.
+ * Only the pinned boolean lives in state.
+ */
+function usePanelDrag(side: PanelSide = "right") {
+  const [pinned, setPinned] = useState(false);
+  // Saved position ref — survives unpins, reset only on app reload
+  const lastPosRef = useRef<PanelPosition | null>(null);
+  // Default button-aligned Y for snap-back after short drag
+  const defaultYRef = useRef<number>(8);
+  // DOM ref for the panel element (set by each panel's outer div)
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  // Drag state stored in refs to avoid re-renders
+  const isDraggingRef = useRef(false);
+  const dragStartPointerRef = useRef({ x: 0, y: 0 });
+  const dragStartPanelRef = useRef({ x: 0, y: 0 });
+  // Whether auto-pin triggered during this drag
+  const autoPinnedThisDragRef = useRef(false);
+  // Expose setPinned so callers can force-unpin
+  const pinnedRef = useRef(pinned);
+  pinnedRef.current = pinned;
+
+  /** Clamp panel position to stay within canvas and clear of the LP tab */
+  const clampPosition = useCallback(
+    (x: number, y: number): PanelPosition => {
+      const el = panelRef.current;
+      if (!el) return { x, y };
+      const pw = el.offsetWidth;
+      const ph = el.offsetHeight;
+      const container = el.closest<HTMLElement>(
+        ".canvas-workspace-bg, [data-canvas-area]",
+      );
+      const cw = container ? container.clientWidth : window.innerWidth;
+      const ch = container ? container.clientHeight : window.innerHeight;
+      let maxX: number;
+      let minX: number;
+      if (side === "right") {
+        maxX = cw - LP_TAB_WIDTH - 8 - pw; // must not cover LP tab
+        minX = 0;
+      } else {
+        // left-side panels (presets): must not cover toolbar
+        minX = 0;
+        maxX = cw - LP_TAB_WIDTH - 8 - pw;
+      }
+      const maxY = ch - ph;
+      return {
+        x: Math.max(minX, Math.min(x, maxX)),
+        y: Math.max(0, Math.min(y, maxY)),
+      };
+    },
+    [side],
+  );
+
+  /** Apply position to DOM element directly (no React state) */
+  const applyPosition = useCallback((pos: PanelPosition) => {
+    const el = panelRef.current;
+    if (!el) return;
+    el.style.left = `${pos.x}px`;
+    el.style.top = `${pos.y}px`;
+    el.style.right = "auto";
+    el.style.transform = "none";
+  }, []);
+
+  /** Set the default Y position (button-aligned) for snap-back */
+  const setDefaultY = useCallback((y: number) => {
+    defaultYRef.current = y;
+  }, []);
+
+  /** Start dragging from the title bar — works whether pinned or not */
+  const handleTitleBarPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.stopPropagation();
+      const el = panelRef.current;
+      if (!el) return;
+
+      // Resolve absolute left/top from current rendered position
+      const rect = el.getBoundingClientRect();
+      const container = el.closest<HTMLElement>(
+        ".canvas-workspace-bg, [data-canvas-area]",
+      );
+      const containerRect = container
+        ? container.getBoundingClientRect()
+        : { left: 0, top: 0 };
+
+      const startX = rect.left - containerRect.left;
+      const startY = rect.top - containerRect.top;
+      applyPosition({ x: startX, y: startY });
+
+      isDraggingRef.current = true;
+      autoPinnedThisDragRef.current = false;
+      dragStartPointerRef.current = { x: e.clientX, y: e.clientY };
+      dragStartPanelRef.current = { x: startX, y: startY };
+
+      e.currentTarget.setPointerCapture(e.pointerId);
+    },
+    [applyPosition],
+  );
+
+  const handleTitleBarPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>, onAutoPinned?: () => void) => {
+      if (!isDraggingRef.current) return;
+      e.stopPropagation();
+      const dx = e.clientX - dragStartPointerRef.current.x;
+      const dy = e.clientY - dragStartPointerRef.current.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      // Auto-pin if drag distance exceeds threshold and not yet pinned
+      if (dist > PANEL_DRAG_AUTOPIN_THRESHOLD && !pinnedRef.current) {
+        autoPinnedThisDragRef.current = true;
+        setPinned(true);
+        onAutoPinned?.();
+      }
+
+      const newPos = clampPosition(
+        dragStartPanelRef.current.x + dx,
+        dragStartPanelRef.current.y + dy,
+      );
+      applyPosition(newPos);
+    },
+    [clampPosition, applyPosition],
+  );
+
+  const handleTitleBarPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!isDraggingRef.current) return;
+      e.stopPropagation();
+      isDraggingRef.current = false;
+
+      const el = panelRef.current;
+      if (!el) return;
+
+      if (pinnedRef.current) {
+        // Save final position to lastPosRef
+        const x = Number.parseFloat(el.style.left) || 0;
+        const y = Number.parseFloat(el.style.top) || 0;
+        lastPosRef.current = { x, y };
+      } else {
+        // Short drag — snap back to default button-aligned position
+        const defaultY = defaultYRef.current;
+        const container = el.closest<HTMLElement>(
+          ".canvas-workspace-bg, [data-canvas-area]",
+        );
+        const cw = container ? container.clientWidth : window.innerWidth;
+        const pw = el.offsetWidth;
+        let snapX: number;
+        if (side === "right") {
+          snapX = cw - LP_TAB_WIDTH - 8 - pw;
+        } else {
+          snapX = TOOLBAR_WIDTH + 8;
+        }
+        applyPosition(clampPosition(snapX, defaultY));
+      }
+    },
+    [side, applyPosition, clampPosition],
+  );
+
+  /**
+   * Toggle pin state.
+   * - Pinning: panel stays open, becomes draggable
+   * - Unpinning: save position to lastPosRef, close panel (caller responsible for closing)
+   */
+  const togglePin = useCallback((onClose: () => void) => {
+    if (pinnedRef.current) {
+      // Save current position before unpinning
+      const el = panelRef.current;
+      if (el) {
+        const x = Number.parseFloat(el.style.left) || 0;
+        const y = Number.parseFloat(el.style.top) || 0;
+        if (x !== 0 || y !== 0) {
+          lastPosRef.current = { x, y };
+        }
+      }
+      setPinned(false);
+      onClose();
+    } else {
+      setPinned(true);
+    }
+  }, []);
+
+  /**
+   * Force-close this panel: save position, unpin, and call onClose.
+   * Used when the LP button is tapped while the panel is open — always closes
+   * regardless of pin state.
+   */
+  const forceClose = useCallback((onClose: () => void) => {
+    const el = panelRef.current;
+    if (el) {
+      const x = Number.parseFloat(el.style.left) || 0;
+      const y = Number.parseFloat(el.style.top) || 0;
+      if (x !== 0 || y !== 0) {
+        lastPosRef.current = { x, y };
+      }
+    }
+    setPinned(false);
+    onClose();
+  }, []);
+
+  /**
+   * Get the inline style for the panel.
+   * - Pinned with last position: use last position
+   * - Default: button-aligned position (right or left side)
+   */
+  const getPanelStyle = useCallback(
+    (buttonY?: number): React.CSSProperties => {
+      if (pinned && lastPosRef.current) {
+        return {
+          position: "absolute",
+          left: lastPosRef.current.x,
+          top: lastPosRef.current.y,
+          right: "auto",
+          transform: "none",
+        };
+      }
+      // Use buttonY if provided, otherwise fall back to defaultYRef (set on last open)
+      const topY = buttonY !== undefined ? buttonY : defaultYRef.current;
+      if (side === "right") {
+        return {
+          position: "absolute",
+          top: topY,
+          transform: "none",
+          right: LP_TAB_WIDTH + 8,
+          left: "auto",
+        };
+      }
+      // Left-side (presets opened from toolbar)
+      return {
+        position: "absolute",
+        top: topY,
+        transform: "none",
+        left: TOOLBAR_WIDTH + 8,
+        right: "auto",
+      };
+    },
+    [pinned, side],
+  );
+
+  return {
+    pinned,
+    setPinned,
+    panelRef,
+    getPanelStyle,
+    setDefaultY,
+    togglePin,
+    forceClose,
+    handleTitleBarPointerDown,
+    handleTitleBarPointerMove,
+    handleTitleBarPointerUp,
+  };
+}
 
 // --- Prop types ---
 
@@ -42,7 +334,7 @@ export interface CanvasAreaProps {
   canvasWidthRef: RefObject<number>;
   canvasHeightRef: RefObject<number>;
   cropRectRef: RefObject<{ x: number; y: number; w: number; h: number }>;
-  toolSizesRef: RefObject<Record<string, number>>;
+  toolSizesRef: RefObject<Record<string, number | undefined>>;
   toolOpacitiesRef: RefObject<Record<string, number>>;
   toolFlowsRef: RefObject<Record<string, number>>;
 
@@ -71,6 +363,54 @@ export interface CanvasAreaProps {
   activePresetIds: Record<string, string | null>;
   layers: Layer[];
 
+  // Layers panel (mobile floating overlay) props
+  layerTree: import("../types").LayerNode[];
+  activeLayerId: string;
+  selectedLayerIds: Set<string>;
+  layerThumbnails: Record<string, string>;
+  onSetActive: (id: string) => void;
+  onToggleVisible: (id: string) => void;
+  onSetOpacity: (id: string, opacity: number) => void;
+  onSetOpacityLive: (id: string, opacity: number) => void;
+  onSetOpacityCommit: (id: string, before: number, after: number) => void;
+  onSetBlendMode: (id: string, blendMode: string) => void;
+  onAddLayer: () => void;
+  onDeleteLayer: (id: string) => void;
+  onReorderLayers: (ids: string[]) => void;
+  onClearLayer: () => void;
+  onToggleClippingMask: (id: string) => void;
+  onMergeLayers: () => void;
+  onRenameLayer: (id: string, name: string) => void;
+  onToggleAlphaLock: (id: string) => void;
+  onCtrlClickLayer: (id: string) => void;
+  onToggleRulerActive: (id: string) => void;
+  onToggleGroupCollapse: (groupId: string) => void;
+  onRenameGroup: (groupId: string, name: string) => void;
+  onSetGroupOpacity: (groupId: string, opacity: number) => void;
+  onSetGroupOpacityLive: (groupId: string, opacity: number) => void;
+  onSetGroupOpacityCommit: (
+    groupId: string,
+    before: number,
+    after: number,
+  ) => void;
+  onToggleGroupVisible: (groupId: string) => void;
+  onOpenDeleteGroup: (groupId: string) => void;
+  onReorderTree: (newTree: import("../types").LayerNode[] | Layer[]) => void;
+  onReorderTreeSilent: (
+    newTree: import("../types").LayerNode[] | Layer[],
+  ) => void;
+  onReorderLayersSilent: (ids: string[]) => void;
+  onCommitReorderHistory: (
+    treeBefore: import("../types").LayerNode[],
+    treeAfter: import("../types").LayerNode[],
+    layersBefore: Layer[],
+    layersAfter: Layer[],
+  ) => void;
+  onToggleLayerSelection: (id: string, shiftHeld: boolean) => void;
+  onCreateGroup: () => void;
+  shiftHeld: boolean;
+  brushTipEditorActive?: boolean;
+
   // Ruler
   scheduleRulerOverlay: () => void;
 
@@ -83,6 +423,7 @@ export interface CanvasAreaProps {
   leftHanded: boolean;
   showMobileColorPanel: boolean;
   showMobilePresetsPanel: boolean;
+  showMobileLayersPanel: boolean;
   recentColors: string[];
   wandTolerance: number;
   wandContiguous: boolean;
@@ -92,9 +433,9 @@ export interface CanvasAreaProps {
   cursor: string;
 
   // Callbacks — mobile
-  onSetShowMobileColorPanel: (show: boolean) => void;
-  onSetShowMobilePresetsPanel: (show: boolean) => void;
-  onSetRightSidebarCollapsed: (collapsed: (c: boolean) => boolean) => void;
+  onSetActiveMobilePanel: (
+    panel: "layers" | "presets" | "palette" | null,
+  ) => void;
   onRecentColorClick: (color: string) => void;
   onColorChange: (color: HSVAColor) => void;
 
@@ -165,6 +506,9 @@ export interface CanvasAreaProps {
    * Shown in the mobile presets popup when activeSubpanel === 'adjustments'.
    */
   mobileAdjustmentsPanel?: ReactNode;
+
+  /** Called when the user taps "Draw New" in the mobile presets panel — opens the inline brush tip editor */
+  onEnterBrushTipEditor?: (onAccept: (dataUrl: string) => void) => void;
 }
 
 export function CanvasArea({
@@ -193,6 +537,41 @@ export function CanvasArea({
   presets,
   activePresetIds,
   layers,
+  layerTree,
+  activeLayerId,
+  selectedLayerIds,
+  layerThumbnails,
+  onSetActive,
+  onToggleVisible,
+  onSetOpacity,
+  onSetOpacityLive,
+  onSetOpacityCommit,
+  onSetBlendMode,
+  onAddLayer,
+  onDeleteLayer,
+  onReorderLayers,
+  onClearLayer,
+  onToggleClippingMask,
+  onMergeLayers,
+  onRenameLayer,
+  onToggleAlphaLock,
+  onCtrlClickLayer,
+  onToggleRulerActive,
+  onToggleGroupCollapse,
+  onRenameGroup,
+  onSetGroupOpacity,
+  onSetGroupOpacityLive,
+  onSetGroupOpacityCommit,
+  onToggleGroupVisible,
+  onOpenDeleteGroup,
+  onReorderTree,
+  onReorderTreeSilent,
+  onReorderLayersSilent,
+  onCommitReorderHistory,
+  onToggleLayerSelection,
+  onCreateGroup,
+  shiftHeld,
+  brushTipEditorActive = false,
   scheduleRulerOverlay,
   isCropActive,
   cropRectVersion,
@@ -200,14 +579,13 @@ export function CanvasArea({
   leftHanded,
   showMobileColorPanel,
   showMobilePresetsPanel,
+  showMobileLayersPanel,
   recentColors,
   wandTolerance,
   wandContiguous,
   wandGrowShrink,
   cursor,
-  onSetShowMobileColorPanel,
-  onSetShowMobilePresetsPanel,
-  onSetRightSidebarCollapsed,
+  onSetActiveMobilePanel,
   onRecentColorClick,
   onColorChange,
   onBrushSizeChange,
@@ -250,14 +628,85 @@ export function CanvasArea({
   onRulerCanvasRef,
   onSelectionOverlayCanvasRef,
   mobileAdjustmentsPanel,
+  onEnterBrushTipEditor,
 }: CanvasAreaProps) {
   // Derive ruler layer props from layers array
   const rulerLayer = layers.find((l) => l.isRuler);
+
+  // --- Mobile panel drag hooks (one per panel) ---
+  const colorDrag = usePanelDrag("right");
+  const presetsDrag = usePanelDrag("left");
+  const layersDrag = usePanelDrag("right");
+
+  // Pinned panels are visible independently of activeMobilePanel
+  const colorVisible = showMobileColorPanel || colorDrag.pinned;
+  const presetsVisible = showMobilePresetsPanel || presetsDrag.pinned;
+  const layersVisible =
+    (showMobileLayersPanel && !brushTipEditorActive) || layersDrag.pinned;
+
+  // Refs for LP tab buttons — used to measure Y position for panel alignment
+  const layersBtnRef = useRef<HTMLButtonElement | null>(null);
+  const colorBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  // Shared title bar style
+  const titleBarStyle: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "6px 10px 6px 12px",
+    borderBottom: "1px solid oklch(var(--border))",
+    flexShrink: 0,
+    cursor: "default",
+    userSelect: "none",
+    background: "oklch(var(--sidebar-left) / 0.8)",
+  };
+
+  const titleBarTextStyle: React.CSSProperties = {
+    fontSize: 11,
+    fontWeight: 600,
+    letterSpacing: "0.06em",
+    textTransform: "uppercase",
+    color: "oklch(var(--muted-foreground))",
+  };
+
+  const pinButtonStyle = (isPinned: boolean): React.CSSProperties => ({
+    width: 26,
+    height: 26,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "none",
+    border: "none",
+    borderRadius: 4,
+    cursor: "pointer",
+    color: isPinned ? "oklch(var(--accent))" : "oklch(var(--muted-foreground))",
+    padding: 0,
+    transition: "color 0.15s",
+    flexShrink: 0,
+  });
+
+  /** Backdrop that closes the unpinned panel on tap */
+  const renderBackdrop = (onClose: () => void) => (
+    <div
+      style={{ position: "absolute", inset: 0, zIndex: 40 }}
+      onPointerDown={(e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
+      }}
+      onPointerUp={(e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        onClose();
+      }}
+    />
+  );
 
   return (
     <div
       ref={containerRef}
       className="flex-1 relative overflow-hidden canvas-workspace-bg"
+      data-canvas-area
       style={{ cursor, touchAction: "none" }}
     >
       {/* Mobile: vertical canvas edge sliders (Flow, Opacity, Size) — only for tools that use them */}
@@ -281,110 +730,44 @@ export function CanvasArea({
             onLiquifyStrengthChange={onLiquifyStrengthChange}
           />
         )}
-      {/* Mobile: all canvas corner buttons in one row — offset past the slider on the non-slider side */}
-      {/* Slider is 44px wide at offset 6px from edge, so buttons start at 56px from that edge */}
-      {isMobile && (
-        <div
-          style={{
-            position: "absolute",
-            // paddingTop accounts for safe area on iPad notch/rounded corners
-            top: "max(8px, env(safe-area-inset-top, 8px))",
-            // On right-handed: slider on left → buttons also on left (offset past slider), layers on right
-            // On left-handed: slider on right → buttons on right (offset past slider), layers on left
-            ...(leftHanded ? { right: 56 } : { left: 56 }),
-            zIndex: 25,
-            display: "flex",
-            flexDirection: "row",
-            gap: 6,
-            alignItems: "center",
-          }}
-        >
-          {/* Color panel button */}
-          <button
-            type="button"
-            data-ocid="mobile.color_panel_button"
-            onClick={() => {
-              onSetShowMobileColorPanel(!showMobileColorPanel);
-              onSetShowMobilePresetsPanel(false);
-            }}
-            style={{
-              width: 40,
-              height: 40,
-              flexShrink: 0,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              background: showMobileColorPanel
-                ? "oklch(var(--accent))"
-                : "rgba(0,0,0,0.45)",
-              backdropFilter: showMobileColorPanel ? undefined : "blur(6px)",
-              borderRadius: 8,
-              border: showMobileColorPanel
-                ? "1px solid oklch(var(--accent))"
-                : "1px solid rgba(255,255,255,0.15)",
-              color: showMobileColorPanel
-                ? "oklch(var(--accent-text))"
-                : "rgba(255,255,255,0.85)",
-              cursor: "pointer",
-            }}
-            title="Color Panel"
-          >
-            <Palette size={18} />
-          </button>
-          {/* Presets panel button */}
-          <button
-            type="button"
-            data-ocid="mobile.presets_panel_button"
-            onClick={() => {
-              onSetShowMobilePresetsPanel(!showMobilePresetsPanel);
-              onSetShowMobileColorPanel(false);
-            }}
-            style={{
-              width: 40,
-              height: 40,
-              flexShrink: 0,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              background: showMobilePresetsPanel
-                ? "oklch(var(--accent))"
-                : "rgba(0,0,0,0.45)",
-              backdropFilter: showMobilePresetsPanel ? undefined : "blur(6px)",
-              borderRadius: 8,
-              border: showMobilePresetsPanel
-                ? "1px solid oklch(var(--accent))"
-                : "1px solid rgba(255,255,255,0.15)",
-              color: showMobilePresetsPanel
-                ? "oklch(var(--accent-text))"
-                : "rgba(255,255,255,0.85)",
-              cursor: "pointer",
-            }}
-            title="Tool Presets"
-          >
-            <PresetsIcon size={18} />
-          </button>
-        </div>
-      )}
-      {/* Mobile: canvas corner button — Layers (opposite side from slider) */}
+      {/* Mobile: LP tab — TWO buttons only: Layers (L) at top, Color Palette (C) at bottom */}
       {isMobile && (
         <div
           style={{
             position: "absolute",
             top: "max(8px, env(safe-area-inset-top, 8px))",
-            // Layers button on the opposite side from slider/color/presets buttons
-            ...(leftHanded ? { left: 8 } : { right: 8 }),
+            right: 0,
             zIndex: 25,
             display: "flex",
-            flexDirection: "row",
-            gap: 6,
+            flexDirection: "column",
+            gap: 0,
             alignItems: "center",
           }}
         >
           {/* Layers button */}
           <button
+            ref={layersBtnRef}
             type="button"
             data-ocid="mobile.layers_button"
-            onClick={() => onSetRightSidebarCollapsed((c) => !c)}
+            onClick={() => {
+              if (showMobileLayersPanel || layersDrag.pinned) {
+                // Always close — unpin if needed
+                layersDrag.forceClose(() => onSetActiveMobilePanel(null));
+              } else {
+                // Measure button Y relative to canvas container
+                const btn = layersBtnRef.current;
+                const container = btn?.closest<HTMLElement>(
+                  ".canvas-workspace-bg, [data-canvas-area]",
+                );
+                if (btn && container) {
+                  const btnRect = btn.getBoundingClientRect();
+                  const cRect = container.getBoundingClientRect();
+                  const buttonY = btnRect.top - cRect.top;
+                  layersDrag.setDefaultY(buttonY);
+                }
+                onSetActiveMobilePanel("layers");
+              }
+            }}
             style={{
               width: 40,
               height: 40,
@@ -392,211 +775,512 @@ export function CanvasArea({
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              background: "rgba(0,0,0,0.45)",
-              backdropFilter: "blur(6px)",
-              borderRadius: 8,
-              border: "1px solid rgba(255,255,255,0.15)",
-              color: "rgba(255,255,255,0.85)",
+              background:
+                showMobileLayersPanel || layersDrag.pinned
+                  ? "oklch(var(--accent))"
+                  : "rgba(0,0,0,0.45)",
+              backdropFilter:
+                showMobileLayersPanel || layersDrag.pinned
+                  ? undefined
+                  : "blur(6px)",
+              borderRadius: "8px 0 0 0",
+              border:
+                showMobileLayersPanel || layersDrag.pinned
+                  ? "1px solid oklch(var(--accent))"
+                  : "1px solid rgba(255,255,255,0.15)",
+              borderBottom: "none",
+              color:
+                showMobileLayersPanel || layersDrag.pinned
+                  ? "oklch(var(--accent-text))"
+                  : "rgba(255,255,255,0.85)",
               cursor: "pointer",
             }}
             title="Layers"
           >
             <Layers size={18} />
           </button>
+          {/* Color panel button */}
+          <button
+            ref={colorBtnRef}
+            type="button"
+            data-ocid="mobile.color_panel_button"
+            onClick={() => {
+              if (showMobileColorPanel || colorDrag.pinned) {
+                // Always close — unpin if needed
+                colorDrag.forceClose(() => onSetActiveMobilePanel(null));
+              } else {
+                // Measure button Y relative to canvas container
+                const btn = colorBtnRef.current;
+                const container = btn?.closest<HTMLElement>(
+                  ".canvas-workspace-bg, [data-canvas-area]",
+                );
+                if (btn && container) {
+                  const btnRect = btn.getBoundingClientRect();
+                  const cRect = container.getBoundingClientRect();
+                  const buttonY = btnRect.top - cRect.top;
+                  colorDrag.setDefaultY(buttonY);
+                }
+                onSetActiveMobilePanel("palette");
+              }
+            }}
+            style={{
+              width: 40,
+              height: 40,
+              flexShrink: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background:
+                showMobileColorPanel || colorDrag.pinned
+                  ? "oklch(var(--accent))"
+                  : "rgba(0,0,0,0.45)",
+              backdropFilter:
+                showMobileColorPanel || colorDrag.pinned
+                  ? undefined
+                  : "blur(6px)",
+              borderRadius: "0 0 0 8px",
+              border:
+                showMobileColorPanel || colorDrag.pinned
+                  ? "1px solid oklch(var(--accent))"
+                  : "1px solid rgba(255,255,255,0.15)",
+              color:
+                showMobileColorPanel || colorDrag.pinned
+                  ? "oklch(var(--accent-text))"
+                  : "rgba(255,255,255,0.85)",
+              cursor: "pointer",
+            }}
+            title="Color Panel"
+          >
+            <Palette size={18} />
+          </button>
         </div>
       )}
-      {/* Mobile: floating color panel overlay (portrait and landscape) */}
-      {isMobile && showMobileColorPanel && (
+
+      {/* Mobile: floating color panel */}
+      {isMobile && colorVisible && (
         <>
-          {/* Backdrop */}
+          {/* Backdrop — only when NOT pinned */}
+          {!colorDrag.pinned &&
+            renderBackdrop(() => onSetActiveMobilePanel(null))}
           <div
-            style={{
-              position: "absolute",
-              inset: 0,
-              zIndex: 40,
-            }}
-            onPointerDown={(e) => {
-              e.stopPropagation();
-              e.preventDefault();
-              e.currentTarget.setPointerCapture(e.pointerId);
-            }}
-            onPointerUp={(e) => {
-              e.stopPropagation();
-              e.preventDefault();
-              onSetShowMobileColorPanel(false);
-            }}
-          />
-          {/* Floating panel — anchored below the corner buttons, aligned with slider offset */}
-          <div
+            ref={colorDrag.panelRef}
             data-ocid="mobile.color_panel"
             style={{
-              position: "absolute",
-              top: "calc(max(8px, env(safe-area-inset-top, 8px)) + 48px)",
-              ...(leftHanded ? { right: 56 } : { left: 56 }),
-              zIndex: 50,
+              ...colorDrag.getPanelStyle(),
+              zIndex: colorDrag.pinned ? 55 : 50,
               background: "oklch(var(--sidebar-left))",
               border: "1px solid oklch(var(--border))",
               borderRadius: 10,
               boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
               width: 240,
-              maxHeight: "80dvh",
-              overflow: "hidden auto",
+              maxHeight: "calc(100dvh - 80px)",
+              overflow: "hidden",
+              display: "flex",
+              flexDirection: "column",
+              animation: colorDrag.pinned
+                ? undefined
+                : "slideInFromRight 0.18s ease-out",
             }}
             onPointerDown={(e) => e.stopPropagation()}
           >
-            <ColorPickerPanel
-              color={color}
-              onColorChange={onColorChange}
-              recentColors={recentColors}
-              onRecentColorClick={onRecentColorClick}
-            />
+            {/* Title bar */}
+            <div
+              style={{
+                ...titleBarStyle,
+                cursor: colorDrag.pinned ? "grab" : "default",
+              }}
+              onPointerDown={colorDrag.handleTitleBarPointerDown}
+              onPointerMove={(e) => colorDrag.handleTitleBarPointerMove(e)}
+              onPointerUp={colorDrag.handleTitleBarPointerUp}
+            >
+              <span style={titleBarTextStyle}>Color</span>
+              <button
+                type="button"
+                title={colorDrag.pinned ? "Unpin panel" : "Pin panel"}
+                style={pinButtonStyle(colorDrag.pinned)}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() =>
+                  colorDrag.togglePin(() => onSetActiveMobilePanel(null))
+                }
+              >
+                <MapPin
+                  size={14}
+                  fill={colorDrag.pinned ? "currentColor" : "none"}
+                />
+              </button>
+            </div>
+            {/* Content */}
+            <div style={{ overflow: "hidden auto", flex: 1 }}>
+              <ColorPickerPanel
+                color={color}
+                onColorChange={onColorChange}
+                recentColors={recentColors}
+                onRecentColorClick={onRecentColorClick}
+              />
+            </div>
           </div>
         </>
       )}
-      {/* Mobile: floating presets panel overlay (portrait and landscape) */}
-      {isMobile && showMobilePresetsPanel && (
+
+      {/* Mobile: floating presets panel */}
+      {isMobile && presetsVisible && (
         <>
-          {/* Backdrop */}
+          {!presetsDrag.pinned &&
+            renderBackdrop(() => onSetActiveMobilePanel(null))}
           <div
-            style={{
-              position: "absolute",
-              inset: 0,
-              zIndex: 40,
-            }}
-            onPointerDown={(e) => {
-              e.stopPropagation();
-              e.preventDefault();
-              e.currentTarget.setPointerCapture(e.pointerId);
-            }}
-            onPointerUp={(e) => {
-              e.stopPropagation();
-              e.preventDefault();
-              onSetShowMobilePresetsPanel(false);
-            }}
-          />
-          {/* Floating panel — anchored below the corner buttons, aligned with slider offset */}
-          <div
+            ref={presetsDrag.panelRef}
             data-ocid="mobile.presets_panel"
             style={{
-              position: "absolute",
-              top: "calc(max(8px, env(safe-area-inset-top, 8px)) + 48px)",
-              ...(leftHanded ? { right: 56 } : { left: 56 }),
-              zIndex: 50,
+              ...presetsDrag.getPanelStyle(),
+              zIndex: presetsDrag.pinned ? 55 : 50,
               background: "oklch(var(--sidebar-left))",
               border: "1px solid oklch(var(--border))",
               borderRadius: 10,
               boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
               width: 280,
-              maxHeight: "85dvh",
-              overflow: "hidden auto",
+              maxHeight: "calc(100dvh - 80px)",
+              overflow: "hidden",
+              display: "flex",
+              flexDirection: "column",
+              animation: presetsDrag.pinned
+                ? undefined
+                : "slideInFromLeft 0.18s ease-out",
             }}
             onPointerDown={(e) => e.stopPropagation()}
           >
-            <div className="flex flex-col" style={{ overflowX: "hidden" }}>
-              {activeSubpanel === "brush" ||
-              activeSubpanel === "smudge" ||
-              activeSubpanel === "eraser" ? (
-                <ToolPresetsPanel
-                  tool={activeSubpanel}
-                  availableTips={(() => {
-                    const seen = new Set<string>();
-                    const tips: {
-                      id: string;
-                      name: string;
-                      tipImageData?: string;
-                    }[] = [];
-                    for (const toolType of [
-                      "brush",
-                      "smudge",
-                      "eraser",
-                    ] as const) {
-                      for (const preset of presets[toolType]) {
-                        const key =
-                          preset.settings.tipImageData ??
-                          `__no-tip-${preset.id}`;
-                        if (!seen.has(key)) {
-                          seen.add(key);
-                          tips.push({
-                            id: preset.id,
-                            name: preset.name,
-                            tipImageData: preset.settings.tipImageData,
-                          });
+            {/* Title bar */}
+            <div
+              style={{
+                ...titleBarStyle,
+                cursor: presetsDrag.pinned ? "grab" : "default",
+              }}
+              onPointerDown={presetsDrag.handleTitleBarPointerDown}
+              onPointerMove={(e) => presetsDrag.handleTitleBarPointerMove(e)}
+              onPointerUp={presetsDrag.handleTitleBarPointerUp}
+            >
+              <span style={titleBarTextStyle}>Tool Presets</span>
+              <button
+                type="button"
+                title={presetsDrag.pinned ? "Unpin panel" : "Pin panel"}
+                style={pinButtonStyle(presetsDrag.pinned)}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() =>
+                  presetsDrag.togglePin(() => onSetActiveMobilePanel(null))
+                }
+              >
+                <MapPin
+                  size={14}
+                  fill={presetsDrag.pinned ? "currentColor" : "none"}
+                />
+              </button>
+            </div>
+            {/* Content */}
+            <div style={{ overflow: "hidden auto", flex: 1 }}>
+              <div className="flex flex-col" style={{ overflowX: "hidden" }}>
+                {activeSubpanel === "brush" ||
+                activeSubpanel === "smudge" ||
+                activeSubpanel === "eraser" ? (
+                  <ToolPresetsPanel
+                    tool={activeSubpanel}
+                    availableTips={(() => {
+                      const seen = new Set<string>();
+                      const tips: {
+                        id: string;
+                        name: string;
+                        tipImageData?: string;
+                      }[] = [];
+                      for (const toolType of [
+                        "brush",
+                        "smudge",
+                        "eraser",
+                      ] as const) {
+                        for (const preset of presets[toolType]) {
+                          const key =
+                            preset.settings.tipImageData ??
+                            `__no-tip-${preset.id}`;
+                          if (!seen.has(key)) {
+                            seen.add(key);
+                            tips.push({
+                              id: preset.id,
+                              name: preset.name,
+                              tipImageData: preset.settings.tipImageData,
+                            });
+                          }
                         }
                       }
+                      return tips;
+                    })()}
+                    presets={presets[activeSubpanel]}
+                    activePresetId={activePresetIds[activeSubpanel] ?? null}
+                    currentSettings={brushSettings}
+                    onSelectPreset={onSelectPreset}
+                    onUpdatePreset={onUpdatePreset}
+                    onAddPreset={onAddPreset}
+                    onDeletePreset={onDeletePreset}
+                    onActivate={onActivatePreset}
+                    onClose={onCloseMobilePresetsPanel}
+                    onReorderPresets={onReorderPresets}
+                    currentSize={currentBrushSize}
+                    currentOpacity={color.a}
+                    onSaveCurrentToPreset={onSaveCurrentToPreset}
+                    onEnterBrushTipEditor={onEnterBrushTipEditor}
+                  />
+                ) : activeSubpanel === "lasso" ? (
+                  <LassoPresetsPanel
+                    lassoMode={lassoMode}
+                    onSelectMode={onSelectLassoMode}
+                    onClose={onCloseMobilePresetsPanel}
+                    accentColor="var(--accent)"
+                    isDarkMode={false}
+                    wandTolerance={wandTolerance}
+                    wandContiguous={wandContiguous}
+                    onWandToleranceChange={onWandToleranceChange}
+                    onWandContiguousChange={onWandContiguousChange}
+                    wandGrowShrink={wandGrowShrink}
+                    onWandGrowShrinkChange={onWandGrowShrinkChange}
+                  />
+                ) : activeSubpanel === "fill" ? (
+                  <FillPresetsPanel
+                    fillMode={fillMode}
+                    fillSettings={fillSettings}
+                    onSelectMode={onSelectFillMode}
+                    onSettingsChange={onFillSettingsChange}
+                    onClose={onCloseMobilePresetsPanel}
+                  />
+                ) : activeSubpanel === "ruler" ? (
+                  <RulerPresetsPanel
+                    rulerPresetType={activeRulerPresetType}
+                    onRulerPresetTypeChange={onRulerPresetTypeChange}
+                    rulerColor={rulerLayer?.rulerColor ?? "#9333ea"}
+                    onRulerColorChange={onRulerColorChange}
+                    vp1Color={rulerLayer?.vp1Color ?? "#ff0000"}
+                    vp2Color={rulerLayer?.vp2Color ?? "#0000ff"}
+                    vp3Color={rulerLayer?.vp3Color ?? "#00ff00"}
+                    onVp1ColorChange={onVp1ColorChange}
+                    onVp2ColorChange={onVp2ColorChange}
+                    onVp3ColorChange={onVp3ColorChange}
+                    rulerWarmupDist={rulerLayer?.rulerWarmupDist ?? 10}
+                    onRulerWarmupDistChange={onRulerWarmupDistChange}
+                    lineSnapMode={rulerLayer?.lineSnapMode ?? "line"}
+                    onLineSnapModeChange={onLineSnapModeChange}
+                    lockFocalLength={rulerLayer?.lockFocalLength ?? false}
+                    onLockFocalLengthChange={onLockFocalLengthChange}
+                    ovalSnapMode={rulerLayer?.ovalSnapMode ?? "ellipse"}
+                    onOvalSnapModeChange={onOvalSnapModeChange}
+                    fivePtEnableCenter={
+                      rulerLayer?.fivePtEnableCenter !== false
                     }
-                    return tips;
-                  })()}
-                  presets={presets[activeSubpanel]}
-                  activePresetId={activePresetIds[activeSubpanel] ?? null}
-                  currentSettings={brushSettings}
-                  onSelectPreset={onSelectPreset}
-                  onUpdatePreset={onUpdatePreset}
-                  onAddPreset={onAddPreset}
-                  onDeletePreset={onDeletePreset}
-                  onActivate={onActivatePreset}
-                  onClose={onCloseMobilePresetsPanel}
-                  onReorderPresets={onReorderPresets}
-                  currentSize={currentBrushSize}
-                  currentOpacity={color.a}
-                  onSaveCurrentToPreset={onSaveCurrentToPreset}
-                />
-              ) : activeSubpanel === "lasso" ? (
-                <LassoPresetsPanel
-                  lassoMode={lassoMode}
-                  onSelectMode={onSelectLassoMode}
-                  onClose={onCloseMobilePresetsPanel}
-                  accentColor="var(--accent)"
-                  isDarkMode={false}
-                  wandTolerance={wandTolerance}
-                  wandContiguous={wandContiguous}
-                  onWandToleranceChange={onWandToleranceChange}
-                  onWandContiguousChange={onWandContiguousChange}
-                  wandGrowShrink={wandGrowShrink}
-                  onWandGrowShrinkChange={onWandGrowShrinkChange}
-                />
-              ) : activeSubpanel === "fill" ? (
-                <FillPresetsPanel
-                  fillMode={fillMode}
-                  fillSettings={fillSettings}
-                  onSelectMode={onSelectFillMode}
-                  onSettingsChange={onFillSettingsChange}
-                  onClose={onCloseMobilePresetsPanel}
-                />
-              ) : activeSubpanel === "ruler" ? (
-                <RulerPresetsPanel
-                  rulerPresetType={activeRulerPresetType}
-                  onRulerPresetTypeChange={onRulerPresetTypeChange}
-                  rulerColor={rulerLayer?.rulerColor ?? "#9333ea"}
-                  onRulerColorChange={onRulerColorChange}
-                  vp1Color={rulerLayer?.vp1Color ?? "#ff0000"}
-                  vp2Color={rulerLayer?.vp2Color ?? "#0000ff"}
-                  vp3Color={rulerLayer?.vp3Color ?? "#00ff00"}
-                  onVp1ColorChange={onVp1ColorChange}
-                  onVp2ColorChange={onVp2ColorChange}
-                  onVp3ColorChange={onVp3ColorChange}
-                  rulerWarmupDist={rulerLayer?.rulerWarmupDist ?? 10}
-                  onRulerWarmupDistChange={onRulerWarmupDistChange}
-                  lineSnapMode={rulerLayer?.lineSnapMode ?? "line"}
-                  onLineSnapModeChange={onLineSnapModeChange}
-                  lockFocalLength={rulerLayer?.lockFocalLength ?? false}
-                  onLockFocalLengthChange={onLockFocalLengthChange}
-                  ovalSnapMode={rulerLayer?.ovalSnapMode ?? "ellipse"}
-                  onOvalSnapModeChange={onOvalSnapModeChange}
-                  fivePtEnableCenter={rulerLayer?.fivePtEnableCenter !== false}
-                  onFivePtEnableCenterChange={onFivePtEnableCenterChange}
-                  fivePtEnableLR={rulerLayer?.fivePtEnableLR !== false}
-                  onFivePtEnableLRChange={onFivePtEnableLRChange}
-                  fivePtEnableUD={rulerLayer?.fivePtEnableUD !== false}
-                  onFivePtEnableUDChange={onFivePtEnableUDChange}
-                  onGridReset={onGridReset}
-                />
-              ) : activeSubpanel === "adjustments" && mobileAdjustmentsPanel ? (
-                mobileAdjustmentsPanel
-              ) : (
-                <div className="flex items-center justify-center h-16 text-muted-foreground text-xs select-none opacity-40">
-                  No presets for this tool
+                    onFivePtEnableCenterChange={onFivePtEnableCenterChange}
+                    fivePtEnableLR={rulerLayer?.fivePtEnableLR !== false}
+                    onFivePtEnableLRChange={onFivePtEnableLRChange}
+                    fivePtEnableUD={rulerLayer?.fivePtEnableUD !== false}
+                    onFivePtEnableUDChange={onFivePtEnableUDChange}
+                    onGridReset={onGridReset}
+                  />
+                ) : activeSubpanel === "adjustments" &&
+                  mobileAdjustmentsPanel ? (
+                  mobileAdjustmentsPanel
+                ) : (
+                  <div className="flex items-center justify-center h-16 text-muted-foreground text-xs select-none opacity-40">
+                    No presets for this tool
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Mobile: floating layers panel */}
+      {isMobile && layersVisible && (
+        <>
+          {!layersDrag.pinned &&
+            renderBackdrop(() => onSetActiveMobilePanel(null))}
+          <div
+            ref={layersDrag.panelRef}
+            data-ocid="mobile.layers_panel"
+            style={{
+              ...layersDrag.getPanelStyle(),
+              zIndex: layersDrag.pinned ? 55 : 50,
+              background: "oklch(var(--sidebar-right))",
+              border: "1px solid oklch(var(--border))",
+              borderRadius: 10,
+              boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+              width: 280,
+              maxHeight: "calc(100dvh - 80px)",
+              overflow: "hidden",
+              display: "flex",
+              flexDirection: "column",
+              animation: layersDrag.pinned
+                ? undefined
+                : "slideInFromRight 0.18s ease-out",
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            {/* Single authoritative title bar: title + action buttons + pin */}
+            <div
+              style={{
+                ...titleBarStyle,
+                cursor: layersDrag.pinned ? "grab" : "default",
+              }}
+              onPointerDown={layersDrag.handleTitleBarPointerDown}
+              onPointerMove={(e) => layersDrag.handleTitleBarPointerMove(e)}
+              onPointerUp={layersDrag.handleTitleBarPointerUp}
+            >
+              <span style={titleBarTextStyle}>Layers</span>
+              {/* Action buttons — same ones that were in LayersPanel's internal header */}
+              <TooltipProvider>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 2,
+                    marginLeft: 4,
+                    marginRight: 4,
+                  }}
+                  onPointerDown={(e) => e.stopPropagation()}
+                >
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => onToggleAlphaLock(activeLayerId)}
+                        className={`p-1 rounded hover:bg-accent ${layers.find((l) => l.id === activeLayerId)?.alphaLock ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                        data-ocid="layers.toggle.button"
+                      >
+                        <Lock size={12} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Alpha Lock</TooltipContent>
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => onToggleClippingMask(activeLayerId)}
+                        className={`p-1 rounded hover:bg-accent ${layers.find((l) => l.id === activeLayerId)?.isClippingMask ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                        data-ocid="layers.clipping_mask_button"
+                      >
+                        <Scissors size={12} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Clipping Mask</TooltipContent>
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={onClearLayer}
+                        className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+                        data-ocid="layers.clear_button"
+                      >
+                        <Eraser size={12} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Clear Layer</TooltipContent>
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={onMergeLayers}
+                        className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+                        data-ocid="layers.merge_button"
+                      >
+                        <Check size={12} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Merge Down</TooltipContent>
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={onCreateGroup}
+                        className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+                        data-ocid="layers.create_group_button"
+                      >
+                        <FolderPlus size={12} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>New Group</TooltipContent>
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={onAddLayer}
+                        className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+                        data-ocid="layers.add_button"
+                      >
+                        <Plus size={12} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Add Layer</TooltipContent>
+                  </Tooltip>
                 </div>
-              )}
+              </TooltipProvider>
+              <button
+                type="button"
+                title={layersDrag.pinned ? "Unpin panel" : "Pin panel"}
+                style={pinButtonStyle(layersDrag.pinned)}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() =>
+                  layersDrag.togglePin(() => onSetActiveMobilePanel(null))
+                }
+              >
+                <MapPin
+                  size={14}
+                  fill={layersDrag.pinned ? "currentColor" : "none"}
+                />
+              </button>
+            </div>
+            {/* Content */}
+            <div
+              style={{
+                overflow: "hidden",
+                flex: 1,
+                display: "flex",
+                flexDirection: "column",
+              }}
+            >
+              <LayersPanel
+                layers={layers}
+                layerTree={layerTree}
+                activeLayerId={activeLayerId}
+                selectedLayerIds={selectedLayerIds}
+                onSetActive={onSetActive}
+                onToggleVisible={onToggleVisible}
+                onSetOpacity={onSetOpacity}
+                onSetOpacityLive={onSetOpacityLive}
+                onSetOpacityCommit={onSetOpacityCommit}
+                onSetBlendMode={onSetBlendMode}
+                onAddLayer={onAddLayer}
+                onDeleteLayer={onDeleteLayer}
+                onReorderLayers={onReorderLayers}
+                onClearLayer={onClearLayer}
+                onToggleClippingMask={onToggleClippingMask}
+                onMergeLayers={onMergeLayers}
+                onRenameLayer={onRenameLayer}
+                onToggleAlphaLock={onToggleAlphaLock}
+                thumbnails={layerThumbnails}
+                onCtrlClickLayer={onCtrlClickLayer}
+                onToggleRulerActive={onToggleRulerActive}
+                onToggleGroupCollapse={onToggleGroupCollapse}
+                onRenameGroup={onRenameGroup}
+                onSetGroupOpacity={onSetGroupOpacity}
+                onSetGroupOpacityLive={onSetGroupOpacityLive}
+                onSetGroupOpacityCommit={onSetGroupOpacityCommit}
+                onToggleGroupVisible={onToggleGroupVisible}
+                onDeleteGroup={onOpenDeleteGroup}
+                onReorderTree={onReorderTree}
+                onReorderTreeSilent={onReorderTreeSilent}
+                onReorderLayersSilent={onReorderLayersSilent}
+                onCommitReorderHistory={onCommitReorderHistory}
+                onToggleLayerSelection={onToggleLayerSelection}
+                onCreateGroup={onCreateGroup}
+                shiftHeld={shiftHeld}
+              />
             </div>
           </div>
         </>
@@ -625,7 +1309,9 @@ export function CanvasArea({
           ref={displayCanvasRef}
           data-ocid="canvas.canvas_target"
           style={{
-            display: "block",
+            position: "absolute",
+            left: 0,
+            top: 0,
             width: "100%",
             height: "100%",
             touchAction: "none",
@@ -803,69 +1489,71 @@ export function CanvasArea({
             </div>
           );
         })()}
-      {/* View HUD */}
-      <div
-        data-ocid="canvas.panel"
-        style={{
-          position: "absolute",
-          bottom: 48,
-          // On mobile: shift right to clear the FOS sliders (width ~30px, offset 6px → ~44px clear)
-          // Right-handed: sliders on left → offset from left; left-handed: sliders on right → stay at left
-          left: isMobile && !leftHanded ? 44 : 12,
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          background: "rgba(0,0,0,0.55)",
-          backdropFilter: "blur(6px)",
-          borderRadius: 6,
-          padding: "4px 8px",
-          fontSize: 11,
-          color: "rgba(255,255,255,0.85)",
-          fontFamily: "monospace",
-          pointerEvents: "auto",
-          userSelect: "none",
-          zIndex: 10,
-        }}
-      >
-        <span title="Canvas dimensions">
-          {canvasWidth}×{canvasHeight}
-        </span>
-        <span style={{ opacity: 0.4 }}>|</span>
-        <span title="Zoom: Ctrl+Space drag or scroll">
-          {Math.round(zoom * 100)}%
-        </span>
-        <span style={{ opacity: 0.4 }}>|</span>
-        <span title="Rotation: R + drag">{Math.round(rotation)}°</span>
-        {isFlipped && (
-          <>
-            <span style={{ opacity: 0.4 }}>|</span>
-            <span style={{ color: "rgba(255,200,100,0.9)" }}>Flipped</span>
-          </>
-        )}
-        {!isDefaultTransform && (
-          <>
-            <span style={{ opacity: 0.4 }}>|</span>
-            <button
-              type="button"
-              data-ocid="canvas.reset_button"
-              onClick={onResetView}
-              title="Reset view (press 0)"
-              style={{
-                background: "rgba(255,255,255,0.15)",
-                border: "none",
-                borderRadius: 4,
-                color: "rgba(255,255,255,0.9)",
-                cursor: "pointer",
-                fontSize: 11,
-                padding: "1px 6px",
-                fontFamily: "monospace",
-              }}
-            >
-              ⌂ Reset
-            </button>
-          </>
-        )}
-      </div>
+      {/* View HUD — hidden on mobile, always visible on desktop */}
+      {!isMobile && (
+        <div
+          data-ocid="canvas.panel"
+          style={{
+            position: "absolute",
+            bottom: 48,
+            // On mobile: shift right to clear the FOS sliders (width ~30px, offset 6px → ~44px clear)
+            // Right-handed: sliders on left → offset from left; left-handed: sliders on right → stay at left
+            left: isMobile && !leftHanded ? 44 : 12,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            background: "rgba(0,0,0,0.55)",
+            backdropFilter: "blur(6px)",
+            borderRadius: 6,
+            padding: "4px 8px",
+            fontSize: 11,
+            color: "rgba(255,255,255,0.85)",
+            fontFamily: "monospace",
+            pointerEvents: "auto",
+            userSelect: "none",
+            zIndex: 10,
+          }}
+        >
+          <span title="Canvas dimensions">
+            {canvasWidth}×{canvasHeight}
+          </span>
+          <span style={{ opacity: 0.4 }}>|</span>
+          <span title="Zoom: Ctrl+Space drag or scroll">
+            {Math.round(zoom * 100)}%
+          </span>
+          <span style={{ opacity: 0.4 }}>|</span>
+          <span title="Rotation: R + drag">{Math.round(rotation)}°</span>
+          {isFlipped && (
+            <>
+              <span style={{ opacity: 0.4 }}>|</span>
+              <span style={{ color: "rgba(255,200,100,0.9)" }}>Flipped</span>
+            </>
+          )}
+          {!isDefaultTransform && (
+            <>
+              <span style={{ opacity: 0.4 }}>|</span>
+              <button
+                type="button"
+                data-ocid="canvas.reset_button"
+                onClick={onResetView}
+                title="Reset view (press 0)"
+                style={{
+                  background: "rgba(255,255,255,0.15)",
+                  border: "none",
+                  borderRadius: 4,
+                  color: "rgba(255,255,255,0.9)",
+                  cursor: "pointer",
+                  fontSize: 11,
+                  padding: "1px 6px",
+                  fontFamily: "monospace",
+                }}
+              >
+                ⌂ Reset
+              </button>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

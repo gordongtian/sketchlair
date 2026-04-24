@@ -89,13 +89,6 @@ export class ExternalBlob {
         return this;
     }
 }
-export interface AppSettings {
-    uiScale: number;
-    theme: string;
-    canvasBackground: string;
-    modifiedAt: bigint;
-    otherSettings: string;
-}
 export interface UserPreferences {
     brushes: Array<BrushPreset>;
     hotkeys: HotkeyAssignments;
@@ -103,19 +96,44 @@ export interface UserPreferences {
     settings: AppSettings;
     schemaVersion: bigint;
 }
-export type SettingsSave = string;
 export interface _ImmutableObjectStorageRefillInformation {
     proposed_top_up_amount?: bigint;
 }
-export interface HotkeyAssignments {
-    assignments: string;
-    modifiedAt: bigint;
+export interface PublicImageSet {
+    id: string;
+    name: string;
+    imageCount: bigint;
+    isFree: boolean;
+    previewThumbnail: string;
+    isDefault: boolean;
 }
 export interface _ImmutableObjectStorageCreateCertificateResult {
     method: string;
     blob_hash: string;
 }
+export interface ImageReference {
+    id: string;
+    height: bigint;
+    assetUrl: string;
+    width: bigint;
+}
+export interface HotkeyAssignments {
+    assignments: string;
+    modifiedAt: bigint;
+}
 export type CanvasSave = string;
+export interface AppSettings {
+    uiScale: number;
+    theme: string;
+    canvasBackground: string;
+    modifiedAt: bigint;
+    otherSettings: string;
+}
+export interface _ImmutableObjectStorageRefillResult {
+    success?: boolean;
+    topped_up_amount?: bigint;
+}
+export type SettingsSave = string;
 export interface BrushPreset {
     id: string;
     modifiedAt: bigint;
@@ -127,9 +145,16 @@ export interface BrushPreset {
 export interface UserProfile {
     name: string;
 }
-export interface _ImmutableObjectStorageRefillResult {
-    success?: boolean;
-    topped_up_amount?: bigint;
+export interface ImageSet {
+    id: string;
+    name: string;
+    tags: Array<string>;
+    imageCount: bigint;
+    isFree: boolean;
+    previewThumbnail: string;
+    isDefault: boolean;
+    priceICP?: string;
+    images: Array<ImageReference>;
 }
 export enum UserRole {
     admin = "admin",
@@ -144,43 +169,155 @@ export interface backendInterface {
     _immutableObjectStorageRefillCashier(refillInformation: _ImmutableObjectStorageRefillInformation | null): Promise<_ImmutableObjectStorageRefillResult>;
     _immutableObjectStorageUpdateGatewayPrincipals(): Promise<void>;
     _initializeAccessControl(): Promise<void>;
+    /**
+     * / Adds a new admin. Only an existing admin may call this.
+     * / Returns false if the caller is not an admin.
+     */
+    addAdmin(newAdmin: Principal): Promise<boolean>;
+    /**
+     * / Admin only — add an image reference to a set.
+     * / Returns false if caller is not admin or setId doesn't exist.
+     */
+    addImageToSet(setId: string, image: ImageReference): Promise<boolean>;
     assignCallerUserRole(user: Principal, role: UserRole): Promise<void>;
     /**
-     * / Removes a single brush by id. No-op if the caller has no record or the
-     * / brush id is not found.
+     * / Returns true if the username is not yet taken — free query call.
      */
+    checkUsernameAvailable(username: string): Promise<boolean>;
+    /**
+     * / Admin only — create a new image set.
+     * / Returns the new set's ID on success, null if caller is not admin or
+     * / name is invalid (must be 3–50 characters).
+     * / If isFree is true, priceICP is ignored and stored as null.
+     * / If isDefault is true, all other sets are unset as default.
+     */
+    createImageSet(name: string, isFree: boolean, isDefault: boolean, priceICP: string | null): Promise<string | null>;
     deleteBrush(id: string): Promise<void>;
+    /**
+     * / Admin only — delete an entire image set.
+     * / Cannot delete default sets (isDefault == true).
+     * / Returns false if caller is not admin, setId doesn't exist, or set is a default.
+     */
+    deleteImageSet(setId: string): Promise<boolean>;
+    /**
+     * / Admin only — get all image sets including paid ones, for admin management UI.
+     * / Returns an empty array if caller is not admin.
+     * / Uses an update call (not query) so it can run ensureStarterSetsCleared()
+     * / to strip any legacy dummy placeholder images on first access after a deploy.
+     */
+    getAllImageSetsAdmin(): Promise<Array<ImageSet>>;
+    /**
+     * / Public query — returns ALL image sets as catalog entries (no images array).
+     * / Used by the marketplace to build the full grid so users can see and purchase
+     * / packs they do not yet own. Diff against getAvailableImageSets() for owned state.
+     */
+    getAllPublicImageSets(): Promise<Array<PublicImageSet>>;
+    /**
+     * / Public query — returns all free sets plus sets the caller has purchased entitlements for.
+     */
+    getAvailableImageSets(): Promise<Array<ImageSet>>;
     getBrushPresets(): Promise<string | null>;
     getCallerUserProfile(): Promise<UserProfile | null>;
     getCallerUserRole(): Promise<UserRole>;
     getCanvasHash(): Promise<CanvasSave | null>;
     /**
-     * / Returns all stored preferences for the caller, or null if none saved yet.
+     * / Returns the username for the caller's principal, or null if none registered.
      */
+    getMyUsername(): Promise<string | null>;
     getPreferences(): Promise<UserPreferences | null>;
-    /**
-     * / Returns the schema version stored for the caller, or 0 if no record exists.
-     */
     getSchemaVersion(): Promise<bigint>;
+    /**
+     * / Returns the set IDs the caller has been explicitly granted.
+     */
+    getUserEntitlements(): Promise<Array<string>>;
+    /**
+     * / Returns all default image sets plus any sets the caller has been granted.
+     */
+    getUserImageSets(): Promise<Array<ImageSet>>;
     getUserProfile(user: Principal): Promise<UserProfile | null>;
     getUserSettings(): Promise<SettingsSave | null>;
+    /**
+     * / Returns the username for any given principal — for display purposes.
+     */
+    getUsernameForPrincipal(p: Principal): Promise<string | null>;
+    /**
+     * / Admin: grant a set to a principal. Returns false if the set does not exist.
+     */
+    grantEntitlement(principal: Principal, setId: string): Promise<boolean>;
+    /**
+     * / Called by the payments canister to grant a pack entitlement to a user.
+     * / Only the stored payments canister principal is allowed to call this.
+     * / Idempotent — adding an entitlement the user already has is a no-op.
+     * / Returns false if the caller is not the trusted payments canister,
+     * / if no payments canister principal has been configured, or if the
+     * / pack does not exist in the image set registry.
+     */
+    grantPackEntitlement(userPrincipal: Principal, packId: string): Promise<boolean>;
+    /**
+     * / Returns true if the given principal is in the admin set.
+     * / Safe as a query because isAdminPrincipal() never mutates state.
+     */
+    isAdmin(p: Principal): Promise<boolean>;
     isCallerAdmin(): Promise<boolean>;
     /**
-     * / Upserts a single brush by id. Creates a default preferences record first
-     * / if the caller has no existing record.
+     * / Registers a username for the caller's principal.
+     * / Returns true on success, false if the caller already has a username
+     * / or if the username is already taken (race condition guard).
      */
+    registerUsername(username: string): Promise<boolean>;
+    /**
+     * / Removes an admin. Only an existing admin may call this.
+     * / Returns false if the caller is not an admin or if the caller tries
+     * / to remove themselves.
+     */
+    removeAdmin(target: Principal): Promise<boolean>;
+    /**
+     * / Admin only — remove an image reference from a set.
+     * / Returns false if caller is not admin, setId doesn't exist, or imageId not found.
+     */
+    removeImageFromSet(setId: string, imageId: string): Promise<boolean>;
+    /**
+     * / Admin only — rename an image set.
+     * / newName must not be empty. Returns false if caller is not admin,
+     * / setId doesn't exist, or newName is empty.
+     */
+    renameSet(setId: string, newName: string): Promise<boolean>;
+    /**
+     * / Admin: revoke a set from a principal. Returns false if the set does not exist.
+     */
+    revokeEntitlement(principal: Principal, setId: string): Promise<boolean>;
     saveBrush(brush: BrushPreset): Promise<void>;
     saveBrushPresets(data: string): Promise<void>;
     saveCallerUserProfile(profile: UserProfile): Promise<void>;
     saveCanvasHash(canvasHash: CanvasSave): Promise<void>;
-    /**
-     * / Atomically replaces all preferences for the caller.
-     * / Always overwrites lastModified with the current canister time.
-     */
     savePreferences(prefs: UserPreferences): Promise<void>;
     saveUserSettings(settings: SettingsSave): Promise<void>;
+    /**
+     * / Admin only — mark a set as the sole default set.
+     * / Unsets isDefault on all other sets. Returns false if caller is not admin
+     * / or the setId does not exist.
+     */
+    setImageSetDefault(setId: string): Promise<boolean>;
+    /**
+     * / Admin only — set or clear the price of a set.
+     * / Pass null to clear the price (make free). Returns false if caller is not admin
+     * / or the setId does not exist.
+     */
+    setImageSetPrice(setId: string, priceICP: string | null): Promise<boolean>;
+    /**
+     * / Admin only — store the trusted payments canister principal.
+     * / grantPackEntitlement will only accept calls from this principal.
+     * / Returns false if the caller is not an admin.
+     */
+    setPaymentsCanisterPrincipal(p: Principal): Promise<boolean>;
+    /**
+     * / Admin only — update the tags for an image set.
+     * / All tags are normalized to lowercase before storing.
+     * / Returns false if caller is not admin or setId doesn't exist.
+     */
+    updateSetTags(setId: string, tags: Array<string>): Promise<boolean>;
 }
-import type { CanvasSave as _CanvasSave, SettingsSave as _SettingsSave, UserPreferences as _UserPreferences, UserProfile as _UserProfile, UserRole as _UserRole, _ImmutableObjectStorageRefillInformation as __ImmutableObjectStorageRefillInformation, _ImmutableObjectStorageRefillResult as __ImmutableObjectStorageRefillResult } from "./declarations/backend.did.d.ts";
+import type { CanvasSave as _CanvasSave, ImageReference as _ImageReference, ImageSet as _ImageSet, SettingsSave as _SettingsSave, UserPreferences as _UserPreferences, UserProfile as _UserProfile, UserRole as _UserRole, _ImmutableObjectStorageRefillInformation as __ImmutableObjectStorageRefillInformation, _ImmutableObjectStorageRefillResult as __ImmutableObjectStorageRefillResult } from "./declarations/backend.did.d.ts";
 export class Backend implements backendInterface {
     constructor(private actor: ActorSubclass<_SERVICE>, private _uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, private _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, private processError?: (error: unknown) => never){}
     async _immutableObjectStorageBlobsAreLive(arg0: Array<Uint8Array>): Promise<Array<boolean>> {
@@ -281,6 +418,34 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async addAdmin(arg0: Principal): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.addAdmin(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.addAdmin(arg0);
+            return result;
+        }
+    }
+    async addImageToSet(arg0: string, arg1: ImageReference): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.addImageToSet(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.addImageToSet(arg0, arg1);
+            return result;
+        }
+    }
     async assignCallerUserRole(arg0: Principal, arg1: UserRole): Promise<void> {
         if (this.processError) {
             try {
@@ -293,6 +458,34 @@ export class Backend implements backendInterface {
         } else {
             const result = await this.actor.assignCallerUserRole(arg0, to_candid_UserRole_n8(this._uploadFile, this._downloadFile, arg1));
             return result;
+        }
+    }
+    async checkUsernameAvailable(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.checkUsernameAvailable(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.checkUsernameAvailable(arg0);
+            return result;
+        }
+    }
+    async createImageSet(arg0: string, arg1: boolean, arg2: boolean, arg3: string | null): Promise<string | null> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.createImageSet(arg0, arg1, arg2, to_candid_opt_n10(this._uploadFile, this._downloadFile, arg3));
+                return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.createImageSet(arg0, arg1, arg2, to_candid_opt_n10(this._uploadFile, this._downloadFile, arg3));
+            return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
         }
     }
     async deleteBrush(arg0: string): Promise<void> {
@@ -309,74 +502,144 @@ export class Backend implements backendInterface {
             return result;
         }
     }
-    async getBrushPresets(): Promise<string | null> {
+    async deleteImageSet(arg0: string): Promise<boolean> {
         if (this.processError) {
             try {
-                const result = await this.actor.getBrushPresets();
-                return from_candid_opt_n10(this._uploadFile, this._downloadFile, result);
+                const result = await this.actor.deleteImageSet(arg0);
+                return result;
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
-            const result = await this.actor.getBrushPresets();
-            return from_candid_opt_n10(this._uploadFile, this._downloadFile, result);
+            const result = await this.actor.deleteImageSet(arg0);
+            return result;
         }
     }
-    async getCallerUserProfile(): Promise<UserProfile | null> {
+    async getAllImageSetsAdmin(): Promise<Array<ImageSet>> {
         if (this.processError) {
             try {
-                const result = await this.actor.getCallerUserProfile();
+                const result = await this.actor.getAllImageSetsAdmin();
+                return from_candid_vec_n12(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getAllImageSetsAdmin();
+            return from_candid_vec_n12(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getAllPublicImageSets(): Promise<Array<PublicImageSet>> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getAllPublicImageSets();
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getAllPublicImageSets();
+            return result;
+        }
+    }
+    async getAvailableImageSets(): Promise<Array<ImageSet>> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getAvailableImageSets();
+                return from_candid_vec_n12(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getAvailableImageSets();
+            return from_candid_vec_n12(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getBrushPresets(): Promise<string | null> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getBrushPresets();
                 return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
-            const result = await this.actor.getCallerUserProfile();
+            const result = await this.actor.getBrushPresets();
             return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
         }
     }
-    async getCallerUserRole(): Promise<UserRole> {
+    async getCallerUserProfile(): Promise<UserProfile | null> {
         if (this.processError) {
             try {
-                const result = await this.actor.getCallerUserRole();
-                return from_candid_UserRole_n12(this._uploadFile, this._downloadFile, result);
-            } catch (e) {
-                this.processError(e);
-                throw new Error("unreachable");
-            }
-        } else {
-            const result = await this.actor.getCallerUserRole();
-            return from_candid_UserRole_n12(this._uploadFile, this._downloadFile, result);
-        }
-    }
-    async getCanvasHash(): Promise<CanvasSave | null> {
-        if (this.processError) {
-            try {
-                const result = await this.actor.getCanvasHash();
-                return from_candid_opt_n14(this._uploadFile, this._downloadFile, result);
-            } catch (e) {
-                this.processError(e);
-                throw new Error("unreachable");
-            }
-        } else {
-            const result = await this.actor.getCanvasHash();
-            return from_candid_opt_n14(this._uploadFile, this._downloadFile, result);
-        }
-    }
-    async getPreferences(): Promise<UserPreferences | null> {
-        if (this.processError) {
-            try {
-                const result = await this.actor.getPreferences();
+                const result = await this.actor.getCallerUserProfile();
                 return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
-            const result = await this.actor.getPreferences();
+            const result = await this.actor.getCallerUserProfile();
             return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getCallerUserRole(): Promise<UserRole> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getCallerUserRole();
+                return from_candid_UserRole_n16(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getCallerUserRole();
+            return from_candid_UserRole_n16(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getCanvasHash(): Promise<CanvasSave | null> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getCanvasHash();
+                return from_candid_opt_n18(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getCanvasHash();
+            return from_candid_opt_n18(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getMyUsername(): Promise<string | null> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getMyUsername();
+                return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getMyUsername();
+            return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getPreferences(): Promise<UserPreferences | null> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getPreferences();
+                return from_candid_opt_n19(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getPreferences();
+            return from_candid_opt_n19(this._uploadFile, this._downloadFile, result);
         }
     }
     async getSchemaVersion(): Promise<bigint> {
@@ -393,32 +656,116 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async getUserEntitlements(): Promise<Array<string>> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getUserEntitlements();
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getUserEntitlements();
+            return result;
+        }
+    }
+    async getUserImageSets(): Promise<Array<ImageSet>> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getUserImageSets();
+                return from_candid_vec_n12(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getUserImageSets();
+            return from_candid_vec_n12(this._uploadFile, this._downloadFile, result);
+        }
+    }
     async getUserProfile(arg0: Principal): Promise<UserProfile | null> {
         if (this.processError) {
             try {
                 const result = await this.actor.getUserProfile(arg0);
-                return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
+                return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.getUserProfile(arg0);
-            return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
+            return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
         }
     }
     async getUserSettings(): Promise<SettingsSave | null> {
         if (this.processError) {
             try {
                 const result = await this.actor.getUserSettings();
-                return from_candid_opt_n16(this._uploadFile, this._downloadFile, result);
+                return from_candid_opt_n20(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.getUserSettings();
-            return from_candid_opt_n16(this._uploadFile, this._downloadFile, result);
+            return from_candid_opt_n20(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getUsernameForPrincipal(arg0: Principal): Promise<string | null> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getUsernameForPrincipal(arg0);
+                return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getUsernameForPrincipal(arg0);
+            return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async grantEntitlement(arg0: Principal, arg1: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.grantEntitlement(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.grantEntitlement(arg0, arg1);
+            return result;
+        }
+    }
+    async grantPackEntitlement(arg0: Principal, arg1: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.grantPackEntitlement(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.grantPackEntitlement(arg0, arg1);
+            return result;
+        }
+    }
+    async isAdmin(arg0: Principal): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.isAdmin(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.isAdmin(arg0);
+            return result;
         }
     }
     async isCallerAdmin(): Promise<boolean> {
@@ -432,6 +779,76 @@ export class Backend implements backendInterface {
             }
         } else {
             const result = await this.actor.isCallerAdmin();
+            return result;
+        }
+    }
+    async registerUsername(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.registerUsername(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.registerUsername(arg0);
+            return result;
+        }
+    }
+    async removeAdmin(arg0: Principal): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.removeAdmin(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.removeAdmin(arg0);
+            return result;
+        }
+    }
+    async removeImageFromSet(arg0: string, arg1: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.removeImageFromSet(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.removeImageFromSet(arg0, arg1);
+            return result;
+        }
+    }
+    async renameSet(arg0: string, arg1: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.renameSet(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.renameSet(arg0, arg1);
+            return result;
+        }
+    }
+    async revokeEntitlement(arg0: Principal, arg1: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.revokeEntitlement(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.revokeEntitlement(arg0, arg1);
             return result;
         }
     }
@@ -519,26 +936,85 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async setImageSetDefault(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setImageSetDefault(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setImageSetDefault(arg0);
+            return result;
+        }
+    }
+    async setImageSetPrice(arg0: string, arg1: string | null): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setImageSetPrice(arg0, to_candid_opt_n10(this._uploadFile, this._downloadFile, arg1));
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setImageSetPrice(arg0, to_candid_opt_n10(this._uploadFile, this._downloadFile, arg1));
+            return result;
+        }
+    }
+    async setPaymentsCanisterPrincipal(arg0: Principal): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setPaymentsCanisterPrincipal(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setPaymentsCanisterPrincipal(arg0);
+            return result;
+        }
+    }
+    async updateSetTags(arg0: string, arg1: Array<string>): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.updateSetTags(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.updateSetTags(arg0, arg1);
+            return result;
+        }
+    }
 }
-function from_candid_UserRole_n12(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _UserRole): UserRole {
-    return from_candid_variant_n13(_uploadFile, _downloadFile, value);
+function from_candid_ImageSet_n13(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _ImageSet): ImageSet {
+    return from_candid_record_n14(_uploadFile, _downloadFile, value);
+}
+function from_candid_UserRole_n16(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _UserRole): UserRole {
+    return from_candid_variant_n17(_uploadFile, _downloadFile, value);
 }
 function from_candid__ImmutableObjectStorageRefillResult_n4(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: __ImmutableObjectStorageRefillResult): _ImmutableObjectStorageRefillResult {
     return from_candid_record_n5(_uploadFile, _downloadFile, value);
 }
-function from_candid_opt_n10(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [string]): string | null {
+function from_candid_opt_n11(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [string]): string | null {
     return value.length === 0 ? null : value[0];
 }
-function from_candid_opt_n11(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_UserProfile]): UserProfile | null {
+function from_candid_opt_n15(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_UserProfile]): UserProfile | null {
     return value.length === 0 ? null : value[0];
 }
-function from_candid_opt_n14(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_CanvasSave]): CanvasSave | null {
+function from_candid_opt_n18(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_CanvasSave]): CanvasSave | null {
     return value.length === 0 ? null : value[0];
 }
-function from_candid_opt_n15(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_UserPreferences]): UserPreferences | null {
+function from_candid_opt_n19(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_UserPreferences]): UserPreferences | null {
     return value.length === 0 ? null : value[0];
 }
-function from_candid_opt_n16(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_SettingsSave]): SettingsSave | null {
+function from_candid_opt_n20(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_SettingsSave]): SettingsSave | null {
     return value.length === 0 ? null : value[0];
 }
 function from_candid_opt_n6(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [boolean]): boolean | null {
@@ -546,6 +1022,39 @@ function from_candid_opt_n6(_uploadFile: (file: ExternalBlob) => Promise<Uint8Ar
 }
 function from_candid_opt_n7(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [bigint]): bigint | null {
     return value.length === 0 ? null : value[0];
+}
+function from_candid_record_n14(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+    id: string;
+    name: string;
+    tags: Array<string>;
+    imageCount: bigint;
+    isFree: boolean;
+    previewThumbnail: string;
+    isDefault: boolean;
+    priceICP: [] | [string];
+    images: Array<_ImageReference>;
+}): {
+    id: string;
+    name: string;
+    tags: Array<string>;
+    imageCount: bigint;
+    isFree: boolean;
+    previewThumbnail: string;
+    isDefault: boolean;
+    priceICP?: string;
+    images: Array<ImageReference>;
+} {
+    return {
+        id: value.id,
+        name: value.name,
+        tags: value.tags,
+        imageCount: value.imageCount,
+        isFree: value.isFree,
+        previewThumbnail: value.previewThumbnail,
+        isDefault: value.isDefault,
+        priceICP: record_opt_to_undefined(from_candid_opt_n11(_uploadFile, _downloadFile, value.priceICP)),
+        images: value.images
+    };
 }
 function from_candid_record_n5(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
     success: [] | [boolean];
@@ -559,7 +1068,7 @@ function from_candid_record_n5(_uploadFile: (file: ExternalBlob) => Promise<Uint
         topped_up_amount: record_opt_to_undefined(from_candid_opt_n7(_uploadFile, _downloadFile, value.topped_up_amount))
     };
 }
-function from_candid_variant_n13(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+function from_candid_variant_n17(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
     admin: null;
 } | {
     user: null;
@@ -567,6 +1076,9 @@ function from_candid_variant_n13(_uploadFile: (file: ExternalBlob) => Promise<Ui
     guest: null;
 }): UserRole {
     return "admin" in value ? UserRole.admin : "user" in value ? UserRole.user : "guest" in value ? UserRole.guest : value;
+}
+function from_candid_vec_n12(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: Array<_ImageSet>): Array<ImageSet> {
+    return value.map((x)=>from_candid_ImageSet_n13(_uploadFile, _downloadFile, x));
 }
 function to_candid_UserRole_n8(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: UserRole): _UserRole {
     return to_candid_variant_n9(_uploadFile, _downloadFile, value);
@@ -576,6 +1088,9 @@ function to_candid__ImmutableObjectStorageRefillInformation_n2(_uploadFile: (fil
 }
 function to_candid_opt_n1(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _ImmutableObjectStorageRefillInformation | null): [] | [__ImmutableObjectStorageRefillInformation] {
     return value === null ? candid_none() : candid_some(to_candid__ImmutableObjectStorageRefillInformation_n2(_uploadFile, _downloadFile, value));
+}
+function to_candid_opt_n10(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: string | null): [] | [string] {
+    return value === null ? candid_none() : candid_some(value);
 }
 function to_candid_record_n3(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
     proposed_top_up_amount?: bigint;

@@ -5,7 +5,7 @@ import {
   ExternalBlob,
 } from "./backend";
 import { StorageClient } from "./utils/StorageClient";
-import { HttpAgent } from "@icp-sdk/core/agent";
+import { HttpAgent, type Identity } from "@icp-sdk/core/agent";
 
 const DEFAULT_STORAGE_GATEWAY_URL = "https://blob.caffeine.ai";
 const DEFAULT_BUCKET_NAME = "default-bucket";
@@ -14,6 +14,7 @@ const DEFAULT_PROJECT_ID = "0000000-0000-0000-0000-00000000000";
 interface JsonConfig {
   backend_host: string;
   backend_canister_id: string;
+  payments_canister_id: string;
   project_id: string;
   ii_derivation_origin: string;
 }
@@ -21,6 +22,7 @@ interface JsonConfig {
 interface Config {
   backend_host?: string;
   backend_canister_id: string;
+  payments_canister_id: string;
   storage_gateway_url: string;
   bucket_name: string;
   project_id: string;
@@ -44,12 +46,20 @@ export async function loadConfig(): Promise<Config> {
       throw new Error("CANISTER_ID_BACKEND is not set");
     }
 
+    const paymentsCanisterId = process.env.CANISTER_ID_PAYMENTS;
+    const resolvedPaymentsCanisterId = (
+      config.payments_canister_id !== "undefined"
+        ? config.payments_canister_id
+        : (paymentsCanisterId ?? "")
+    ) as string;
+
     const fullConfig = {
       backend_host:
         config.backend_host === "undefined" ? undefined : config.backend_host,
       backend_canister_id: (config.backend_canister_id === "undefined"
         ? backendCanisterId
         : config.backend_canister_id) as string,
+      payments_canister_id: resolvedPaymentsCanisterId,
       storage_gateway_url: process.env.STORAGE_GATEWAY_URL ?? "nogateway",
       bucket_name: DEFAULT_BUCKET_NAME,
       project_id:
@@ -71,6 +81,7 @@ export async function loadConfig(): Promise<Config> {
     const fallbackConfig = {
       backend_host: undefined,
       backend_canister_id: backendCanisterId,
+      payments_canister_id: process.env.CANISTER_ID_PAYMENTS ?? "",
       storage_gateway_url: DEFAULT_STORAGE_GATEWAY_URL,
       bucket_name: DEFAULT_BUCKET_NAME,
       project_id: DEFAULT_PROJECT_ID,
@@ -117,7 +128,7 @@ async function maybeLoadMockBackend(): Promise<backendInterface | null> {
 }
 
 export async function createActorWithConfig(
-  options?: CreateActorOptions,
+  options?: CreateActorOptions & { identity?: Identity },
 ): Promise<backendInterface> {
   // Attempt to load mock backend if enabled
   const mock = await maybeLoadMockBackend();
@@ -128,7 +139,7 @@ export async function createActorWithConfig(
   const config = await loadConfig();
   const resolvedOptions = options ?? {};
   const agent = new HttpAgent({
-    ...resolvedOptions.agentOptions,
+    identity: resolvedOptions.identity,
     host: config.backend_host,
   });
   if (config.backend_host?.includes("localhost")) {
@@ -139,11 +150,16 @@ export async function createActorWithConfig(
       console.error(err);
     });
   }
+  // Pass ONLY the agent — do NOT spread resolvedOptions (which may contain agentOptions)
+  // because passing both `agent` and `agentOptions` to createActor simultaneously
+  // triggers "Detected both agent and agentOptions" and the identity in agentOptions
+  // is silently dropped. The identity is already baked into the HttpAgent above.
   const actorOptions = {
-    ...resolvedOptions,
-    agent: agent,
+    agent,
     processError,
   };
+
+  agent.getPrincipal().then(p => console.log('[ActorIdentity] constructed actor principal:', p.toString())).catch(() => {});
 
   const storageClient = new StorageClient(
     config.bucket_name,

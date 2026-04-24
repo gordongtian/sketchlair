@@ -139,6 +139,13 @@ export const DEFAULT_HOTKEYS: Record<string, HotkeyAction> = {
     primary: { key: "w" },
     secondary: null,
   },
+  line: {
+    id: "line",
+    label: "Line",
+    category: "Tools",
+    primary: { key: "n", shift: false, ctrl: false, alt: false, meta: false },
+    secondary: null,
+  },
   fill: {
     id: "fill",
     label: "Fill",

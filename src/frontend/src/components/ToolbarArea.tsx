@@ -24,6 +24,7 @@ export interface ToolbarAreaProps {
   leftHanded: boolean;
   fileLoadInputRef: RefObject<HTMLInputElement | null>;
   onFileLoad: (file: File) => void;
+  onNavigateToSplash?: () => void;
 }
 
 export function ToolbarArea({
@@ -48,6 +49,7 @@ export function ToolbarArea({
   leftHanded,
   fileLoadInputRef,
   onFileLoad,
+  onNavigateToSplash,
 }: ToolbarAreaProps) {
   return (
     <>
@@ -80,6 +82,7 @@ export function ToolbarArea({
           onOpenFile={onOpenFile}
           hasUnsavedChanges={hasUnsavedChanges}
           isMobile={isMobile}
+          onNavigateToSplash={onNavigateToSplash}
         />
       </div>{" "}
       {/* end toolbar wrapper */}

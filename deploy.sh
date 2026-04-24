@@ -16,11 +16,13 @@ trap 'cleanup 1' INT TERM
 icp network start -d
 icp canister create --environment local frontend
 icp canister create --environment local backend
+icp canister create --environment local payments
 export BACKEND_CANISTER_ID=$(icp canister settings show --environment local --id-only backend)
+export CANISTER_ID_PAYMENTS=$(icp canister settings show --environment local --id-only payments)
 export STORAGE_GATEWAY_URL=http://localhost:6188
 export II_URL=http://rdmx6-jaaaa-aaaaa-aaadq-cai.localhost:8000
 
-icp deploy --environment local frontend backend
+icp deploy --environment local frontend backend payments
 
 
 echo "Press Ctrl+C to stop the deployment and exit."

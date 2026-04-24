@@ -107,6 +107,37 @@ export interface SettingsPanelProps {
   preferences?: PreferencesManager;
 }
 
+function PrincipalDisplay({ principalId }: { principalId?: string | null }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    if (!principalId) return;
+    navigator.clipboard.writeText(principalId).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+
+  return (
+    <button
+      type="button"
+      data-ocid="settings.principal_id"
+      className="flex-1 min-w-0 px-2 py-1.5 rounded text-xs font-mono border border-border truncate cursor-pointer select-none transition-colors hover:border-primary/50 text-left"
+      style={{ backgroundColor: "oklch(var(--sidebar-left))" }}
+      onClick={handleCopy}
+      title={principalId ?? ""}
+    >
+      {copied ? (
+        <span className="text-green-500">Copied!</span>
+      ) : (
+        <span className="text-muted-foreground">
+          {principalId ? `${principalId.substring(0, 10)}...` : "Logged in"}
+        </span>
+      )}
+    </button>
+  );
+}
+
 export function SettingsPanel({
   open,
   onClose,
@@ -219,14 +250,13 @@ export function SettingsPanel({
       });
   }, [open, onClose]);
 
-  // Apply saved theme on mount
+  // Sync themeId state to match what is currently applied (set by index.html early script or App.tsx).
+  // Do NOT re-apply here — App.tsx preferences effect and the index.html script are the canonical sources.
   useEffect(() => {
     const stored = localStorage.getItem(THEME_KEY);
     const id: ThemeId = (
       stored && THEMES.some((t) => t.id === stored) ? stored : "light"
     ) as ThemeId;
-    applyThemeClass(id);
-    applyThemeOverrides(id);
     setThemeId(id);
   }, []);
 
@@ -363,14 +393,8 @@ export function SettingsPanel({
             </div>
             {isLoggedIn ? (
               <div className="flex items-center gap-2">
-                <div
-                  className="flex-1 min-w-0 px-2 py-1.5 rounded text-xs font-mono text-muted-foreground border border-border truncate"
-                  style={{ backgroundColor: "oklch(var(--sidebar-left))" }}
-                >
-                  {principalId
-                    ? `${principalId.substring(0, 10)}...`
-                    : "Logged in"}
-                </div>
+                <PrincipalDisplay principalId={principalId} />
+
                 <button
                   type="button"
                   data-ocid="settings.close_button"

@@ -1,0 +1,8 @@
+{
+  "name": "@caffeine/payments",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "bindgen": "caffeine-bindgen --did-file ./dist/payments.did --out-dir ../frontend/src --actor-interface-file --force"
+  }
+}

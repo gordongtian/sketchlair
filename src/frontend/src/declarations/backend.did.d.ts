@@ -30,6 +30,31 @@ export interface HotkeyAssignments {
   'assignments' : string,
   'modifiedAt' : bigint,
 }
+export interface ImageReference {
+  'id' : string,
+  'height' : bigint,
+  'assetUrl' : string,
+  'width' : bigint,
+}
+export interface ImageSet {
+  'id' : string,
+  'name' : string,
+  'tags' : Array<string>,
+  'imageCount' : bigint,
+  'isFree' : boolean,
+  'previewThumbnail' : string,
+  'isDefault' : boolean,
+  'priceICP' : [] | [string],
+  'images' : Array<ImageReference>,
+}
+export interface PublicImageSet {
+  'id' : string,
+  'name' : string,
+  'imageCount' : bigint,
+  'isFree' : boolean,
+  'previewThumbnail' : string,
+  'isDefault' : boolean,
+}
 export type SettingsSave = string;
 export interface UserPreferences {
   'brushes' : Array<BrushPreset>,
@@ -73,41 +98,156 @@ export interface _SERVICE {
   >,
   '_immutableObjectStorageUpdateGatewayPrincipals' : ActorMethod<[], undefined>,
   '_initializeAccessControl' : ActorMethod<[], undefined>,
+  /**
+   * / Adds a new admin. Only an existing admin may call this.
+   * / Returns false if the caller is not an admin.
+   */
+  'addAdmin' : ActorMethod<[Principal], boolean>,
+  /**
+   * / Admin only — add an image reference to a set.
+   * / Returns false if caller is not admin or setId doesn't exist.
+   */
+  'addImageToSet' : ActorMethod<[string, ImageReference], boolean>,
   'assignCallerUserRole' : ActorMethod<[Principal, UserRole], undefined>,
   /**
-   * / Removes a single brush by id. No-op if the caller has no record or the
-   * / brush id is not found.
+   * / Returns true if the username is not yet taken — free query call.
    */
+  'checkUsernameAvailable' : ActorMethod<[string], boolean>,
+  /**
+   * / Admin only — create a new image set.
+   * / Returns the new set's ID on success, null if caller is not admin or
+   * / name is invalid (must be 3–50 characters).
+   * / If isFree is true, priceICP is ignored and stored as null.
+   * / If isDefault is true, all other sets are unset as default.
+   */
+  'createImageSet' : ActorMethod<
+    [string, boolean, boolean, [] | [string]],
+    [] | [string]
+  >,
   'deleteBrush' : ActorMethod<[string], undefined>,
+  /**
+   * / Admin only — delete an entire image set.
+   * / Cannot delete default sets (isDefault == true).
+   * / Returns false if caller is not admin, setId doesn't exist, or set is a default.
+   */
+  'deleteImageSet' : ActorMethod<[string], boolean>,
+  /**
+   * / Admin only — get all image sets including paid ones, for admin management UI.
+   * / Returns an empty array if caller is not admin.
+   * / Uses an update call (not query) so it can run ensureStarterSetsCleared()
+   * / to strip any legacy dummy placeholder images on first access after a deploy.
+   */
+  'getAllImageSetsAdmin' : ActorMethod<[], Array<ImageSet>>,
+  /**
+   * / Public query — returns ALL image sets as catalog entries (no images array).
+   * / Used by the marketplace to build the full grid so users can see and purchase
+   * / packs they do not yet own. Diff against getAvailableImageSets() for owned state.
+   */
+  'getAllPublicImageSets' : ActorMethod<[], Array<PublicImageSet>>,
+  /**
+   * / Public query — returns all free sets plus sets the caller has purchased entitlements for.
+   */
+  'getAvailableImageSets' : ActorMethod<[], Array<ImageSet>>,
   'getBrushPresets' : ActorMethod<[], [] | [string]>,
   'getCallerUserProfile' : ActorMethod<[], [] | [UserProfile]>,
   'getCallerUserRole' : ActorMethod<[], UserRole>,
   'getCanvasHash' : ActorMethod<[], [] | [CanvasSave]>,
   /**
-   * / Returns all stored preferences for the caller, or null if none saved yet.
+   * / Returns the username for the caller's principal, or null if none registered.
    */
+  'getMyUsername' : ActorMethod<[], [] | [string]>,
   'getPreferences' : ActorMethod<[], [] | [UserPreferences]>,
-  /**
-   * / Returns the schema version stored for the caller, or 0 if no record exists.
-   */
   'getSchemaVersion' : ActorMethod<[], bigint>,
+  /**
+   * / Returns the set IDs the caller has been explicitly granted.
+   */
+  'getUserEntitlements' : ActorMethod<[], Array<string>>,
+  /**
+   * / Returns all default image sets plus any sets the caller has been granted.
+   */
+  'getUserImageSets' : ActorMethod<[], Array<ImageSet>>,
   'getUserProfile' : ActorMethod<[Principal], [] | [UserProfile]>,
   'getUserSettings' : ActorMethod<[], [] | [SettingsSave]>,
+  /**
+   * / Returns the username for any given principal — for display purposes.
+   */
+  'getUsernameForPrincipal' : ActorMethod<[Principal], [] | [string]>,
+  /**
+   * / Admin: grant a set to a principal. Returns false if the set does not exist.
+   */
+  'grantEntitlement' : ActorMethod<[Principal, string], boolean>,
+  /**
+   * / Called by the payments canister to grant a pack entitlement to a user.
+   * / Only the stored payments canister principal is allowed to call this.
+   * / Idempotent — adding an entitlement the user already has is a no-op.
+   * / Returns false if the caller is not the trusted payments canister,
+   * / if no payments canister principal has been configured, or if the
+   * / pack does not exist in the image set registry.
+   */
+  'grantPackEntitlement' : ActorMethod<[Principal, string], boolean>,
+  /**
+   * / Returns true if the given principal is in the admin set.
+   * / Safe as a query because isAdminPrincipal() never mutates state.
+   */
+  'isAdmin' : ActorMethod<[Principal], boolean>,
   'isCallerAdmin' : ActorMethod<[], boolean>,
   /**
-   * / Upserts a single brush by id. Creates a default preferences record first
-   * / if the caller has no existing record.
+   * / Registers a username for the caller's principal.
+   * / Returns true on success, false if the caller already has a username
+   * / or if the username is already taken (race condition guard).
    */
+  'registerUsername' : ActorMethod<[string], boolean>,
+  /**
+   * / Removes an admin. Only an existing admin may call this.
+   * / Returns false if the caller is not an admin or if the caller tries
+   * / to remove themselves.
+   */
+  'removeAdmin' : ActorMethod<[Principal], boolean>,
+  /**
+   * / Admin only — remove an image reference from a set.
+   * / Returns false if caller is not admin, setId doesn't exist, or imageId not found.
+   */
+  'removeImageFromSet' : ActorMethod<[string, string], boolean>,
+  /**
+   * / Admin only — rename an image set.
+   * / newName must not be empty. Returns false if caller is not admin,
+   * / setId doesn't exist, or newName is empty.
+   */
+  'renameSet' : ActorMethod<[string, string], boolean>,
+  /**
+   * / Admin: revoke a set from a principal. Returns false if the set does not exist.
+   */
+  'revokeEntitlement' : ActorMethod<[Principal, string], boolean>,
   'saveBrush' : ActorMethod<[BrushPreset], undefined>,
   'saveBrushPresets' : ActorMethod<[string], undefined>,
   'saveCallerUserProfile' : ActorMethod<[UserProfile], undefined>,
   'saveCanvasHash' : ActorMethod<[CanvasSave], undefined>,
-  /**
-   * / Atomically replaces all preferences for the caller.
-   * / Always overwrites lastModified with the current canister time.
-   */
   'savePreferences' : ActorMethod<[UserPreferences], undefined>,
   'saveUserSettings' : ActorMethod<[SettingsSave], undefined>,
+  /**
+   * / Admin only — mark a set as the sole default set.
+   * / Unsets isDefault on all other sets. Returns false if caller is not admin
+   * / or the setId does not exist.
+   */
+  'setImageSetDefault' : ActorMethod<[string], boolean>,
+  /**
+   * / Admin only — set or clear the price of a set.
+   * / Pass null to clear the price (make free). Returns false if caller is not admin
+   * / or the setId does not exist.
+   */
+  'setImageSetPrice' : ActorMethod<[string, [] | [string]], boolean>,
+  /**
+   * / Admin only — store the trusted payments canister principal.
+   * / grantPackEntitlement will only accept calls from this principal.
+   * / Returns false if the caller is not an admin.
+   */
+  'setPaymentsCanisterPrincipal' : ActorMethod<[Principal], boolean>,
+  /**
+   * / Admin only — update the tags for an image set.
+   * / All tags are normalized to lowercase before storing.
+   * / Returns false if caller is not admin or setId doesn't exist.
+   */
+  'updateSetTags' : ActorMethod<[string, Array<string>], boolean>,
 }
 export declare const idlService: IDL.ServiceClass;
 export declare const idlInitArgs: IDL.Type[];

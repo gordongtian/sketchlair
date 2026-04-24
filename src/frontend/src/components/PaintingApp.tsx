@@ -100,6 +100,7 @@ import {
   RotateCrosshairOverlay,
   SoftwareCursorCanvas,
 } from "./CanvasOverlays";
+import { CtrlRightClickLayerMenu } from "./CtrlRightClickLayerMenu";
 import type { FillMode, FillSettings } from "./FillPresetsPanel";
 import type { Layer } from "./LayersPanel";
 import { LeftSidebarArea } from "./LeftSidebarArea";
@@ -110,6 +111,7 @@ import { SettingsPanel } from "./SettingsPanel";
 import type { LassoMode, Tool } from "./Toolbar";
 import { ToolbarArea } from "./ToolbarArea";
 import { WebGL1WarningBanner } from "./WebGL1WarningBanner";
+import { FigureDrawingSession } from "./learn/FigureDrawingSession";
 
 const CANVAS_WIDTH = isIPad ? 1280 : 2560;
 const CANVAS_HEIGHT = isIPad ? 720 : 1440;
@@ -334,6 +336,19 @@ interface PaintingAppProps {
    * lock / unlock the document tab bar.
    */
   onBrushTipEditorActiveChange?: (active: boolean) => void;
+  /**
+   * When set, the figure drawing session is active. PaintingApp renders
+   * FigureDrawingSession as an overlay and hides the layer panel/navigator.
+   */
+  figureDrawingSession?: {
+    config: import("@/types/learn").FigureDrawingConfig;
+    imageSets: import("@/types/learn").ImageSet[];
+    handedness: "left" | "right";
+    onSessionComplete: (snapshots: ImageData[]) => void;
+    onAbort: () => void;
+  } | null;
+  /** Called when the user navigates home from the mobile toolbar */
+  onNavigateToSplash?: () => void;
 }
 
 export function PaintingApp({
@@ -347,6 +362,8 @@ export function PaintingApp({
   registerLoadPresets,
   preferences,
   onBrushTipEditorActiveChange,
+  figureDrawingSession,
+  onNavigateToSplash,
 }: PaintingAppProps = {}) {
   // Access DocumentContext to register imperative functions and react to document events
   const {
@@ -482,6 +499,17 @@ export function PaintingApp({
   // The savedColor is restored on exit; the onAccept callback receives the
   // grayscale data URL and passes it to the brush engine exactly as the old
   // ScratchpadDialog did.
+
+  // ── Ctrl+right-click layer menu state ─────────────────────────────────────
+  const [ctrlRightClickMenu, setCtrlRightClickMenu] = useState<{
+    layers: Layer[];
+    x: number;
+    y: number;
+  } | null>(null);
+  // Ref so the canvas event handler (stable closure) can gate on figure drawing mode.
+  const isFigureDrawingSessionRef = useRef(!!figureDrawingSession);
+  // Keep ref in sync with prop — runs before any render-triggered effects.
+  isFigureDrawingSessionRef.current = !!figureDrawingSession;
   const [brushTipEditorMode, setBrushTipEditorMode] = useState<{
     active: boolean;
     onAccept: (dataUrl: string) => void;
@@ -541,13 +569,19 @@ export function PaintingApp({
   // Mobile layout state
   const { isMobile, forceDesktop, leftHanded, setForceDesktop, setLeftHanded } =
     useIsMobile();
-  const [showMobileColorPanel, setShowMobileColorPanel] = useState(false);
-  const [showMobilePresetsPanel, setShowMobilePresetsPanel] = useState(false);
+  const [activeMobilePanel, setActiveMobilePanel] = useState<
+    "layers" | "presets" | "palette" | null
+  >(null);
+
+  // Derive booleans for panel rendering
+  const showMobileColorPanel = activeMobilePanel === "palette";
+  const showMobilePresetsPanel = activeMobilePanel === "presets";
+  const showMobileLayersPanel = activeMobilePanel === "layers";
 
   // Auto-open mobile presets popup when adjustments subpanel becomes active
   useEffect(() => {
     if (isMobile && activeSubpanel === "adjustments") {
-      setShowMobilePresetsPanel(true);
+      setActiveMobilePanel("presets");
     }
   }, [isMobile, activeSubpanel]);
 
@@ -649,11 +683,6 @@ export function PaintingApp({
           eraser: eraser[0]?.id ?? null,
         },
       };
-      console.log("[Preferences] Download callback: pushing brushes into UI", {
-        brush: brush.length,
-        smudge: smudge.length,
-        eraser: eraser.length,
-      });
       loadPresetsRef.current(payload);
     });
     // preferences object identity is stable — registerOnDownload stores into a ref
@@ -679,7 +708,7 @@ export function PaintingApp({
   const rightSidebarCollapsedRef = useRef(false);
   rightSidebarCollapsedRef.current = rightSidebarCollapsed;
   const [leftSidebarWidth, setLeftSidebarWidth] = useState(220);
-  const [wandTolerance, setWandTolerance] = useState(13);
+  const [wandTolerance, setWandTolerance] = useState(32);
   const [wandContiguous, setWandContiguous] = useState(true);
   // wandToleranceRef, wandContiguousRef, wandGrowShrinkRef → now in toolRefs group (declared below)
   const [wandGrowShrink, setWandGrowShrink] = useState(0);
@@ -805,6 +834,12 @@ export function PaintingApp({
   // with a console warning. Cleared by flushStrokeBuffer at the end of every stroke.
   const strokeActiveRef = useRef<boolean>(false);
 
+  // ── Ctrl+drag layer move refs ─────────────────────────────────────────────
+  // Shared between usePaintingCanvasEvents (pointer logic) and useCompositing (preview offset).
+  const ctrlDragMoveActiveRef = useRef<boolean>(false);
+  const ctrlDragOffsetRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const ctrlDragMovingLayerIdRef = useRef<string>("");
+
   // ── Grouped state refs ────────────────────────────────────────────────────
   const stateRefs = {
     activeToolRef: useRef(activeTool),
@@ -884,7 +919,7 @@ export function PaintingApp({
 
   // ── Grouped tool refs ─────────────────────────────────────────────────────
   const toolRefs = {
-    wandToleranceRef: useRef(13),
+    wandToleranceRef: useRef(32),
     wandContiguousRef: useRef(true),
     wandGrowShrinkRef: useRef(0),
     eyedropperSampleSourceRef: useRef<"canvas" | "layer">("canvas"),
@@ -1080,6 +1115,9 @@ export function PaintingApp({
 
   // ─── useStrokeEngine: stroke lifecycle, stampWebGL, smudge, tail RAF ──────
   const {
+    // Path accumulation refs — cleared at stroke start, passed to usePaintingCanvasEvents
+    strokePathBufferRef,
+    lastStampPathIdxRef,
     tailRafIdRef,
     tailDoCommitRef,
     strokeStartSnapshotRef,
@@ -1533,6 +1571,7 @@ export function PaintingApp({
     lastToolBeforeTransformRef,
     multiFloatCanvasesRef,
     multiLayerResolvedIdsRef,
+    freeCornerStateRef,
     transformActionsRef,
   } = useTransformSystem({
     canvasWidth: canvasWidth,
@@ -1600,6 +1639,7 @@ export function PaintingApp({
     transformActiveRef,
     multiFloatCanvasesRef,
     multiLayerResolvedIdsRef,
+    freeCornerStateRef,
     moveFloatCanvasRef,
     moveFloatOriginBoundsRef,
     xfStateRef,
@@ -1607,6 +1647,9 @@ export function PaintingApp({
     webglBrushRef,
     getActiveSize,
     getOrCreateLayerCanvas,
+    ctrlDragMoveActiveRef,
+    ctrlDragOffsetRef,
+    ctrlDragMovingLayerIdRef,
   });
 
   // scheduleComposite — thin wrapper around _rawScheduleComposite.
@@ -1790,30 +1833,48 @@ export function PaintingApp({
       );
 
       // 1. Clear and release all layer canvases owned by the discarded document.
-      //    This prevents their pixel data from being reused by a new document.
-      for (const [layerId, canvas] of doc.layerCanvases) {
+      //    For file-loaded documents, handleLoadFile populates layerCanvasesRef.current
+      //    (same Map object as doc.layerCanvases). To guarantee we clear ALL canvases
+      //    regardless of how the document was created, we flush BOTH sources:
+      //    (a) doc.layerCanvases — authoritative for inactive docs
+      //    (b) layerCanvasesRef.current — authoritative for the active doc (same Map, but
+      //        if they diverged due to a missed updateDocument call, we cover both).
+      const canvasesToFlush = new Set<HTMLCanvasElement>();
+      for (const canvas of doc.layerCanvases.values())
+        canvasesToFlush.add(canvas);
+      if (isActiveDoc) {
+        for (const canvas of layerCanvasesRef.current.values())
+          canvasesToFlush.add(canvas);
+      }
+      for (const canvas of canvasesToFlush) {
         const ctx = canvas.getContext("2d");
         if (ctx) {
           ctx.clearRect(0, 0, canvas.width, canvas.height);
-        } else {
-          console.warn(
-            `[Doc Flush] Could not get 2d context for layer canvas ${layerId} — canvas may already be detached`,
-          );
         }
-        doc.layerCanvases.delete(layerId);
+      }
+      doc.layerCanvases.clear();
+      if (isActiveDoc) {
+        // Clear the live ref map too so no stale entry survives into the next document.
+        layerCanvasesRef.current.clear();
       }
 
       // 2. Null out pixelData on all paint layers so ImageData cannot be reused.
-      //    LayerPixelSnapshot.pixelData is the field; plain layers may not have it,
-      //    so we guard with a property check.
-      for (const layer of doc.layers) {
-        if (
-          layer &&
-          typeof layer === "object" &&
-          "pixelData" in layer &&
-          layer.pixelData !== null
-        ) {
-          (layer as { pixelData: ImageData | null }).pixelData = null;
+      //    Flush both doc.layers (React state snapshot) and layersRef.current (live ref)
+      //    so file-loaded documents (whose React state layers may be stale) are also covered.
+      const layerArraysToFlush = [
+        doc.layers,
+        ...(isActiveDoc ? [layersRef.current] : []),
+      ];
+      for (const layerArr of layerArraysToFlush) {
+        for (const layer of layerArr) {
+          if (
+            layer &&
+            typeof layer === "object" &&
+            "pixelData" in layer &&
+            layer.pixelData !== null
+          ) {
+            (layer as { pixelData: ImageData | null }).pixelData = null;
+          }
         }
       }
 
@@ -1839,8 +1900,15 @@ export function PaintingApp({
         webglBrushRef.current.clear();
       }
 
+      // 5. Reset the active layer ID ref so no stale layer ID from the discarded
+      //    document persists into the next document's initialization.
+      if (isActiveDoc) {
+        activeLayerIdRef.current = "";
+        invalidateAllLayerBitmaps();
+      }
+
       console.warn(
-        `[Doc Flush] Flush complete for "${doc.filename}" — layerCanvases cleared (map size now ${doc.layerCanvases.size})`,
+        `[Doc Flush] Flush complete for "${doc.filename}" — doc.layerCanvases size: ${doc.layerCanvases.size}, layerCanvasesRef size: ${layerCanvasesRef.current.size}`,
       );
     });
   }, [registerDiscardFlushFn]);
@@ -1852,6 +1920,27 @@ export function PaintingApp({
     onPresetsLoaded: (loaded, loadedBrushSettings) => {
       setPresets(loaded);
       setBrushSettings(loadedBrushSettings);
+      // Apply the loaded preset's default sizes to brushSizes so new canvases
+      // open at the preset's intended size rather than the hardcoded fallback.
+      // Only updates if the current document still holds the blank-doc defaults
+      // (brush: DEFAULT_PRESETS[0].defaultSize, eraser: DEFAULT_PRESETS[0].defaultSize)
+      // — customized documents retain their saved sizes through the swap path.
+      const activeBrushPreset =
+        loaded.brush?.find((p) => p.id === "brush-default") ??
+        loaded.brush?.[0];
+      const activeEraserPreset =
+        loaded.eraser?.find((p) => p.id === "eraser-default") ??
+        loaded.eraser?.[0];
+      const newBrushSize =
+        activeBrushPreset?.defaultSize ?? activeBrushPreset?.size;
+      const newEraserSize =
+        activeEraserPreset?.defaultSize ?? activeEraserPreset?.size;
+      if (newBrushSize !== undefined || newEraserSize !== undefined) {
+        setBrushSizes((prev) => ({
+          brush: newBrushSize !== undefined ? newBrushSize : prev.brush,
+          eraser: newEraserSize !== undefined ? newEraserSize : prev.eraser,
+        }));
+      }
     },
   });
 
@@ -2899,71 +2988,114 @@ export function PaintingApp({
         (activeToolRef.current === "transform" ||
           activeToolRef.current === "move")
       ) {
-        // Inline handle computation to avoid forward reference
-        const xfHandles = xfStateRef.current;
-        const handles = xfHandles
-          ? (() => {
-              const { x, y, w, h } = xfHandles;
-              const hw = w / 2;
-              const hh = h / 2;
-              return {
-                nw: { x, y },
-                n: { x: x + hw, y },
-                ne: { x: x + w, y },
-                w: { x, y: y + hh },
-                e: { x: x + w, y: y + hh },
-                sw: { x, y: y + h },
-                s: { x: x + hw, y: y + h },
-                se: { x: x + w, y: y + h },
-                rot: { x: x + hw, y: y - 24 },
-                bounds: { x, y, w, h },
-              };
-            })()
-          : null;
-        if (handles) {
-          const rot = xfHandles!.rotation;
-          const { x, y, w, h } = handles.bounds;
-          const vcx = x + w / 2;
-          const vcy = y + h / 2;
+        const fcState = freeCornerStateRef.current;
+        if (fcState) {
+          // ── Free-corner mode: draw quadrilateral bounding box ──────────
+          const { tl, tr, bl, br } = fcState.corners;
+          const zoom = viewTransformRef.current.zoom;
+          const hr = Math.max(4, 4 / zoom);
+
           ctx.save();
-          ctx.translate(vcx, vcy);
-          ctx.rotate(rot);
-          ctx.translate(-vcx, -vcy);
-          // Draw bounding box
+          // Draw the quadrilateral bounding box
           ctx.strokeStyle = "rgba(0,120,255,0.8)";
           ctx.lineWidth = 1;
           ctx.setLineDash([]);
-          ctx.strokeRect(x, y, w, h);
-          // Draw rotation line
           ctx.beginPath();
-          // No rotation handle line
-          // Draw square handles (Photoshop/Magma style) — no rotation handle
-          const handleKeys = [
-            "nw",
-            "n",
-            "ne",
-            "w",
-            "e",
-            "sw",
-            "s",
-            "se",
-          ] as const;
-          // Scale handle size inversely with zoom so handles maintain a consistent
-          // screen-pixel footprint. At zoom >= 1 hr = 4 (8×8px handle). When
-          // zoomed out (zoom < 1) hr grows so the handle stays easy to grab.
-          const zoom = viewTransformRef.current.zoom;
-          const hr = Math.max(4, 4 / zoom);
-          for (const key of handleKeys) {
-            const pt = handles[key] as { x: number; y: number };
-            ctx.fillStyle = "white";
-            ctx.strokeStyle = "rgba(0,100,220,0.9)";
-            ctx.lineWidth = Math.max(1.5, 1.5 / zoom);
-            ctx.setLineDash([]);
+          ctx.moveTo(tl.x, tl.y);
+          ctx.lineTo(tr.x, tr.y);
+          ctx.lineTo(br.x, br.y);
+          ctx.lineTo(bl.x, bl.y);
+          ctx.closePath();
+          ctx.stroke();
+
+          // Draw handles at corners and edge midpoints
+          const n = { x: (tl.x + tr.x) / 2, y: (tl.y + tr.y) / 2 };
+          const s = { x: (bl.x + br.x) / 2, y: (bl.y + br.y) / 2 };
+          const w = { x: (tl.x + bl.x) / 2, y: (tl.y + bl.y) / 2 };
+          const e = { x: (tr.x + br.x) / 2, y: (tr.y + br.y) / 2 };
+          const handlePts = [tl, n, tr, w, e, bl, s, br];
+          ctx.fillStyle = "white";
+          ctx.strokeStyle = "rgba(0,100,220,0.9)";
+          ctx.lineWidth = Math.max(1.5, 1.5 / zoom);
+          ctx.setLineDash([]);
+          for (const pt of handlePts) {
             ctx.fillRect(pt.x - hr, pt.y - hr, hr * 2, hr * 2);
             ctx.strokeRect(pt.x - hr, pt.y - hr, hr * 2, hr * 2);
           }
           ctx.restore();
-        }
+        } else {
+          // Inline handle computation to avoid forward reference
+          const xfHandles = xfStateRef.current;
+          const handles = xfHandles
+            ? (() => {
+                const { x, y, w, h } = xfHandles;
+                const hw = w / 2;
+                const hh = h / 2;
+                return {
+                  nw: { x, y },
+                  n: { x: x + hw, y },
+                  ne: { x: x + w, y },
+                  w: { x, y: y + hh },
+                  e: { x: x + w, y: y + hh },
+                  sw: { x, y: y + h },
+                  s: { x: x + hw, y: y + h },
+                  se: { x: x + w, y: y + h },
+                  rot: { x: x + hw, y: y - 24 },
+                  bounds: { x, y, w, h },
+                };
+              })()
+            : null;
+          if (handles) {
+            const rot = xfHandles!.rotation;
+            const skX = xfHandles!.skewX ?? 0;
+            const skY = xfHandles!.skewY ?? 0;
+            const { x, y, w, h } = handles.bounds;
+            const vcx = x + w / 2;
+            const vcy = y + h / 2;
+            ctx.save();
+            ctx.translate(vcx, vcy);
+            ctx.rotate(rot);
+            // Apply skew so the bounding box deforms to a parallelogram
+            if (skX !== 0 || skY !== 0) {
+              ctx.transform(1, Math.tan(skY), Math.tan(skX), 1, 0, 0);
+            }
+            ctx.translate(-vcx, -vcy);
+            // Draw bounding box
+            ctx.strokeStyle = "rgba(0,120,255,0.8)";
+            ctx.lineWidth = 1;
+            ctx.setLineDash([]);
+            ctx.strokeRect(x, y, w, h);
+            // Draw rotation line
+            ctx.beginPath();
+            // No rotation handle line
+            // Draw square handles (Photoshop/Magma style) — no rotation handle
+            const handleKeys = [
+              "nw",
+              "n",
+              "ne",
+              "w",
+              "e",
+              "sw",
+              "s",
+              "se",
+            ] as const;
+            // Scale handle size inversely with zoom so handles maintain a consistent
+            // screen-pixel footprint. At zoom >= 1 hr = 4 (8×8px handle). When
+            // zoomed out (zoom < 1) hr grows so the handle stays easy to grab.
+            const zoom = viewTransformRef.current.zoom;
+            const hr = Math.max(4, 4 / zoom);
+            for (const key of handleKeys) {
+              const pt = handles[key] as { x: number; y: number };
+              ctx.fillStyle = "white";
+              ctx.strokeStyle = "rgba(0,100,220,0.9)";
+              ctx.lineWidth = Math.max(1.5, 1.5 / zoom);
+              ctx.setLineDash([]);
+              ctx.fillRect(pt.x - hr, pt.y - hr, hr * 2, hr * 2);
+              ctx.strokeRect(pt.x - hr, pt.y - hr, hr * 2, hr * 2);
+            }
+            ctx.restore();
+          }
+        } // end else (not freeCorner mode)
       }
     };
     // Store drawAnts in a ref so the selectionActive restart effect can start it
@@ -3774,6 +3906,48 @@ export function PaintingApp({
     }
   }, [exportWithSaveDialog]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: displayCanvasRef is a stable ref
+  const handleExportJPG = useCallback(async () => {
+    const display = displayCanvasRef.current;
+    if (!display) return;
+
+    const doc = activeDocumentRef.current;
+    const baseName =
+      (doc?.filename ?? "untitled").replace(/\.sktch$/i, "").trim() ||
+      "untitled";
+    const defaultFilename = `${baseName}.jpg`;
+
+    try {
+      const exportCanvas = document.createElement("canvas");
+      exportCanvas.width = display.width;
+      exportCanvas.height = display.height;
+      const ctx = exportCanvas.getContext("2d", {
+        willReadFrequently: !isIPad,
+      });
+      if (!ctx) return;
+      // Fill white background for JPG (no transparency)
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+      ctx.drawImage(display, 0, 0);
+
+      const jpgBlob = await new Promise<Blob | null>((resolve) =>
+        exportCanvas.toBlob(resolve, "image/jpeg", 0.92),
+      );
+      if (!jpgBlob) throw new Error("Failed to generate JPG data");
+
+      await exportWithSaveDialog(jpgBlob, defaultFilename, {
+        description: "JPEG Image",
+        accept: { "image/jpeg": [".jpg", ".jpeg"] },
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") return; // user cancelled
+      console.error("[JPG Export] Failed:", err);
+      alert(
+        `JPG export failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+      );
+    }
+  }, [exportWithSaveDialog]);
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: stable refs + activeDocumentRef
   const handleExportPSD = useCallback(async () => {
     setIsPsdExporting(true);
@@ -4413,6 +4587,9 @@ export function PaintingApp({
     smearRafRef,
     smearDirtyRef,
     distAccumRef,
+    // Path accumulation refs
+    strokePathBufferRef,
+    lastStampPathIdxRef,
     // Layer tree
     layerTreeRef,
     selectedLayerIdsRef,
@@ -4443,6 +4620,16 @@ export function PaintingApp({
     holdTimerRef,
     pendingSpringKeyRef,
     pendingSpringToolRef,
+    // Ctrl+right-click layer menu
+    isFigureDrawingSessionRef,
+    onCtrlRightClick: (payload) => {
+      setCtrlRightClickMenu(payload);
+    },
+    freeCornerStateRef,
+    // Ctrl+drag layer move
+    ctrlDragMoveActiveRef,
+    ctrlDragOffsetRef,
+    ctrlDragMovingLayerIdRef,
   });
 
   const handleZoomLockToggle = useCallback(() => {
@@ -4483,20 +4670,46 @@ export function PaintingApp({
     setSettingsOpen(true);
   }, []);
 
-  const handleToolReselect = useCallback((tool: Tool) => {
-    // Always keep subpanel open — no toggling
-    if (tool === "brush" || tool === "smudge" || tool === "eraser") {
-      setActiveSubpanel(tool as "brush" | "smudge" | "eraser");
-    } else if (tool === "lasso") {
-      setActiveSubpanel("lasso");
-    } else if (tool === "fill") {
-      setActiveSubpanel("fill");
-    } else if (tool === "ruler") {
-      setActiveSubpanel("ruler");
-    } else if (tool === "eyedropper") {
-      setActiveSubpanel("eyedropper" as never);
-    }
-  }, []);
+  const handleToolReselect = useCallback(
+    (tool: Tool) => {
+      // On mobile: tapping the active tool opens/closes the presets panel
+      if (isMobile) {
+        // Update the subpanel to match the tapped tool first
+        if (tool === "brush" || tool === "smudge" || tool === "eraser") {
+          setActiveSubpanel(tool as "brush" | "smudge" | "eraser");
+        } else if (tool === "lasso") {
+          setActiveSubpanel("lasso");
+        } else if (tool === "fill") {
+          setActiveSubpanel("fill");
+        } else if (tool === "ruler") {
+          setActiveSubpanel("ruler");
+        } else if (tool === "adjustments") {
+          setActiveSubpanel("adjustments");
+        } else if (tool === "eyedropper") {
+          setActiveSubpanel("eyedropper" as never);
+        }
+        // Toggle the presets panel: if it's already open, always close it;
+        // otherwise open it. This applies even if the panel is pinned.
+        setActiveMobilePanel((prev) => (prev === "presets" ? null : "presets"));
+        return;
+      }
+      // Desktop: always keep subpanel open — no toggling
+      if (tool === "brush" || tool === "smudge" || tool === "eraser") {
+        setActiveSubpanel(tool as "brush" | "smudge" | "eraser");
+      } else if (tool === "lasso") {
+        setActiveSubpanel("lasso");
+      } else if (tool === "fill") {
+        setActiveSubpanel("fill");
+      } else if (tool === "ruler") {
+        setActiveSubpanel("ruler");
+      } else if (tool === "adjustments") {
+        setActiveSubpanel("adjustments");
+      } else if (tool === "eyedropper") {
+        setActiveSubpanel("eyedropper" as never);
+      }
+    },
+    [isMobile],
+  );
 
   // Wraps handleToolChange for panel/toolbar clicks. Clears any active spring-load
   // so that releasing the spring key after a manual tool click does nothing.
@@ -4521,6 +4734,23 @@ export function PaintingApp({
   const { panX, panY, zoom, rotation } = viewTransform;
   const isDefaultTransform =
     panX === 0 && panY === 0 && zoom === 1 && rotation === 0;
+
+  // ── Close Ctrl+right-click menu on tool change ──────────────────────────
+  // biome-ignore lint/correctness/useExhaustiveDependencies: setCtrlRightClickMenu is a stable React dispatch fn
+  useEffect(() => {
+    setCtrlRightClickMenu(null);
+  }, [activeTool]);
+
+  // ── Close Ctrl+right-click menu when a stroke starts ───────────────────
+  // biome-ignore lint/correctness/useExhaustiveDependencies: setCtrlRightClickMenu is a stable React dispatch fn
+  useEffect(() => {
+    if (!ctrlRightClickMenu) return;
+    const canvas = displayCanvasRef.current;
+    if (!canvas) return;
+    const onPointerDown = () => setCtrlRightClickMenu(null);
+    canvas.addEventListener("pointerdown", onPointerDown);
+    return () => canvas.removeEventListener("pointerdown", onPointerDown);
+  }, [ctrlRightClickMenu]);
 
   // Current tool's size for BottomBar
   const currentBrushSize =
@@ -4707,6 +4937,7 @@ export function PaintingApp({
             leftHanded={leftHanded}
             fileLoadInputRef={fileLoadInputRef}
             onFileLoad={openFileAsDocument}
+            onNavigateToSplash={onNavigateToSplash}
           />
           {/* Left sidebar: Color Panel + Tool Presets — desktop only; mobile uses floating panels */}
           {!isMobile && (
@@ -4857,6 +5088,7 @@ export function PaintingApp({
               }}
               onClear={handleClear}
               onExport={handleExport}
+              onExportJPG={handleExportJPG}
               onExportPSD={handleExportPSD}
               isPsdExporting={isPsdExporting}
               isPngExporting={isPngExporting}
@@ -5006,6 +5238,12 @@ export function PaintingApp({
               presets={presets}
               activePresetIds={activePresetIds}
               layers={layers}
+              layerTree={[]}
+              activeLayerId={activeLayerId}
+              selectedLayerIds={selectedLayerIds}
+              layerThumbnails={layerThumbnails}
+              shiftHeld={shiftHeld}
+              brushTipEditorActive={brushTipEditorMode?.active}
               scheduleRulerOverlay={scheduleRulerOverlay}
               isCropActive={isCropActive}
               cropRectVersion={cropRectVersion}
@@ -5013,14 +5251,13 @@ export function PaintingApp({
               leftHanded={leftHanded}
               showMobileColorPanel={showMobileColorPanel}
               showMobilePresetsPanel={showMobilePresetsPanel}
+              showMobileLayersPanel={showMobileLayersPanel}
               recentColors={recentColors}
               wandTolerance={wandTolerance}
               wandContiguous={wandContiguous}
               wandGrowShrink={wandGrowShrink}
               cursor={getCursorStyle()}
-              onSetShowMobileColorPanel={setShowMobileColorPanel}
-              onSetShowMobilePresetsPanel={setShowMobilePresetsPanel}
-              onSetRightSidebarCollapsed={setRightSidebarCollapsed}
+              onSetActiveMobilePanel={setActiveMobilePanel}
               onRecentColorClick={handleRecentColorClick}
               onColorChange={setColor}
               onBrushSizeChange={handleCanvasBrushSizeChange}
@@ -5038,7 +5275,7 @@ export function PaintingApp({
               onReorderPresets={handleReorderPresets}
               onSaveCurrentToPreset={handleSaveCurrentToPreset}
               onSelectLassoMode={handleSelectLassoMode}
-              onCloseMobilePresetsPanel={() => setShowMobilePresetsPanel(false)}
+              onCloseMobilePresetsPanel={() => setActiveMobilePanel(null)}
               onWandToleranceChange={setWandTolerance}
               onWandContiguousChange={setWandContiguous}
               onWandGrowShrinkChange={setWandGrowShrink}
@@ -5064,6 +5301,130 @@ export function PaintingApp({
               onCanvasDoubleClick={handleCanvasDoubleClick}
               onSelectionOverlayCanvasRef={handleSelectionOverlayCanvasRef}
               onRulerCanvasRef={handleRulerCanvasRef}
+              onSetActive={(id) => {
+                const clickedLayer = layersRef.current.find((l) => l.id === id);
+                const wasTransformActive =
+                  transformActiveRef.current || isDraggingFloatRef.current;
+                if (wasTransformActive && !clickedLayer?.isRuler) {
+                  selectionActionsRef.current.commitFloat({
+                    keepSelection: false,
+                  });
+                }
+                if (clickedLayer?.isRuler) {
+                  lastPaintToolRef2.current =
+                    activeToolRef.current !== "ruler"
+                      ? activeToolRef.current
+                      : lastPaintToolRef2.current;
+                  lastPaintLayerIdRef.current =
+                    activeLayerIdRef.current !== id
+                      ? activeLayerIdRef.current
+                      : lastPaintLayerIdRef.current;
+                  const presetType = (clickedLayer.rulerPresetType ??
+                    "perspective-1pt") as RulerPresetType;
+                  setActiveRulerPresetType(presetType);
+                  activeRulerPresetTypeRef.current = presetType;
+                  setActiveTool("ruler");
+                  setActiveSubpanel("ruler");
+                } else if (activeToolRef.current === "ruler") {
+                  collapseRulerHistory();
+                  const tool = lastPaintToolRef2.current;
+                  setActiveTool(tool);
+                  if (
+                    tool === "brush" ||
+                    tool === "smudge" ||
+                    tool === "eraser"
+                  ) {
+                    setActiveSubpanel(tool);
+                  } else {
+                    setActiveSubpanel(null);
+                  }
+                }
+                setActiveLayerId(id);
+                activeLayerIdRef.current = id;
+                if (!clickedLayer?.isRuler) lastPaintLayerIdRef.current = id;
+              }}
+              onToggleVisible={(id) => {
+                const layer = layersRef.current.find((l) => l.id === id);
+                if (layer?.isRuler) {
+                  const nowHiding = layer.visible;
+                  const updFn = (l: Layer): Layer => {
+                    if (l.id !== id) return l;
+                    if (nowHiding)
+                      return {
+                        ...l,
+                        visible: false,
+                        rulerActiveBeforeHide: l.rulerActive ?? true,
+                        rulerActive: false,
+                      };
+                    return {
+                      ...l,
+                      visible: true,
+                      rulerActive:
+                        l.rulerActiveBeforeHide ?? l.rulerActive ?? true,
+                      rulerActiveBeforeHide: undefined,
+                    };
+                  };
+                  layersRef.current = layersRef.current.map(updFn);
+                  setLayers((prev) => prev.map(updFn));
+                  if (rulerRafRef.current !== null) {
+                    cancelAnimationFrame(rulerRafRef.current);
+                    rulerRafRef.current = null;
+                  }
+                  drawRulerOverlay();
+                } else {
+                  handleToggleVisible(id);
+                }
+              }}
+              onSetOpacity={handleSetOpacity}
+              onSetOpacityLive={handleSetOpacityLive}
+              onSetOpacityCommit={handleSetOpacityCommit}
+              onSetBlendMode={handleSetLayerBlendMode}
+              onAddLayer={handleAddLayer}
+              onDeleteLayer={(id) => {
+                const isRuler = layersRef.current.find(
+                  (l) => l.id === id,
+                )?.isRuler;
+                handleDeleteLayer(id);
+                if (isRuler) scheduleRulerOverlay();
+              }}
+              onReorderLayers={handleReorderLayers}
+              onClearLayer={handleClear}
+              onToggleClippingMask={handleToggleClippingMask}
+              onMergeLayers={handleMergeLayers}
+              onRenameLayer={handleRenameLayer}
+              onToggleAlphaLock={handleToggleAlphaLock}
+              onCtrlClickLayer={handleCtrlClickLayer}
+              onToggleRulerActive={(id) => {
+                const toggleFn = (l: Layer): Layer =>
+                  l.id === id
+                    ? { ...l, rulerActive: !(l.rulerActive ?? true) }
+                    : l;
+                setLayers((prev) => prev.map(toggleFn));
+                layersRef.current = layersRef.current.map(toggleFn);
+                scheduleRulerOverlay();
+              }}
+              onToggleGroupCollapse={_handleToggleGroupCollapse}
+              onRenameGroup={_handleRenameGroup}
+              onSetGroupOpacity={_handleSetGroupOpacity}
+              onSetGroupOpacityLive={_handleSetGroupOpacityLive}
+              onSetGroupOpacityCommit={_handleSetGroupOpacityCommit}
+              onToggleGroupVisible={_handleToggleGroupVisible}
+              onOpenDeleteGroup={(groupId) => {
+                const groupLayer = layers.find((l) => l.id === groupId);
+                const groupName = groupLayer?.name ?? "Group";
+                setDeleteGroupConfirm({ groupId, groupName });
+              }}
+              onReorderTree={_handleReorderTree}
+              onReorderTreeSilent={_handleReorderTreeSilent}
+              onReorderLayersSilent={_handleReorderLayersSilent}
+              onCommitReorderHistory={_handleCommitReorderHistory}
+              onToggleLayerSelection={_handleToggleLayerSelection}
+              onCreateGroup={handleCreateGroup}
+              onEnterBrushTipEditor={(onAccept) => {
+                // Close the mobile presets panel before entering the tip editor
+                setActiveMobilePanel(null);
+                enterBrushTipEditor(onAccept);
+              }}
               mobileAdjustmentsPanel={
                 <AdjustmentsPresetsPanel
                   activeLayerId={activeLayerId}
@@ -5081,12 +5442,131 @@ export function PaintingApp({
                 />
               }
             />
+            {/* ── Figure Drawing Session overlay ── */}
+            {figureDrawingSession && (
+              <FigureDrawingSession
+                config={figureDrawingSession.config}
+                imageSets={figureDrawingSession.imageSets}
+                handedness={figureDrawingSession.handedness}
+                onSessionComplete={figureDrawingSession.onSessionComplete}
+                onAbort={figureDrawingSession.onAbort}
+                layers={layers}
+                setLayers={(newLayers) => {
+                  // Synchronously update layersRef BEFORE the React state update so that
+                  // any compositeAllLayers() call inside FigureDrawingSession immediately
+                  // after setLayers() reads the correct session layers (not the stale pre-session layers).
+                  // Without this, composite() reads layersRef.current which still holds the old
+                  // document layers because the React useEffect that syncs layersRef hasn't fired yet.
+                  layersRef.current = newLayers;
+                  setLayers(newLayers);
+                }}
+                canvasWidth={canvasWidth}
+                canvasHeight={canvasHeight}
+                resizeCanvas={(w, h) => {
+                  // Atomically resize ALL canvas infrastructure before React state updates.
+                  // Simply calling setCanvasWidth/setCanvasHeight only updates the CSS size
+                  // of the wrapper div. The display canvas pixel dimensions, WebGL brush,
+                  // offscreen compositing canvases, and canvasWidthRef/canvasHeightRef all
+                  // stay stale — causing a pixel-vs-CSS-size mismatch that makes coordinate
+                  // mapping wrong (offset + scaling) and compositing draw into the wrong
+                  // number of pixels.
+                  const newW = Math.max(1, w);
+                  const newH = Math.max(1, h);
+
+                  // 1. Update live refs immediately so compositing reads correct dimensions
+                  canvasWidthRef.current = newW;
+                  canvasHeightRef.current = newH;
+
+                  // 2. Resize display canvas pixels to match
+                  if (displayCanvasRef.current) {
+                    displayCanvasRef.current.width = newW;
+                    displayCanvasRef.current.height = newH;
+                  }
+
+                  // 3. Resize WebGL brush and offscreen compositing canvases
+                  if (webglBrushRef.current) {
+                    webglBrushRef.current.resize(newW, newH);
+                  }
+                  for (const offscreen of [
+                    belowActiveCanvasRef,
+                    aboveActiveCanvasRef,
+                    snapshotCanvasRef,
+                    activePreviewCanvasRef,
+                  ]) {
+                    if (offscreen.current) {
+                      offscreen.current.width = newW;
+                      offscreen.current.height = newH;
+                    }
+                  }
+
+                  // 4. Invalidate caches so the next composite does a full redraw
+                  invalidateCompositeContextCaches();
+                  strokeCanvasCacheKeyRef.current++;
+                  needsFullCompositeRef.current = true;
+
+                  // 5. Update React state so the canvas wrapper CSS size matches
+                  console.log(
+                    "[ResizeCanvas] state setters firing: setCanvasWidth + setCanvasHeight",
+                  );
+                  setCanvasWidth(newW);
+                  setCanvasHeight(newH);
+                  console.log("[ResizeCanvas] returning");
+                }}
+                compositeAllLayers={composite}
+                commitActiveStroke={() => {
+                  // Commit any in-progress stroke synchronously so pose transitions
+                  // never fire while the stroke pipeline is still active.
+                  // Must mirror the pointer-up commit path in usePaintingCanvasEvents.
+                  if (strokeActiveRef.current) {
+                    const activeId = activeLayerIdRef.current;
+                    const lc = layerCanvasesRef.current.get(activeId);
+                    if (lc) {
+                      // Determine commit opacity the same way the pointer-up handler does:
+                      // use 1.0 when the WebGL brush has mask data (pressure→opacity mode),
+                      // otherwise use the base brush opacity slider value.
+                      const commitOpacity =
+                        (webglBrushRef.current?.hasMaskData() ?? false)
+                          ? 1.0
+                          : brushOpacityRef.current;
+                      // Flush any pending WebGL stroke display before committing
+                      if (webglBrushRef.current) {
+                        webglBrushRef.current.flushDisplay(
+                          flushDisplayCapRef.current,
+                        );
+                      }
+                      flushStrokeBuffer(
+                        lc,
+                        commitOpacity,
+                        activeToolRef.current as "brush" | "eraser" | "smudge",
+                      );
+                    } else {
+                      // No layer canvas — just clear the stroke-active guard
+                      strokeActiveRef.current = false;
+                    }
+                  }
+                  if (isDrawingRef.current) {
+                    isDrawingRef.current = false;
+                  }
+                }}
+                getDisplayCanvas={() => displayCanvasRef.current}
+                layerCanvasesRef={layerCanvasesRef}
+                generateLayerId={generateLayerId}
+                activeLayerIdRef={activeLayerIdRef}
+                setActiveLayerId={(id) => {
+                  setActiveLayerId(id);
+                  activeLayerIdRef.current = id;
+                }}
+                canvasWrapperRef={canvasWrapperRef}
+                needsFullCompositeRef={needsFullCompositeRef}
+              />
+            )}
           </div>
           {/* Right panel: Navigator + Layers */}
           {/* On mobile: hidden when collapsed (button in canvas overlay handles toggle) */}
-          {/* Hidden entirely while brush tip editor is active — canvas expands to fill the space */}
+          {/* Hidden entirely while brush tip editor or figure drawing session is active */}
           {(!isMobile || !rightSidebarCollapsed) &&
-            !brushTipEditorMode?.active && (
+            !brushTipEditorMode?.active &&
+            !figureDrawingSession && (
               <RightSidebarArea
                 isMobile={isMobile}
                 rightSidebarCollapsed={rightSidebarCollapsed}
@@ -5413,6 +5893,24 @@ export function PaintingApp({
           <BrushSizeOverlayCanvas canvasRef={brushSizeOverlayRef} />
           {/* Software cursor for pen/stylus input — browser suppresses CSS cursors for pen during capture */}
           <SoftwareCursorCanvas canvasRef={softwareCursorRef} />
+          {/* Ctrl+right-click layer picker — removed from DOM when not open */}
+          {ctrlRightClickMenu && (
+            <CtrlRightClickLayerMenu
+              layers={ctrlRightClickMenu.layers}
+              position={{ x: ctrlRightClickMenu.x, y: ctrlRightClickMenu.y }}
+              activeLayerId={activeLayerId}
+              layerCanvasesRef={layerCanvasesRef}
+              onSelect={(id) => {
+                const layer = layersRef.current.find((l) => l.id === id);
+                if (!layer || (layer as { isLocked?: boolean }).isLocked)
+                  return;
+                setActiveLayerId(id);
+                activeLayerIdRef.current = id;
+                setCtrlRightClickMenu(null);
+              }}
+              onClose={() => setCtrlRightClickMenu(null)}
+            />
+          )}
         </div>
       </div>
     </PaintingContextProvider>

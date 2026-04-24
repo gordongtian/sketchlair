@@ -57,7 +57,7 @@ export function LassoPresetsPanel({
   lassoMode,
   onSelectMode,
   onClose,
-  wandTolerance = 13,
+  wandTolerance = 32,
   wandContiguous = true,
   wandGrowShrink = 0,
   onWandToleranceChange,
@@ -128,11 +128,11 @@ export function LassoPresetsPanel({
                   <input
                     type="number"
                     min={0}
-                    max={100}
+                    max={255}
                     value={wandTolerance}
                     onChange={(e) =>
                       onWandToleranceChange?.(
-                        Math.max(0, Math.min(100, Number(e.target.value))),
+                        Math.max(0, Math.min(255, Number(e.target.value))),
                       )
                     }
                     className="w-12 text-[11px] text-right bg-muted border border-border rounded px-1 py-0.5"
@@ -142,13 +142,15 @@ export function LassoPresetsPanel({
                 <input
                   type="range"
                   min={0}
-                  max={100}
+                  max={255}
                   value={wandTolerance}
                   onChange={(e) =>
                     onWandToleranceChange?.(Number(e.target.value))
                   }
                   style={
-                    { "--fill-pct": `${wandTolerance}%` } as React.CSSProperties
+                    {
+                      "--fill-pct": `${(wandTolerance / 255) * 100}%`,
+                    } as React.CSSProperties
                   }
                   className="w-full"
                   data-ocid="lasso_presets.wand_tolerance_slider.input"

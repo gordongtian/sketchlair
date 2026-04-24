@@ -30,6 +30,10 @@ export interface XfState {
   w: number;
   h: number;
   rotation: number;
+  /** Horizontal shear angle in radians — positive shears the top edge right */
+  skewX?: number;
+  /** Vertical shear angle in radians — positive shears the left edge down */
+  skewY?: number;
 }
 
 // Minimal shape of selectionActionsRef that context consumers need

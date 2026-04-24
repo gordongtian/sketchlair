@@ -2,6 +2,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Slider } from "@/components/ui/slider";
@@ -21,7 +22,7 @@ import {
   Trash2,
   Undo2,
 } from "lucide-react";
-import React from "react";
+import React, { useState } from "react";
 import { toast } from "sonner";
 import type { Layer } from "./LayersPanel";
 import type { Tool } from "./Toolbar";
@@ -46,6 +47,7 @@ interface BottomBarProps {
   onRedo: () => void;
   onClear: () => void;
   onExport: () => void;
+  onExportJPG?: () => void;
   onExportPSD?: () => void;
   isPsdExporting?: boolean;
   isPngExporting?: boolean;
@@ -209,6 +211,7 @@ export function BottomBar({
   onRedo,
   onClear,
   onExport,
+  onExportJPG,
   onExportPSD,
   isPsdExporting = false,
   isPngExporting = false,
@@ -247,6 +250,7 @@ export function BottomBar({
   isMobile = false,
   brushTipEditorActive = false,
 }: BottomBarProps) {
+  const [showMobileSaveMenu, setShowMobileSaveMenu] = useState(false);
   const renderToolControls = () => {
     // Crop tool
     if (activeTool === "crop" && isCropActive) {
@@ -1008,7 +1012,7 @@ export function BottomBar({
           </Tooltip>
 
           {/* Export dropdown — hidden in brush tip editor mode */}
-          {!brushTipEditorActive && (
+          {!brushTipEditorActive && !isMobile && (
             <DropdownMenu>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -1025,6 +1029,14 @@ export function BottomBar({
                 <TooltipContent>Export</TooltipContent>
               </Tooltip>
               <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  data-ocid="bottombar.save_sktch_item"
+                  onClick={onSave}
+                >
+                  <Save size={14} className="mr-2 shrink-0" />
+                  Save as .sktch
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
                 <DropdownMenuItem
                   data-ocid="bottombar.export_png_item"
                   onClick={onExport}
@@ -1053,8 +1065,8 @@ export function BottomBar({
             </DropdownMenu>
           )}
 
-          {/* Save — hidden in brush tip editor mode */}
-          {!brushTipEditorActive && (
+          {/* Save — desktop only, hidden in brush tip editor mode */}
+          {!brushTipEditorActive && !isMobile && (
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -1069,6 +1081,144 @@ export function BottomBar({
               </TooltipTrigger>
               <TooltipContent>Save</TooltipContent>
             </Tooltip>
+          )}
+
+          {/* Mobile: unified Save/Export button — hidden in brush tip editor mode */}
+          {!brushTipEditorActive && isMobile && (
+            <div style={{ position: "relative" }}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    data-ocid="bottombar.mobile_save_export_button"
+                    onClick={() => setShowMobileSaveMenu((v) => !v)}
+                    className="w-8 h-8 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                  >
+                    <Download size={16} />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>Save / Export</TooltipContent>
+              </Tooltip>
+              {showMobileSaveMenu && (
+                <>
+                  {/* Backdrop to close menu */}
+                  <div
+                    style={{
+                      position: "fixed",
+                      inset: 0,
+                      zIndex: 998,
+                      background: "rgba(0,0,0,0.45)",
+                    }}
+                    onPointerDown={() => setShowMobileSaveMenu(false)}
+                  />
+                  {/* Dropdown menu — centered in viewport on mobile */}
+                  <div
+                    data-ocid="bottombar.mobile_save_export_menu"
+                    style={{
+                      position: "fixed",
+                      top: "40%",
+                      left: "50%",
+                      transform: "translateX(-50%) translateY(-50%)",
+                      zIndex: 999,
+                      background: "oklch(var(--card))",
+                      border: "1px solid oklch(var(--border))",
+                      borderRadius: 12,
+                      boxShadow: "0 16px 48px rgba(0,0,0,0.45)",
+                      width: "fit-content",
+                      minWidth: 200,
+                      maxWidth: "80vw",
+                      paddingLeft: 24,
+                      paddingRight: 24,
+                      overflow: "hidden",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      data-ocid="bottombar.mobile_save_sktch_item"
+                      onClick={() => {
+                        setShowMobileSaveMenu(false);
+                        onSave();
+                      }}
+                      className="w-full flex items-center gap-3 px-5 text-sm text-foreground hover:bg-muted transition-colors text-left"
+                      style={{ minHeight: 48 }}
+                    >
+                      <Save
+                        size={16}
+                        className="shrink-0 text-muted-foreground"
+                      />
+                      Save as .sktch
+                    </button>
+                    <div className="h-px bg-border" />
+                    <button
+                      type="button"
+                      data-ocid="bottombar.mobile_export_png_item"
+                      onClick={() => {
+                        setShowMobileSaveMenu(false);
+                        onExport();
+                      }}
+                      disabled={isPngExporting}
+                      className="w-full flex items-center gap-3 px-5 text-sm text-foreground hover:bg-muted transition-colors text-left disabled:opacity-40"
+                      style={{ minHeight: 48 }}
+                    >
+                      {isPngExporting ? (
+                        <Loader2
+                          size={16}
+                          className="shrink-0 animate-spin text-muted-foreground"
+                        />
+                      ) : (
+                        <FileImage
+                          size={16}
+                          className="shrink-0 text-muted-foreground"
+                        />
+                      )}
+                      Export as PNG
+                    </button>
+                    <div className="h-px bg-border" />
+                    <button
+                      type="button"
+                      data-ocid="bottombar.mobile_export_jpg_item"
+                      onClick={() => {
+                        setShowMobileSaveMenu(false);
+                        onExportJPG?.();
+                      }}
+                      className="w-full flex items-center gap-3 px-5 text-sm text-foreground hover:bg-muted transition-colors text-left"
+                      style={{ minHeight: 48 }}
+                    >
+                      <FileImage
+                        size={16}
+                        className="shrink-0 text-muted-foreground"
+                      />
+                      Export as JPG
+                    </button>
+                    <div className="h-px bg-border" />
+                    <button
+                      type="button"
+                      data-ocid="bottombar.mobile_export_psd_item"
+                      onClick={() => {
+                        setShowMobileSaveMenu(false);
+                        onExportPSD?.();
+                      }}
+                      disabled={isPsdExporting}
+                      className="w-full flex items-center gap-3 px-5 text-sm text-foreground hover:bg-muted transition-colors text-left disabled:opacity-40"
+                      style={{ minHeight: 48 }}
+                    >
+                      {isPsdExporting ? (
+                        <Loader2
+                          size={16}
+                          className="shrink-0 animate-spin text-muted-foreground"
+                        />
+                      ) : (
+                        <Download
+                          size={16}
+                          className="shrink-0 text-muted-foreground"
+                        />
+                      )}
+                      Export as PSD
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           )}
         </div>
       </div>

@@ -1,13 +1,18 @@
+import { AdminPortal } from "@/components/AdminPortal";
 import { CloseTabDialog } from "@/components/CloseTabDialog";
 import { DocumentTabBar } from "@/components/DocumentTabBar";
+import { MarketplaceScreen } from "@/components/MarketplaceScreen";
 import { NewDocumentModal } from "@/components/NewDocumentModal";
 import { PaintingApp } from "@/components/PaintingApp";
 import { SplashScreen } from "@/components/SplashScreen";
+import { FigureDrawingSetup } from "@/components/learn/FigureDrawingSetup";
+import { SessionEndScreen } from "@/components/learn/SessionEndScreen";
 import { Toaster } from "@/components/ui/sonner";
 import {
   DocumentProvider,
   useDocumentContext,
 } from "@/context/DocumentContext";
+import { useAuth } from "@/hooks/useAuth";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { usePreferences } from "@/hooks/usePreferences";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -20,6 +25,7 @@ import {
   useInternetIdentity,
 } from "./hooks/useInternetIdentity";
 import type { PresetsPayload } from "./hooks/usePresetSystem";
+import type { FigureDrawingConfig, ImageSet } from "./types/learn";
 import { type ThemeId, applyThemeOverrides } from "./utils/themeOverrides";
 
 const queryClient = new QueryClient();
@@ -65,6 +71,18 @@ const SESSION_EXISTS_KEY = "sl_has_session";
 
 // ── AppInner ──────────────────────────────────────────────────────────────────
 
+// Figure drawing session flow state
+type FigureDrawingView =
+  | { mode: "idle" }
+  | { mode: "setup" }
+  | {
+      mode: "session";
+      config: FigureDrawingConfig;
+      imageSets: ImageSet[];
+      handedness: "left" | "right";
+    }
+  | { mode: "end"; snapshots: ImageData[] };
+
 function AppInner() {
   const [softwareWebGL, setSoftwareWebGL] = useState(false);
   const [dismissed, setDismissed] = useState(false);
@@ -73,6 +91,29 @@ function AppInner() {
   const { identity, login, clear } = useInternetIdentity();
   const isLoggedIn = !!identity && !identity.getPrincipal().isAnonymous();
   const { isMobile, forceDesktop } = useIsMobile();
+
+  // Admin status — fetched once per authenticated session via useAuth
+  const { isAdmin } = useAuth();
+
+  // Admin portal state
+  const [showAdminPortal, setShowAdminPortal] = useState(false);
+  const handleAdminPortalBack = useCallback(
+    () => setShowAdminPortal(false),
+    [],
+  );
+
+  // Marketplace state
+  const [showMarketplace, setShowMarketplace] = useState(false);
+  const handleShowMarketplace = useCallback(() => setShowMarketplace(true), []);
+  const handleCloseMarketplace = useCallback(
+    () => setShowMarketplace(false),
+    [],
+  );
+
+  // ── Figure Drawing state ─────────────────────────────────────────────────
+  const [figDrawView, setFigDrawView] = useState<FigureDrawingView>({
+    mode: "idle",
+  });
 
   // ── Preferences (canister-backed) ─────────────────────────────────────────
   const preferences = usePreferences(identity, isLoggedIn);
@@ -212,6 +253,54 @@ function AppInner() {
     clear();
   }, [clear]);
 
+  // ── Learn module handler ─────────────────────────────────────────────────
+
+  const handleLearnModule = useCallback((moduleId: string) => {
+    if (moduleId === "figure-drawing") {
+      setFigDrawView({ mode: "setup" });
+      setShowSplash(false);
+    }
+  }, []);
+
+  // ── Figure Drawing handlers ─────────────────────────────────────────────
+
+  const handleFigureDrawingStart = useCallback(
+    (config: FigureDrawingConfig, imageSets: ImageSet[]) => {
+      // Read handedness from preferences otherSettings
+      let handedness: "left" | "right" = "right";
+      try {
+        const otherSettings = preferences.settings.otherSettings
+          ? JSON.parse(preferences.settings.otherSettings as string)
+          : {};
+        if (otherSettings.leftHanded === true) handedness = "left";
+      } catch {
+        // ignore parse errors
+      }
+
+      setFigDrawView({ mode: "session", config, imageSets, handedness });
+    },
+    [preferences.settings],
+  );
+
+  const handleSessionComplete = useCallback((snapshots: ImageData[]) => {
+    setFigDrawView({ mode: "end", snapshots });
+  }, []);
+
+  const handleSessionAbort = useCallback(() => {
+    setFigDrawView({ mode: "idle" });
+    setShowSplash(true);
+  }, []);
+
+  const handleSessionEndDismiss = useCallback(() => {
+    setFigDrawView({ mode: "idle" });
+    setShowSplash(true);
+  }, []);
+
+  const handleFigureDrawingBack = useCallback(() => {
+    setFigDrawView({ mode: "idle" });
+    setShowSplash(true);
+  }, []);
+
   // ── Brush preset auto-save ────────────────────────────────────────────────
 
   const handlePresetsMutated = useCallback(
@@ -313,6 +402,18 @@ function AppInner() {
     ? identity!.getPrincipal().toString()
     : undefined;
 
+  const isFigureDrawingSession = figDrawView.mode === "session";
+  const figureDrawingSessionProp =
+    isFigureDrawingSession && figDrawView.mode === "session"
+      ? {
+          config: figDrawView.config,
+          imageSets: figDrawView.imageSets,
+          handedness: figDrawView.handedness,
+          onSessionComplete: handleSessionComplete,
+          onAbort: handleSessionAbort,
+        }
+      : null;
+
   return (
     <>
       {softwareWebGL && !dismissed && (
@@ -376,6 +477,8 @@ function AppInner() {
                 getCanvasHash={undefined}
                 preferences={preferences}
                 onBrushTipEditorActiveChange={setBrushTipEditorActive}
+                figureDrawingSession={figureDrawingSessionProp}
+                onNavigateToSplash={() => setShowSplash(true)}
               />
             </div>
 
@@ -426,14 +529,63 @@ function AppInner() {
         )}
       </AnimatePresence>
 
-      {showSplash && (
-        <SplashScreen
-          principalId={principalId}
-          isLoggedIn={isLoggedIn}
-          onLogin={login}
-          onLogout={handleLogout}
-          onNewCanvas={handleNewCanvas}
-          onOpenFile={handleOpenFile}
+      {/* Figure Drawing Setup — shown over splash */}
+      {figDrawView.mode === "setup" && (
+        <div
+          data-ocid="figure_drawing_setup.overlay"
+          className="fixed inset-0 z-[9000] flex items-center justify-center"
+          style={{
+            background: "oklch(var(--canvas-bg) / 0.97)",
+            backdropFilter: "blur(12px)",
+          }}
+        >
+          <FigureDrawingSetup
+            onStart={handleFigureDrawingStart}
+            onBack={handleFigureDrawingBack}
+            onShowMarketplace={handleShowMarketplace}
+          />
+        </div>
+      )}
+
+      {/* Session End Screen */}
+      {figDrawView.mode === "end" && (
+        <SessionEndScreen
+          snapshots={figDrawView.snapshots}
+          onDismiss={handleSessionEndDismiss}
+        />
+      )}
+
+      {showSplash &&
+        figDrawView.mode === "idle" &&
+        !showAdminPortal &&
+        !showMarketplace && (
+          <SplashScreen
+            principalId={principalId}
+            isLoggedIn={isLoggedIn}
+            onLogin={login}
+            onLogout={handleLogout}
+            onNewCanvas={handleNewCanvas}
+            onOpenFile={handleOpenFile}
+            onLearnModule={handleLearnModule}
+            onStartFigureDrawing={(config, imageSets) => {
+              setShowSplash(false);
+              handleFigureDrawingStart(config, imageSets);
+            }}
+            onAdminPortal={() => setShowAdminPortal(true)}
+            onShowMarketplace={handleShowMarketplace}
+          />
+        )}
+
+      {/* Admin Portal — takes full screen, only for admins */}
+      {showAdminPortal && isAdmin && (
+        <AdminPortal onBack={handleAdminPortalBack} />
+      )}
+
+      {/* Marketplace — full-screen overlay */}
+      {showMarketplace && (
+        <MarketplaceScreen
+          onClose={handleCloseMarketplace}
+          identity={identity ?? undefined}
         />
       )}
 

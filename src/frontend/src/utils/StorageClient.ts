@@ -1,4 +1,4 @@
-import { type HttpAgent, isV3ResponseBody } from "@icp-sdk/core/agent";
+import type { HttpAgent } from "@icp-sdk/core/agent";
 import { IDL } from "@icp-sdk/core/candid";
 
 type Headers = Record<string, string>;
@@ -484,15 +484,92 @@ export class StorageClient {
   private async getCertificate(hash: string): Promise<Uint8Array> {
     const args = IDL.encode([IDL.Text], [hash]);
     const result = await this.agent.call(this.backendCanisterId, {
-      methodName: "_caffeineStorageCreateCertificate",
+      methodName: "_immutableObjectStorageCreateCertificate",
       arg: args,
     });
-    const respone = result.response.body;
-    if (isV3ResponseBody(respone)) {
-      console.log("Certificate:", respone.certificate);
-      return respone.certificate;
+    console.log("[StorageClient] getCertificate raw response:", result);
+    const responseBody = result?.response?.body;
+    // V3 response body has a `certificate` field containing the signed bytes.
+    // The field may be a Uint8Array, ArrayBuffer, another ArrayBufferView, or a plain number array
+    // depending on how the ICP agent deserializes it — handle all cases.
+    if (
+      responseBody !== null &&
+      responseBody !== undefined &&
+      typeof responseBody === "object" &&
+      "certificate" in responseBody
+    ) {
+      const certRaw = (responseBody as unknown as Record<string, unknown>)
+        .certificate;
+      if (certRaw != null) {
+        let certBytes: Uint8Array | null = null;
+        if (certRaw instanceof Uint8Array) {
+          certBytes = certRaw;
+        } else if (certRaw instanceof ArrayBuffer) {
+          certBytes = new Uint8Array(certRaw);
+        } else if (ArrayBuffer.isView(certRaw)) {
+          certBytes = new Uint8Array(
+            (certRaw as ArrayBufferView).buffer,
+            (certRaw as ArrayBufferView).byteOffset,
+            (certRaw as ArrayBufferView).byteLength,
+          );
+        } else if (
+          Array.isArray(certRaw) &&
+          certRaw.length > 0 &&
+          typeof certRaw[0] === "number"
+        ) {
+          certBytes = new Uint8Array(certRaw as number[]);
+        }
+        if (certBytes !== null && certBytes.length > 0) {
+          console.log(
+            "[StorageClient] getCertificate: decoded certificate bytes, length:",
+            certBytes.length,
+          );
+          return certBytes;
+        }
+      }
     }
-    throw new Error("Expected v3 response body");
+    // Fallback: scan all values in the response body for any binary-like value
+    if (
+      responseBody !== null &&
+      responseBody !== undefined &&
+      typeof responseBody === "object"
+    ) {
+      console.warn(
+        "[StorageClient] getCertificate: v3 certificate field not found, scanning response body:",
+        responseBody,
+      );
+      for (const value of Object.values(
+        responseBody as unknown as Record<string, unknown>,
+      )) {
+        if (value != null) {
+          let bytes: Uint8Array | null = null;
+          if (value instanceof Uint8Array) bytes = value;
+          else if (value instanceof ArrayBuffer) bytes = new Uint8Array(value);
+          else if (ArrayBuffer.isView(value))
+            bytes = new Uint8Array(
+              (value as ArrayBufferView).buffer,
+              (value as ArrayBufferView).byteOffset,
+              (value as ArrayBufferView).byteLength,
+            );
+          else if (
+            Array.isArray(value) &&
+            value.length > 0 &&
+            typeof value[0] === "number"
+          )
+            bytes = new Uint8Array(value as number[]);
+          if (bytes !== null && bytes.length > 0) {
+            console.log(
+              "[StorageClient] getCertificate: found certificate bytes in fallback scan, length:",
+              bytes.length,
+            );
+            return bytes;
+          }
+        }
+      }
+    }
+    throw new Error(
+      `getCertificate: expected v3 response body with certificate field, got: ${JSON.stringify(responseBody)}`,
+    );
   }
 
   public async putFile(

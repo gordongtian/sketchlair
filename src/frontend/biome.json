@@ -4,6 +4,8 @@
     "ignore": [
       "**/backend.ts",
       "**/backend.d.ts",
+      "**/payments.ts",
+      "**/payments.d.ts",
       "dist/**",
       "node_modules/**",
       "build/**",

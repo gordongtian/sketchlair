@@ -86,7 +86,7 @@ export interface UsePresetSystemReturn {
   brushSizesRef: React.MutableRefObject<BrushSizes>;
   /** PaintingApp must keep this in sync: brushOpacityRef.current = color.a */
   brushOpacityRef: React.MutableRefObject<number>;
-  toolSizesRef: React.MutableRefObject<Record<string, number>>;
+  toolSizesRef: React.MutableRefObject<Record<string, number | undefined>>;
   toolOpacitiesRef: React.MutableRefObject<Record<string, number>>;
   toolFlowsRef: React.MutableRefObject<Record<string, number>>;
 
@@ -171,11 +171,11 @@ export function usePresetSystem({
     eraser: DEFAULT_PRESETS.eraser[0]?.defaultSize ?? 24,
   });
   const brushOpacityRef = useRef(1);
-  const toolSizesRef = useRef<Record<string, number>>({
-    brush: DEFAULT_PRESETS.brush[0]?.defaultSize ?? 24,
-    eraser: DEFAULT_PRESETS.eraser[0]?.defaultSize ?? 24,
-    smudge: DEFAULT_PRESETS.smudge[0]?.defaultSize ?? 24,
-  });
+  // Intentionally initialized as empty so that on first load the tool-switch
+  // effect falls through to `preset.defaultSize` rather than a stale hardcoded
+  // value.  `loadPresets` populates this from the active preset's defaultSize,
+  // and `handleCanvasBrushSizeChange` writes explicit user adjustments.
+  const toolSizesRef = useRef<Record<string, number | undefined>>({});
   const toolOpacitiesRef = useRef<Record<string, number>>({});
   const toolFlowsRef = useRef<Record<string, number>>({});
 
@@ -277,9 +277,13 @@ export function usePresetSystem({
             flow:
               preset.defaultFlow !== undefined ? preset.defaultFlow : prev.flow,
           }));
-          // Restore preset's stored size if defined, otherwise restore tool's stored size
+          // Restore size: prefer an explicit user adjustment stored in toolSizesRef,
+          // then fall back to the preset's defaultSize, then to preset.size.
           const sizeKey = activeTool === "eraser" ? "eraser" : "brush";
-          const restoredSize = toolSizesRef.current[activeTool] ?? preset.size;
+          const restoredSize =
+            toolSizesRef.current[activeTool] ??
+            preset.defaultSize ??
+            preset.size;
           if (restoredSize !== undefined) {
             setBrushSizes((prev) => ({ ...prev, [sizeKey]: restoredSize }));
           }
@@ -682,19 +686,52 @@ export function usePresetSystem({
         activeIds: safeActiveIds,
       });
 
+      // Seed toolSizesRef from each tool's active preset so that on first
+      // tool-switch the effect reads the correct defaultSize rather than
+      // whatever hardcoded fallback was used at mount.
+      const toolPresetMap: Array<{
+        tool: "brush" | "smudge" | "eraser";
+        list: Preset[];
+      }> = [
+        { tool: "brush", list: safeBrush },
+        { tool: "smudge", list: safeSmudge },
+        { tool: "eraser", list: safeEraser },
+      ];
+      for (const { tool, list } of toolPresetMap) {
+        const id = safeActiveIds[tool];
+        const preset = id ? list.find((p) => p.id === id) : list[0];
+        if (preset) {
+          const size = preset.defaultSize ?? preset.size;
+          if (size !== undefined) {
+            toolSizesRef.current[tool] = size;
+          }
+        }
+      }
+
       // Restore brush settings for the currently active brush preset
       const activeBrushId = safeActiveIds.brush;
       const activePreset = activeBrushId
         ? safeBrush.find((p) => p.id === activeBrushId)
         : null;
-      if (activePreset?.settings) {
-        const s = { ...activePreset.settings };
-        if (activePreset.defaultFlow !== undefined)
-          s.flow = activePreset.defaultFlow;
-        setBrushSettings(s);
+      if (activePreset) {
+        if (activePreset.settings) {
+          const s = { ...activePreset.settings };
+          if (activePreset.defaultFlow !== undefined)
+            s.flow = activePreset.defaultFlow;
+          setBrushSettings(s);
+        }
+        // Apply the correct size immediately so the UI reflects the preset
+        const correctSize = activePreset.defaultSize ?? activePreset.size;
+        if (correctSize !== undefined) {
+          setBrushSizes((prev) => ({ ...prev, brush: correctSize }));
+          brushSizesRef.current = {
+            ...brushSizesRef.current,
+            brush: correctSize,
+          };
+        }
       }
     },
-    [setBrushSettings],
+    [setBrushSettings, setBrushSizes],
   );
 
   // ── Slider change helpers ────────────────────────────────────────────────────

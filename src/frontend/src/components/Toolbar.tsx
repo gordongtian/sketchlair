@@ -11,15 +11,15 @@ import {
   Crop,
   Eraser,
   FlipHorizontal2,
-  FolderOpen,
   Hand,
+  House,
   Lasso,
   Maximize2,
+  Minus,
   PaintBucket,
   Pipette,
   RotateCcw,
   Ruler,
-  Save,
   Settings,
   SlidersHorizontal,
   Square,
@@ -27,11 +27,13 @@ import {
   Waves,
   ZoomIn,
 } from "lucide-react";
+import { useState } from "react";
 
 export type Tool =
   | "brush"
   | "eraser"
   | "smudge"
+  | "line"
   | "fill"
   | "eyedropper"
   | "lasso"
@@ -79,6 +81,14 @@ const GROUP1_TOOLS: {
     label: "Smudge",
     shortcut: "S",
     ocid: "toolbar.smudge_button",
+  },
+  {
+    id: "line",
+    icon: <Minus size={20} />,
+    mobileIcon: <Minus size={17} />,
+    label: "Line",
+    shortcut: "N",
+    ocid: "toolbar.line_button",
   },
   {
     id: "liquify",
@@ -174,6 +184,7 @@ interface ToolbarProps {
   onOpenFile: () => void;
   hasUnsavedChanges: boolean;
   isMobile?: boolean;
+  onNavigateToSplash?: () => void;
 }
 
 export function Toolbar({
@@ -192,10 +203,22 @@ export function Toolbar({
   onFlipToggle,
   onAdminOpen,
   onSaveFile,
-  onOpenFile,
+  // onOpenFile is kept in props for API compatibility but not rendered on desktop toolbar
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  onOpenFile: _onOpenFile,
   hasUnsavedChanges,
   isMobile = false,
+  onNavigateToSplash,
 }: ToolbarProps) {
+  const [showUnsavedDialog, setShowUnsavedDialog] = useState(false);
+
+  const handleHomeTap = () => {
+    if (hasUnsavedChanges) {
+      setShowUnsavedDialog(true);
+    } else {
+      onNavigateToSplash?.();
+    }
+  };
   // On mobile: smaller buttons to fit more tools, and zoom/rotate/pan are hidden
   const btnCls = isMobile
     ? "w-8 h-8 flex items-center justify-center rounded transition-all duration-100"
@@ -236,6 +259,26 @@ export function Toolbar({
             scrollbarWidth: "none" as React.CSSProperties["scrollbarWidth"],
           }}
         >
+          {/* Mobile-only: Home button at the very top */}
+          {isMobile && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  data-ocid="toolbar.home_button"
+                  onClick={handleHomeTap}
+                  className={`${btnCls} text-muted-foreground hover:text-foreground hover:bg-muted`}
+                >
+                  <House size={17} />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="right">
+                <span>Home</span>
+              </TooltipContent>
+            </Tooltip>
+          )}
+          {/* Mobile home divider */}
+          {isMobile && <div className="w-6 border-t border-border my-1" />}
           {/* ── Group 1: Paint tools ── */}
           {GROUP1_TOOLS.map((tool) => (
             <Tooltip key={tool.id}>
@@ -380,7 +423,13 @@ export function Toolbar({
               <button
                 type="button"
                 data-ocid="toolbar.ruler_button"
-                onClick={() => onToolChange("ruler")}
+                onClick={() => {
+                  if (activeTool === "ruler") {
+                    onToolReselect("ruler");
+                  } else {
+                    onToolChange("ruler");
+                  }
+                }}
                 className={`${btnCls} ${
                   activeTool === "ruler" || activeSubpanel === "ruler"
                     ? "bg-primary text-primary-foreground shadow-md"
@@ -402,7 +451,13 @@ export function Toolbar({
               <button
                 type="button"
                 data-ocid="toolbar.adjustments_button"
-                onClick={() => onToolChange("adjustments")}
+                onClick={() => {
+                  if (activeTool === "adjustments") {
+                    onToolReselect("adjustments");
+                  } else {
+                    onToolChange("adjustments");
+                  }
+                }}
                 className={`${btnCls} ${
                   activeTool === "adjustments" ||
                   activeSubpanel === "adjustments"
@@ -611,45 +666,6 @@ export function Toolbar({
             borderTop: "1px solid oklch(var(--border))",
           }}
         >
-          {/* Save file button */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                data-ocid="toolbar.save_button"
-                onClick={onSaveFile}
-                className={`relative ${bottomBtnCls}`}
-              >
-                <Save size={isMobile ? 16 : 18} />
-                {hasUnsavedChanges && (
-                  <span className="absolute top-1 right-1 w-1.5 h-1.5 bg-orange-400 rounded-full" />
-                )}
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right" className="flex items-center gap-2">
-              <span>Save</span>
-              <kbd className="text-xs bg-muted px-1 rounded">Ctrl+S</kbd>
-            </TooltipContent>
-          </Tooltip>
-
-          {/* Open file button */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                data-ocid="toolbar.open_button"
-                onClick={onOpenFile}
-                className={bottomBtnCls}
-              >
-                <FolderOpen size={isMobile ? 16 : 18} />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right" className="flex items-center gap-2">
-              <span>Open</span>
-              <kbd className="text-xs bg-muted px-1 rounded">Ctrl+O</kbd>
-            </TooltipContent>
-          </Tooltip>
-
           {/* Settings */}
           <Tooltip>
             <TooltipTrigger asChild>
@@ -668,6 +684,113 @@ export function Toolbar({
           </Tooltip>
         </div>
       </div>
+
+      {/* Mobile-only: Unsaved Changes Dialog */}
+      {isMobile && showUnsavedDialog && (
+        <div
+          data-ocid="toolbar.unsaved_dialog"
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 9999,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(0,0,0,0.6)",
+            backdropFilter: "blur(4px)",
+          }}
+        >
+          <div
+            style={{
+              background: "oklch(var(--card))",
+              border: "1px solid oklch(var(--border))",
+              borderRadius: 12,
+              padding: "24px 20px",
+              width: 300,
+              boxShadow: "0 16px 48px rgba(0,0,0,0.5)",
+              display: "flex",
+              flexDirection: "column",
+              gap: 16,
+            }}
+          >
+            <p
+              style={{
+                margin: 0,
+                fontSize: 15,
+                fontWeight: 600,
+                textAlign: "center",
+                color: "oklch(var(--foreground))",
+              }}
+            >
+              You have unsaved changes
+            </p>
+            <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+              <button
+                type="button"
+                data-ocid="toolbar.unsaved_discard_button"
+                onClick={() => {
+                  setShowUnsavedDialog(false);
+                  onNavigateToSplash?.();
+                }}
+                style={{
+                  flex: 1,
+                  padding: "8px 12px",
+                  borderRadius: 6,
+                  border: "1px solid oklch(var(--border))",
+                  background: "oklch(var(--muted))",
+                  color: "oklch(var(--foreground))",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                }}
+              >
+                Discard
+              </button>
+              <button
+                type="button"
+                data-ocid="toolbar.unsaved_cancel_button"
+                onClick={() => setShowUnsavedDialog(false)}
+                style={{
+                  flex: 1,
+                  padding: "8px 12px",
+                  borderRadius: 6,
+                  border: "1px solid oklch(var(--border))",
+                  background: "oklch(var(--muted))",
+                  color: "oklch(var(--foreground))",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+            <button
+              type="button"
+              data-ocid="toolbar.unsaved_save_button"
+              onClick={async () => {
+                setShowUnsavedDialog(false);
+                onSaveFile();
+                // Navigate after a brief delay to allow save to complete
+                setTimeout(() => onNavigateToSplash?.(), 300);
+              }}
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                borderRadius: 6,
+                border: "none",
+                background: "oklch(var(--primary))",
+                color: "oklch(var(--primary-foreground))",
+                fontSize: 14,
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      )}
     </TooltipProvider>
   );
 }
