@@ -30,14 +30,22 @@ export const UserRole = IDL.Variant({
   'user' : IDL.Null,
   'guest' : IDL.Null,
 });
+export const ContentType = IDL.Variant({
+  'learningmodule' : IDL.Null,
+  'referencepack' : IDL.Null,
+});
 export const ImageSet = IDL.Record({
   'id' : IDL.Text,
+  'contentType' : ContentType,
   'name' : IDL.Text,
   'tags' : IDL.Vec(IDL.Text),
   'imageCount' : IDL.Nat,
+  'description' : IDL.Text,
   'isFree' : IDL.Bool,
   'previewThumbnail' : IDL.Text,
   'isDefault' : IDL.Bool,
+  'isSubscriberContent' : IDL.Bool,
+  'priceUsdCents' : IDL.Opt(IDL.Nat),
   'priceICP' : IDL.Opt(IDL.Text),
   'images' : IDL.Vec(ImageReference),
 });
@@ -51,6 +59,17 @@ export const PublicImageSet = IDL.Record({
 });
 export const UserProfile = IDL.Record({ 'name' : IDL.Text });
 export const CanvasSave = IDL.Text;
+export const CatalogItem = IDL.Record({
+  'id' : IDL.Text,
+  'contentType' : ContentType,
+  'name' : IDL.Text,
+  'imageCount' : IDL.Nat,
+  'description' : IDL.Text,
+  'isFree' : IDL.Bool,
+  'previewThumbnail' : IDL.Text,
+  'isSubscriberContent' : IDL.Bool,
+  'priceUsdCents' : IDL.Opt(IDL.Nat),
+});
 export const BrushPreset = IDL.Record({
   'id' : IDL.Text,
   'modifiedAt' : IDL.Int,
@@ -76,6 +95,10 @@ export const UserPreferences = IDL.Record({
   'lastModified' : IDL.Int,
   'settings' : AppSettings,
   'schemaVersion' : IDL.Nat,
+});
+export const SubscriptionStatus = IDL.Record({
+  'active' : IDL.Bool,
+  'expiryDateMs' : IDL.Opt(IDL.Nat64),
 });
 export const SettingsSave = IDL.Text;
 
@@ -118,6 +141,8 @@ export const idlService = IDL.Service({
     ),
   'deleteBrush' : IDL.Func([IDL.Text], [], []),
   'deleteImageSet' : IDL.Func([IDL.Text], [IDL.Bool], []),
+  'deleteMascotAnimation' : IDL.Func([IDL.Text], [IDL.Bool], []),
+  'deleteMascotExpression' : IDL.Func([IDL.Text], [IDL.Bool], []),
   'getAllImageSetsAdmin' : IDL.Func([], [IDL.Vec(ImageSet)], []),
   'getAllPublicImageSets' : IDL.Func([], [IDL.Vec(PublicImageSet)], ['query']),
   'getAvailableImageSets' : IDL.Func([], [IDL.Vec(ImageSet)], ['query']),
@@ -125,9 +150,34 @@ export const idlService = IDL.Service({
   'getCallerUserProfile' : IDL.Func([], [IDL.Opt(UserProfile)], ['query']),
   'getCallerUserRole' : IDL.Func([], [UserRole], ['query']),
   'getCanvasHash' : IDL.Func([], [IDL.Opt(CanvasSave)], ['query']),
+  'getFullCatalog' : IDL.Func(
+      [],
+      [
+        IDL.Record({
+          'packs' : IDL.Vec(CatalogItem),
+          'modules' : IDL.Vec(CatalogItem),
+        }),
+      ],
+      ['query'],
+    ),
+  'getGuideScript' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
+  'getMascotAssets' : IDL.Func(
+      [],
+      [
+        IDL.Record({
+          'defaultIdleAnimationName' : IDL.Opt(IDL.Text),
+          'animations' : IDL.Vec(IDL.Tuple(IDL.Text, IDL.Text)),
+          'expressions' : IDL.Vec(IDL.Tuple(IDL.Text, IDL.Text)),
+          'defaultExpressionName' : IDL.Opt(IDL.Text),
+        }),
+      ],
+      ['query'],
+    ),
+  'getModuleScript' : IDL.Func([IDL.Text], [IDL.Opt(IDL.Text)], ['query']),
   'getMyUsername' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
   'getPreferences' : IDL.Func([], [IDL.Opt(UserPreferences)], []),
   'getSchemaVersion' : IDL.Func([], [IDL.Nat], ['query']),
+  'getSubscriptionStatus' : IDL.Func([], [SubscriptionStatus], ['query']),
   'getUserEntitlements' : IDL.Func([], [IDL.Vec(IDL.Text)], ['query']),
   'getUserImageSets' : IDL.Func([], [IDL.Vec(ImageSet)], []),
   'getUserProfile' : IDL.Func(
@@ -143,23 +193,45 @@ export const idlService = IDL.Service({
     ),
   'grantEntitlement' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], []),
   'grantPackEntitlement' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], []),
+  'grantSubscription' : IDL.Func(
+      [IDL.Principal, IDL.Text, IDL.Nat64],
+      [IDL.Bool],
+      [],
+    ),
   'isAdmin' : IDL.Func([IDL.Principal], [IDL.Bool], ['query']),
   'isCallerAdmin' : IDL.Func([], [IDL.Bool], ['query']),
+  'isEntitledTo' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], ['query']),
   'registerUsername' : IDL.Func([IDL.Text], [IDL.Bool], []),
   'removeAdmin' : IDL.Func([IDL.Principal], [IDL.Bool], []),
   'removeImageFromSet' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
   'renameSet' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
   'revokeEntitlement' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], []),
+  'revokeSubscription' : IDL.Func([IDL.Principal], [IDL.Bool], []),
   'saveBrush' : IDL.Func([BrushPreset], [], []),
   'saveBrushPresets' : IDL.Func([IDL.Text], [], []),
   'saveCallerUserProfile' : IDL.Func([UserProfile], [], []),
   'saveCanvasHash' : IDL.Func([CanvasSave], [], []),
+  'saveGuideScript' : IDL.Func([IDL.Text], [IDL.Bool], []),
+  'saveModuleScript' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
   'savePreferences' : IDL.Func([UserPreferences], [], []),
   'saveUserSettings' : IDL.Func([SettingsSave], [], []),
+  'setContentType' : IDL.Func([IDL.Text, ContentType], [IDL.Bool], []),
+  'setDefaultExpression' : IDL.Func([IDL.Text], [IDL.Bool], []),
+  'setDefaultIdleAnimation' : IDL.Func([IDL.Text], [IDL.Bool], []),
+  'setDescription' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
   'setImageSetDefault' : IDL.Func([IDL.Text], [IDL.Bool], []),
   'setImageSetPrice' : IDL.Func([IDL.Text, IDL.Opt(IDL.Text)], [IDL.Bool], []),
   'setPaymentsCanisterPrincipal' : IDL.Func([IDL.Principal], [IDL.Bool], []),
+  'setPriceUsdCents' : IDL.Func([IDL.Text, IDL.Opt(IDL.Nat)], [IDL.Bool], []),
+  'setSubscriberContent' : IDL.Func([IDL.Text, IDL.Bool], [IDL.Bool], []),
   'updateSetTags' : IDL.Func([IDL.Text, IDL.Vec(IDL.Text)], [IDL.Bool], []),
+  'updateSubscriptionExpiry' : IDL.Func(
+      [IDL.Principal, IDL.Nat64],
+      [IDL.Bool],
+      [],
+    ),
+  'uploadMascotAnimation' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
+  'uploadMascotExpression' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
 });
 
 export const idlInitArgs = [];
@@ -187,14 +259,22 @@ export const idlFactory = ({ IDL }) => {
     'user' : IDL.Null,
     'guest' : IDL.Null,
   });
+  const ContentType = IDL.Variant({
+    'learningmodule' : IDL.Null,
+    'referencepack' : IDL.Null,
+  });
   const ImageSet = IDL.Record({
     'id' : IDL.Text,
+    'contentType' : ContentType,
     'name' : IDL.Text,
     'tags' : IDL.Vec(IDL.Text),
     'imageCount' : IDL.Nat,
+    'description' : IDL.Text,
     'isFree' : IDL.Bool,
     'previewThumbnail' : IDL.Text,
     'isDefault' : IDL.Bool,
+    'isSubscriberContent' : IDL.Bool,
+    'priceUsdCents' : IDL.Opt(IDL.Nat),
     'priceICP' : IDL.Opt(IDL.Text),
     'images' : IDL.Vec(ImageReference),
   });
@@ -208,6 +288,17 @@ export const idlFactory = ({ IDL }) => {
   });
   const UserProfile = IDL.Record({ 'name' : IDL.Text });
   const CanvasSave = IDL.Text;
+  const CatalogItem = IDL.Record({
+    'id' : IDL.Text,
+    'contentType' : ContentType,
+    'name' : IDL.Text,
+    'imageCount' : IDL.Nat,
+    'description' : IDL.Text,
+    'isFree' : IDL.Bool,
+    'previewThumbnail' : IDL.Text,
+    'isSubscriberContent' : IDL.Bool,
+    'priceUsdCents' : IDL.Opt(IDL.Nat),
+  });
   const BrushPreset = IDL.Record({
     'id' : IDL.Text,
     'modifiedAt' : IDL.Int,
@@ -233,6 +324,10 @@ export const idlFactory = ({ IDL }) => {
     'lastModified' : IDL.Int,
     'settings' : AppSettings,
     'schemaVersion' : IDL.Nat,
+  });
+  const SubscriptionStatus = IDL.Record({
+    'active' : IDL.Bool,
+    'expiryDateMs' : IDL.Opt(IDL.Nat64),
   });
   const SettingsSave = IDL.Text;
   
@@ -275,6 +370,8 @@ export const idlFactory = ({ IDL }) => {
       ),
     'deleteBrush' : IDL.Func([IDL.Text], [], []),
     'deleteImageSet' : IDL.Func([IDL.Text], [IDL.Bool], []),
+    'deleteMascotAnimation' : IDL.Func([IDL.Text], [IDL.Bool], []),
+    'deleteMascotExpression' : IDL.Func([IDL.Text], [IDL.Bool], []),
     'getAllImageSetsAdmin' : IDL.Func([], [IDL.Vec(ImageSet)], []),
     'getAllPublicImageSets' : IDL.Func(
         [],
@@ -286,9 +383,34 @@ export const idlFactory = ({ IDL }) => {
     'getCallerUserProfile' : IDL.Func([], [IDL.Opt(UserProfile)], ['query']),
     'getCallerUserRole' : IDL.Func([], [UserRole], ['query']),
     'getCanvasHash' : IDL.Func([], [IDL.Opt(CanvasSave)], ['query']),
+    'getFullCatalog' : IDL.Func(
+        [],
+        [
+          IDL.Record({
+            'packs' : IDL.Vec(CatalogItem),
+            'modules' : IDL.Vec(CatalogItem),
+          }),
+        ],
+        ['query'],
+      ),
+    'getGuideScript' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
+    'getMascotAssets' : IDL.Func(
+        [],
+        [
+          IDL.Record({
+            'defaultIdleAnimationName' : IDL.Opt(IDL.Text),
+            'animations' : IDL.Vec(IDL.Tuple(IDL.Text, IDL.Text)),
+            'expressions' : IDL.Vec(IDL.Tuple(IDL.Text, IDL.Text)),
+            'defaultExpressionName' : IDL.Opt(IDL.Text),
+          }),
+        ],
+        ['query'],
+      ),
+    'getModuleScript' : IDL.Func([IDL.Text], [IDL.Opt(IDL.Text)], ['query']),
     'getMyUsername' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
     'getPreferences' : IDL.Func([], [IDL.Opt(UserPreferences)], []),
     'getSchemaVersion' : IDL.Func([], [IDL.Nat], ['query']),
+    'getSubscriptionStatus' : IDL.Func([], [SubscriptionStatus], ['query']),
     'getUserEntitlements' : IDL.Func([], [IDL.Vec(IDL.Text)], ['query']),
     'getUserImageSets' : IDL.Func([], [IDL.Vec(ImageSet)], []),
     'getUserProfile' : IDL.Func(
@@ -308,19 +430,32 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Bool],
         [],
       ),
+    'grantSubscription' : IDL.Func(
+        [IDL.Principal, IDL.Text, IDL.Nat64],
+        [IDL.Bool],
+        [],
+      ),
     'isAdmin' : IDL.Func([IDL.Principal], [IDL.Bool], ['query']),
     'isCallerAdmin' : IDL.Func([], [IDL.Bool], ['query']),
+    'isEntitledTo' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], ['query']),
     'registerUsername' : IDL.Func([IDL.Text], [IDL.Bool], []),
     'removeAdmin' : IDL.Func([IDL.Principal], [IDL.Bool], []),
     'removeImageFromSet' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
     'renameSet' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
     'revokeEntitlement' : IDL.Func([IDL.Principal, IDL.Text], [IDL.Bool], []),
+    'revokeSubscription' : IDL.Func([IDL.Principal], [IDL.Bool], []),
     'saveBrush' : IDL.Func([BrushPreset], [], []),
     'saveBrushPresets' : IDL.Func([IDL.Text], [], []),
     'saveCallerUserProfile' : IDL.Func([UserProfile], [], []),
     'saveCanvasHash' : IDL.Func([CanvasSave], [], []),
+    'saveGuideScript' : IDL.Func([IDL.Text], [IDL.Bool], []),
+    'saveModuleScript' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
     'savePreferences' : IDL.Func([UserPreferences], [], []),
     'saveUserSettings' : IDL.Func([SettingsSave], [], []),
+    'setContentType' : IDL.Func([IDL.Text, ContentType], [IDL.Bool], []),
+    'setDefaultExpression' : IDL.Func([IDL.Text], [IDL.Bool], []),
+    'setDefaultIdleAnimation' : IDL.Func([IDL.Text], [IDL.Bool], []),
+    'setDescription' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
     'setImageSetDefault' : IDL.Func([IDL.Text], [IDL.Bool], []),
     'setImageSetPrice' : IDL.Func(
         [IDL.Text, IDL.Opt(IDL.Text)],
@@ -328,7 +463,16 @@ export const idlFactory = ({ IDL }) => {
         [],
       ),
     'setPaymentsCanisterPrincipal' : IDL.Func([IDL.Principal], [IDL.Bool], []),
+    'setPriceUsdCents' : IDL.Func([IDL.Text, IDL.Opt(IDL.Nat)], [IDL.Bool], []),
+    'setSubscriberContent' : IDL.Func([IDL.Text, IDL.Bool], [IDL.Bool], []),
     'updateSetTags' : IDL.Func([IDL.Text, IDL.Vec(IDL.Text)], [IDL.Bool], []),
+    'updateSubscriptionExpiry' : IDL.Func(
+        [IDL.Principal, IDL.Nat64],
+        [IDL.Bool],
+        [],
+      ),
+    'uploadMascotAnimation' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
+    'uploadMascotExpression' : IDL.Func([IDL.Text, IDL.Text], [IDL.Bool], []),
   });
 };
 

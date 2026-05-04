@@ -9,9 +9,9 @@ interface PressureCurveEditorProps {
 
 const PRESETS: { label: string; value: CP }[] = [
   { label: "Linear", value: [0.25, 0.25, 0.75, 0.75] },
-  { label: "Light", value: [0.1, 0.5, 0.5, 0.9] },
-  { label: "Heavy", value: [0.5, 0.1, 0.9, 0.5] },
   { label: "S-Curve", value: [0.1, 0.4, 0.9, 0.6] },
+  { label: "Heavy", value: [0.5, 0.1, 0.9, 0.5] },
+  { label: "Light", value: [0.1, 0.5, 0.5, 0.9] },
 ];
 
 const SIZE = 160;
@@ -223,8 +223,15 @@ export function PressureCurveEditor({
         onPointerCancel={onPointerUp}
         className="rounded"
       />
-      {/* Preset buttons */}
-      <div className="grid grid-cols-4 gap-1">
+      {/* Preset buttons — 2×2 grid, auto-width (compact) */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(2, auto)",
+          justifyContent: "start",
+          gap: 4,
+        }}
+      >
         {PRESETS.map((p) => (
           <button
             key={p.label}
@@ -236,13 +243,6 @@ export function PressureCurveEditor({
           </button>
         ))}
       </div>
-      <button
-        type="button"
-        onClick={() => onChange([0.25, 0.25, 0.75, 0.75])}
-        className="w-full text-xs py-1 rounded bg-muted/50 hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
-      >
-        Reset to Linear
-      </button>
     </div>
   );
 }

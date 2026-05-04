@@ -17,6 +17,10 @@ interface ColorPickerPanelProps {
   onColorChange: (color: HSVAColor) => void;
   recentColors: string[];
   onRecentColorClick: (hex: string) => void;
+  /** Called when user picks a color — used by mobile to bring the panel to front */
+  onInteract?: () => void;
+  /** When true, renders the compact mobile layout */
+  isMobile?: boolean;
 }
 
 // ---- Photoshop-style Gradient Slider ----
@@ -131,6 +135,8 @@ export function ColorPickerPanel({
   onColorChange,
   recentColors,
   onRecentColorClick,
+  onInteract,
+  isMobile = false,
 }: ColorPickerPanelProps) {
   const svCanvasRef = useRef<HTMLCanvasElement>(null);
   const svContainerRef = useRef<HTMLDivElement>(null);
@@ -140,6 +146,7 @@ export function ColorPickerPanel({
   const isDraggingHue = useRef(false);
   const colorRef = useRef(color);
   const onColorChangeRef = useRef(onColorChange);
+  const onInteractRef = useRef(onInteract);
   const [showSV, setShowSV] = useState(true);
   const [showHue, setShowHue] = useState(true);
   const [showHex, setShowHex] = useState(false);
@@ -149,23 +156,26 @@ export function ColorPickerPanel({
 
   // Track the canvas pixel dimensions so we can draw at the right resolution
   const [svPixelW, setSvPixelW] = useState(194);
-  const SV_HEIGHT = 150;
+  const [svPixelH, setSvPixelH] = useState(isMobile ? 140 : 150);
+  const SV_HEIGHT = isMobile ? svPixelH : 150;
 
-  // ResizeObserver: keep canvas pixel width in sync with its CSS display width.
+  // ResizeObserver: keep canvas pixel width (and height on mobile) in sync with its CSS display size.
   // showSV is included so we re-observe whenever the container remounts.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: showSV triggers re-observe after container remount
+  // biome-ignore lint/correctness/useExhaustiveDependencies: showSV/isMobile triggers re-observe after container remount
   useEffect(() => {
     const container = svContainerRef.current;
     if (!container) return;
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const w = Math.round(entry.contentRect.width);
+        const h = Math.round(entry.contentRect.height);
         if (w > 0) setSvPixelW(w);
+        if (isMobile && h > 0) setSvPixelH(h);
       }
     });
     observer.observe(container);
     return () => observer.disconnect();
-  }, [showSV]);
+  }, [showSV, isMobile]);
 
   const drawSVSquare = useCallback(() => {
     const canvas = svCanvasRef.current;
@@ -224,11 +234,11 @@ export function ColorPickerPanel({
     ctx.fillRect(cx - 1, 0, 2, height);
   }, [color.h]);
 
-  // Redraw SV square whenever color or canvas pixel width changes
+  // Redraw SV square whenever color or canvas pixel dimensions change
   // biome-ignore lint/correctness/useExhaustiveDependencies: showSV triggers redraw after canvas remount
   useEffect(() => {
     drawSVSquare();
-  }, [drawSVSquare, showSV, svPixelW]);
+  }, [drawSVSquare, showSV, svPixelW, svPixelH]);
   // biome-ignore lint/correctness/useExhaustiveDependencies: showHue triggers redraw after canvas remount
   useEffect(() => {
     drawHueBar();
@@ -240,6 +250,7 @@ export function ColorPickerPanel({
   const handleSVPointerDown = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
       isDraggingSV.current = true;
+      onInteractRef.current?.();
       const canvas = svCanvasRef.current;
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
@@ -259,6 +270,9 @@ export function ColorPickerPanel({
   });
   useEffect(() => {
     onColorChangeRef.current = onColorChange;
+  });
+  useEffect(() => {
+    onInteractRef.current = onInteract;
   });
 
   useEffect(() => {
@@ -355,6 +369,298 @@ export function ColorPickerPanel({
   const gGradient = `linear-gradient(to right, rgb(${rVal},0,${bVal}), rgb(${rVal},255,${bVal}))`;
   const bGradient = `linear-gradient(to right, rgb(${rVal},${gVal},0), rgb(${rVal},${gVal},255))`;
 
+  // ── MOBILE LAYOUT ──────────────────────────────────────────────────────────
+  if (isMobile) {
+    const hasExpandedControls =
+      showHex ||
+      showHsvSliders ||
+      showRgbSliders ||
+      (showRecent && recentColors.length > 0);
+
+    return (
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        {/* SV Square — fixed 140px height so panel can be auto-height */}
+        <div ref={svContainerRef} style={{ height: 140, position: "relative" }}>
+          <canvas
+            ref={svCanvasRef}
+            width={svPixelW}
+            height={svPixelH}
+            style={{
+              display: "block",
+              width: "100%",
+              height: "100%",
+              touchAction: "none",
+              cursor: "crosshair",
+            }}
+            onPointerDown={handleSVPointerDown}
+          />
+        </div>
+
+        {/* Hue bar */}
+        <div style={{ padding: "6px 8px 0 8px" }}>
+          <canvas
+            ref={hueCanvasRef}
+            width={194}
+            height={18}
+            style={{
+              display: "block",
+              width: "100%",
+              height: 18,
+              borderRadius: 3,
+              touchAction: "none",
+              cursor: "crosshair",
+            }}
+            onPointerDown={(e) => {
+              isDraggingHue.current = true;
+              onInteractRef.current?.();
+              const canvas = hueCanvasRef.current;
+              if (!canvas) return;
+              const rect = canvas.getBoundingClientRect();
+              const h = Math.max(
+                0,
+                Math.min(360, ((e.clientX - rect.left) / rect.width) * 360),
+              );
+              onColorChange({ ...color, h });
+            }}
+          />
+        </div>
+
+        {/* Bottom row: color swatch + settings gear */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "6px 8px 8px 8px",
+            gap: 8,
+          }}
+        >
+          {/* Current color swatch */}
+          <div
+            style={{
+              width: 44,
+              height: 28,
+              borderRadius: 4,
+              border: "1.5px solid rgba(255,255,255,0.18)",
+              boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.35)",
+              flexShrink: 0,
+              ...previewStyle,
+            }}
+            title={hexDisplay}
+          />
+
+          {/* Settings dropdown — shows advanced controls */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                data-ocid="color.mobile_settings_button"
+                style={{
+                  width: 28,
+                  height: 28,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  borderRadius: 6,
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer",
+                  flexShrink: 0,
+                  color: "oklch(var(--muted-foreground))",
+                }}
+              >
+                <SlidersHorizontal size={14} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="end"
+              className="w-44"
+              style={{ zIndex: 99999 }}
+            >
+              <DropdownMenuLabel className="text-xs">
+                Show / Hide
+              </DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuCheckboxItem
+                checked={showHex}
+                onCheckedChange={setShowHex}
+              >
+                Hex input
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={showHsvSliders}
+                onCheckedChange={setShowHsvSliders}
+              >
+                HSV sliders
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={showRgbSliders}
+                onCheckedChange={setShowRgbSliders}
+              >
+                RGB sliders
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={showRecent}
+                onCheckedChange={setShowRecent}
+              >
+                Recent colors
+              </DropdownMenuCheckboxItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
+        {/* Expanded controls — shown only when toggled via settings */}
+        {hasExpandedControls && (
+          <div
+            className="flex flex-col gap-2"
+            style={{
+              borderTop: "1px solid oklch(var(--border))",
+              padding: "8px",
+              flexShrink: 0,
+            }}
+          >
+            {showHex && (
+              <div className="flex items-center gap-2">
+                <Input
+                  data-ocid="color.hex_input"
+                  value={hexInput}
+                  onChange={handleHexChange}
+                  onBlur={() => setHexInput(hexDisplay)}
+                  className="h-7 text-xs font-mono bg-muted border-border"
+                  maxLength={7}
+                />
+              </div>
+            )}
+
+            {showHsvSliders && (
+              <div className="flex flex-col gap-3">
+                <SliderRow
+                  label="H"
+                  ocid="color.h_slider"
+                  value={Math.round(color.h)}
+                  max={360}
+                  onNumChange={(v) => handleHsvChange("h", v)}
+                >
+                  <GradientSlider
+                    value={Math.round(color.h)}
+                    min={0}
+                    max={360}
+                    gradient={hGradient}
+                    onChange={(v) => handleHsvChange("h", v)}
+                  />
+                </SliderRow>
+                <SliderRow
+                  label="S"
+                  ocid="color.s_slider"
+                  value={Math.round(color.s * 100)}
+                  max={100}
+                  onNumChange={(v) => handleHsvChange("s", v)}
+                >
+                  <GradientSlider
+                    value={Math.round(color.s * 100)}
+                    min={0}
+                    max={100}
+                    gradient={sGradient}
+                    onChange={(v) => handleHsvChange("s", v)}
+                  />
+                </SliderRow>
+                <SliderRow
+                  label="V"
+                  ocid="color.v_slider"
+                  value={Math.round(color.v * 100)}
+                  max={100}
+                  onNumChange={(v) => handleHsvChange("v", v)}
+                >
+                  <GradientSlider
+                    value={Math.round(color.v * 100)}
+                    min={0}
+                    max={100}
+                    gradient={vGradient}
+                    onChange={(v) => handleHsvChange("v", v)}
+                  />
+                </SliderRow>
+              </div>
+            )}
+
+            {showRgbSliders && (
+              <div className="flex flex-col gap-3">
+                <SliderRow
+                  label="R"
+                  ocid="color.r_slider"
+                  value={rVal}
+                  max={255}
+                  onNumChange={(v) => handleRgbChange("r", v)}
+                >
+                  <GradientSlider
+                    value={rVal}
+                    min={0}
+                    max={255}
+                    gradient={rGradient}
+                    onChange={(v) => handleRgbChange("r", v)}
+                  />
+                </SliderRow>
+                <SliderRow
+                  label="G"
+                  ocid="color.g_slider"
+                  value={gVal}
+                  max={255}
+                  onNumChange={(v) => handleRgbChange("g", v)}
+                >
+                  <GradientSlider
+                    value={gVal}
+                    min={0}
+                    max={255}
+                    gradient={gGradient}
+                    onChange={(v) => handleRgbChange("g", v)}
+                  />
+                </SliderRow>
+                <SliderRow
+                  label="B"
+                  ocid="color.b_slider"
+                  value={bVal}
+                  max={255}
+                  onNumChange={(v) => handleRgbChange("b", v)}
+                >
+                  <GradientSlider
+                    value={bVal}
+                    min={0}
+                    max={255}
+                    gradient={bGradient}
+                    onChange={(v) => handleRgbChange("b", v)}
+                  />
+                </SliderRow>
+              </div>
+            )}
+
+            {showRecent && recentColors.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {recentColors.map((hex) => (
+                  <button
+                    type="button"
+                    key={hex}
+                    className="w-5 h-5 rounded-sm border border-border hover:scale-110 transition-transform flex-shrink-0"
+                    style={{ background: hex }}
+                    onClick={() => {
+                      onInteractRef.current?.();
+                      onRecentColorClick(hex);
+                    }}
+                    title={hex}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ── DESKTOP LAYOUT (unchanged) ─────────────────────────────────────────────
   return (
     <div className="flex flex-col">
       {/* Header row */}
@@ -445,6 +751,7 @@ export function ColorPickerPanel({
             style={{ height: 14, touchAction: "none" }}
             onPointerDown={(e) => {
               isDraggingHue.current = true;
+              onInteractRef.current?.();
               const canvas = hueCanvasRef.current;
               if (!canvas) return;
               const rect = canvas.getBoundingClientRect();
@@ -586,7 +893,10 @@ export function ColorPickerPanel({
                 key={hex}
                 className="w-5 h-5 rounded-sm border border-border hover:scale-110 transition-transform flex-shrink-0"
                 style={{ background: hex }}
-                onClick={() => onRecentColorClick(hex)}
+                onClick={() => {
+                  onInteractRef.current?.();
+                  onRecentColorClick(hex);
+                }}
                 title={hex}
               />
             ))}

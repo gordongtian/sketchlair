@@ -34,6 +34,7 @@ const CATEGORY_ORDER = [
   "History",
   "Selection",
   "Ruler",
+  "Interface",
 ] as const;
 
 export function HotkeyEditor({ onClose, onHotkeysChanged }: Props) {
@@ -298,6 +299,7 @@ export function HotkeyEditor({ onClose, onHotkeysChanged }: Props) {
         transform: "translateZ(0)",
       }}
       className="border border-border rounded-lg shadow-2xl overflow-hidden"
+      onPointerDown={(e) => e.stopPropagation()}
     >
       {/* Title bar */}
       <div

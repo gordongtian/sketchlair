@@ -1,3 +1,4 @@
+import { PWAInstallBanner } from "@/components/PWAInstallBanner";
 import { FigureDrawingSetup } from "@/components/learn/FigureDrawingSetup";
 import { LearnAuthGate } from "@/components/learn/LearnAuthGate";
 import { LearnMenu } from "@/components/learn/LearnMenu";
@@ -35,6 +36,7 @@ interface SplashScreenProps {
   ) => void;
   onAdminPortal?: () => void;
   onShowMarketplace?: () => void;
+  onShowProfile?: () => void;
   onSettings?: () => void;
   username?: string;
 }
@@ -60,10 +62,16 @@ export function SplashScreen({
   onStartFigureDrawing,
   onAdminPortal,
   onShowMarketplace,
+  onShowProfile,
   onSettings,
   username,
 }: SplashScreenProps) {
-  const { isAdmin, username: authUsername } = useAuth();
+  const {
+    isAdmin,
+    isAdminPending,
+    retryAdminCheck,
+    username: authUsername,
+  } = useAuth();
   const [view, setView] = useState<View>("main");
   const [selectedModule, setSelectedModule] = useState<string | null>(null);
   const [orientation, setOrientation] = useState<"landscape" | "portrait">(
@@ -513,6 +521,42 @@ export function SplashScreen({
                             Admin
                           </button>
                         )}
+
+                        {/* Profile link — shown when logged in */}
+                        {onShowProfile && (
+                          <button
+                            type="button"
+                            data-ocid="splash.profile_button"
+                            onClick={onShowProfile}
+                            className="text-xs transition-opacity hover:opacity-70 hover:underline"
+                            style={{ color: "oklch(var(--muted-text))" }}
+                          >
+                            Account
+                          </button>
+                        )}
+
+                        {/* Reconnect button — shown when logged in but admin check is still pending or failed */}
+                        {!isAdmin && !isAdminPending && (
+                          <button
+                            type="button"
+                            data-ocid="splash.reconnect_button"
+                            onClick={retryAdminCheck}
+                            className="text-xs transition-opacity hover:opacity-70 hover:underline"
+                            style={{ color: "oklch(var(--muted-text))" }}
+                            title="Retry connection to backend canister"
+                          >
+                            reconnect
+                          </button>
+                        )}
+                        {!isAdmin && isAdminPending && (
+                          <span
+                            data-ocid="splash.connecting_state"
+                            className="text-xs opacity-50"
+                            style={{ color: "oklch(var(--muted-text))" }}
+                          >
+                            connecting…
+                          </span>
+                        )}
                       </>
                     ) : (
                       <button
@@ -542,6 +586,9 @@ export function SplashScreen({
                       </button>
                     </div>
                   )}
+
+                  {/* PWA install banner — shown at bottom of splash, mobile only */}
+                  <PWAInstallBanner />
                 </motion.div>
               )}
 

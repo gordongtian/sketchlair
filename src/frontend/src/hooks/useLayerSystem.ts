@@ -18,13 +18,22 @@ import {
   isFlatLayer,
   setGroupIdCounter,
 } from "../utils/groupUtils";
-import { markCanvasDirty } from "./useCompositing";
+import { evictLayerBitmap, markCanvasDirty } from "./useCompositing";
 import { useRefState } from "./useRefState";
 
 // Module-level reusable canvas for thumbnail generation in layer ops
 const _layerSysThumbCanvas = document.createElement("canvas");
 _layerSysThumbCanvas.width = 144;
 _layerSysThumbCanvas.height = 144;
+
+// Module-level reusable canvases for merge-down clipping mask compositing
+// (prevents per-merge allocation leaks at large canvas sizes)
+const _mergeTmpCanvas = document.createElement("canvas");
+_mergeTmpCanvas.width = 1;
+_mergeTmpCanvas.height = 1;
+const _mergeClipTmpCanvas = document.createElement("canvas");
+_mergeClipTmpCanvas.width = 1;
+_mergeClipTmpCanvas.height = 1;
 const _layerSysThumbCtx = _layerSysThumbCanvas.getContext("2d", {
   willReadFrequently: true,
 })!;
@@ -90,6 +99,7 @@ export type UndoEntry =
       belowPixelsAfter: ImageData;
       belowLayerIsClippingMaskBefore: boolean;
       belowLayerIsClippingMaskAfter: boolean;
+      dirtyRect?: { x: number; y: number; w: number; h: number };
     }
   | {
       type: "canvas-resize";
@@ -154,6 +164,12 @@ export type UndoEntry =
       after: boolean;
     }
   | {
+      type: "lock-layer-change";
+      layerId: string;
+      before: boolean;
+      after: boolean;
+    }
+  | {
       type: "clipping-mask-change";
       layerId: string;
       before: boolean;
@@ -175,7 +191,14 @@ export type UndoEntry =
     }
   | {
       type: "multi-layer-pixels";
-      layers: Map<string, { before: ImageData; after: ImageData }>;
+      layers: Map<
+        string,
+        {
+          before: ImageData;
+          after: ImageData;
+          dirtyRect?: { x: number; y: number; w: number; h: number };
+        }
+      >;
     };
 
 // ── Entry handler types ───────────────────────────────────────────────────────
@@ -187,6 +210,7 @@ type LayerSystemEntry = Extract<
   | { type: "group-opacity-change" }
   | { type: "layer-visibility-change" }
   | { type: "alpha-lock-change" }
+  | { type: "lock-layer-change" }
   | { type: "clipping-mask-change" }
   | { type: "layer-rename" }
   | { type: "layer-reorder" }
@@ -357,6 +381,14 @@ export function useLayerSystem({
           );
           break;
 
+        case "lock-layer-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, isLocked: entry.before } : l,
+            ),
+          );
+          break;
+
         case "clipping-mask-change":
           setLayers((prev) =>
             prev.map((l) =>
@@ -435,6 +467,14 @@ export function useLayerSystem({
           setLayers((prev) =>
             prev.map((l) =>
               l.id === entry.layerId ? { ...l, alphaLock: entry.after } : l,
+            ),
+          );
+          break;
+
+        case "lock-layer-change":
+          setLayers((prev) =>
+            prev.map((l) =>
+              l.id === entry.layerId ? { ...l, isLocked: entry.after } : l,
             ),
           );
           break;
@@ -570,7 +610,10 @@ export function useLayerSystem({
         const slice = getGroupSlice(flatLayers, id);
         if (slice) {
           const layersBefore = layers.slice();
-          // Collect deleted canvases for undo
+          // Collect deleted canvases for undo, then immediately release them from
+          // layerCanvasesRef and the GPU bitmap cache so GC can reclaim the memory.
+          // Previously this path only read the canvas pixels but never removed the canvas
+          // from the map, causing all child canvases to leak for the lifetime of the document.
           const deletedCanvases = new Map<string, ImageData>();
           for (const entry of slice.entries) {
             if (isFlatLayer(entry)) {
@@ -582,6 +625,9 @@ export function useLayerSystem({
                     entry.id,
                     ctx.getImageData(0, 0, lc.width, lc.height),
                   );
+                // Release canvas and GPU bitmap so GC can reclaim memory immediately.
+                layerCanvasesRef.current.delete(entry.id);
+                evictLayerBitmap(entry.id);
               }
             }
           }
@@ -657,6 +703,7 @@ export function useLayerSystem({
         return next;
       });
       layerCanvasesRef.current.delete(id);
+      evictLayerBitmap(id);
       composite();
       markCanvasDirty();
     },
@@ -731,6 +778,107 @@ export function useLayerSystem({
     },
     [layers, pushHistory, setLayers],
   );
+
+  const handleToggleLockLayer = useCallback(
+    (id: string) => {
+      const layer = layers.find((l) => l.id === id);
+      if (!layer || layer.type === "group" || layer.type === "end_group")
+        return;
+      const pl = layer as PaintLayer;
+      const before = !!pl.isLocked;
+      const after = !before;
+      pushHistory({
+        type: "lock-layer-change",
+        layerId: id,
+        before,
+        after,
+      });
+      setLayers((prev) =>
+        prev.map((l) => (l.id === id ? { ...l, isLocked: after } : l)),
+      );
+    },
+    [layers, pushHistory, setLayers],
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: setSelectedLayerIds from useRefState is stable
+  const handleDuplicateLayer = useCallback(() => {
+    const activeId = activeLayerIdRef.current;
+    const sourceLayer = layers.find((l) => l.id === activeId);
+    if (!sourceLayer || sourceLayer.type === "end_group") return;
+
+    // Create a new layer object cloned from source
+    const newId = `layer_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    const sourcePl = sourceLayer as PaintLayer;
+    const duplicateLayer: PaintLayer = {
+      ...sourcePl,
+      id: newId,
+      name: `${sourcePl.name} copy`,
+      isLocked: false, // duplicates are unlocked by default
+    };
+
+    // Create the canvas and copy pixel data
+    const sourceCanvas = getOrCreateLayerCanvas(activeId);
+    const newCanvas = getOrCreateLayerCanvas(newId);
+    const newCtx = newCanvas.getContext("2d");
+    if (newCtx) {
+      newCtx.drawImage(sourceCanvas, 0, 0);
+    }
+
+    const activeIdx = layers.findIndex((l) => l.id === activeId);
+    const insertIdx = activeIdx >= 0 ? activeIdx : 0;
+
+    setLayers((prev) => {
+      const ai = prev.findIndex((l) => l.id === activeId);
+      const ii = ai >= 0 ? ai : 0;
+      const next = [...prev];
+      next.splice(ii, 0, duplicateLayer as unknown as FlatLayer);
+      return next;
+    });
+
+    setActiveLayerId(newId);
+    const newLayerSet = new Set([newId]);
+    setSelectedLayerIds(newLayerSet);
+    if (selectedLayerIdsRef) {
+      selectedLayerIdsRef.current = newLayerSet;
+    }
+    setLayerThumbnails((prev) => {
+      const sourceThumbnail = prev[activeId] ?? WHITE_THUMBNAIL;
+      return { ...prev, [newId]: sourceThumbnail };
+    });
+
+    pushHistory({
+      type: "layer-add",
+      layer: duplicateLayer as unknown as Layer,
+      index: insertIdx,
+      previousActiveLayerId: activeId,
+    });
+    markLayerBitmapDirty(newId);
+    setTimeout(() => composite(), 0);
+    markCanvasDirty(newId);
+  }, [
+    layers,
+    setLayers,
+    setActiveLayerId,
+    activeLayerIdRef,
+    pushHistory,
+    setLayerThumbnails,
+    getOrCreateLayerCanvas,
+    markLayerBitmapDirty,
+    composite,
+    selectedLayerIdsRef,
+  ]);
+
+  /** Cut selected pixels to a new layer directly above the active layer. */
+  const handleCutToNewLayer = useCallback(() => {
+    if (!selectionActionsRef.current) return;
+    selectionActionsRef.current.cutOrCopyToLayer(true);
+  }, [selectionActionsRef]);
+
+  /** Copy selected pixels to a new layer directly above the active layer. */
+  const handleCopyToNewLayer = useCallback(() => {
+    if (!selectionActionsRef.current) return;
+    selectionActionsRef.current.cutOrCopyToLayer(false);
+  }, [selectionActionsRef]);
 
   const handleSetOpacity = useCallback(
     (id: string, opacity: number) => {
@@ -831,31 +979,98 @@ export function useLayerSystem({
     const aCtx = activeLc.getContext("2d", { willReadFrequently: true });
     if (!bCtx || !aCtx) return;
 
-    const activePixels = aCtx.getImageData(0, 0, canvasWidth, canvasHeight);
-    const belowPixelsBefore = bCtx.getImageData(
-      0,
-      0,
-      canvasWidth,
-      canvasHeight,
-    );
+    // Compute the dirty rect as the union of non-transparent pixel bounding boxes
+    // on the active layer and the below layer. Only that region is affected by the merge.
+    // This avoids storing three full-canvas 4MB snapshots per merge operation.
+    const _mergeW = canvasWidth;
+    const _mergeH = canvasHeight;
+    const _computeContentBounds = (
+      pixelData: Uint8ClampedArray,
+      pw: number,
+      ph: number,
+    ) => {
+      let minX = pw;
+      let minY = ph;
+      let maxX = 0;
+      let maxY = 0;
+      let hasContent = false;
+      for (let i = 3; i < pixelData.length; i += 4) {
+        if (pixelData[i] > 0) {
+          const px = ((i - 3) / 4) % pw;
+          const py = Math.floor((i - 3) / 4 / pw);
+          if (px < minX) minX = px;
+          if (px + 1 > maxX) maxX = px + 1;
+          if (py < minY) minY = py;
+          if (py + 1 > maxY) maxY = py + 1;
+          hasContent = true;
+        }
+      }
+      return hasContent ? { minX, minY, maxX, maxY } : null;
+    };
+    // Scan both layers to find their content bounding boxes
+    const _aFullData = aCtx.getImageData(0, 0, _mergeW, _mergeH);
+    const _bFullData = bCtx.getImageData(0, 0, _mergeW, _mergeH);
+    const _aBounds = _computeContentBounds(_aFullData.data, _mergeW, _mergeH);
+    const _bBounds = _computeContentBounds(_bFullData.data, _mergeW, _mergeH);
+    // Union the two bounding boxes, expand by 4px, clamp to canvas bounds
+    const mergeDirtyRect:
+      | { x: number; y: number; w: number; h: number }
+      | undefined = (() => {
+      if (!_aBounds && !_bBounds) return undefined;
+      const uMinX = Math.min(
+        _aBounds?.minX ?? _mergeW,
+        _bBounds?.minX ?? _mergeW,
+      );
+      const uMinY = Math.min(
+        _aBounds?.minY ?? _mergeH,
+        _bBounds?.minY ?? _mergeH,
+      );
+      const uMaxX = Math.max(_aBounds?.maxX ?? 0, _bBounds?.maxX ?? 0);
+      const uMaxY = Math.max(_aBounds?.maxY ?? 0, _bBounds?.maxY ?? 0);
+      const pad = 4;
+      const rx = Math.max(0, uMinX - pad);
+      const ry = Math.max(0, uMinY - pad);
+      const rx2 = Math.min(_mergeW, uMaxX + pad);
+      const ry2 = Math.min(_mergeH, uMaxY + pad);
+      const rw = rx2 - rx;
+      const rh = ry2 - ry;
+      return rw > 0 && rh > 0 ? { x: rx, y: ry, w: rw, h: rh } : undefined;
+    })();
+
+    // Capture before-snapshots using the dirty rect (or full canvas as fallback).
+    // NOTE: activePixels is always captured at full canvas because it is used to
+    // repopulate a freshly-created canvas when the layer is restored via undo
+    // (pendingLayerPixelsRef writes at offset 0,0 into a blank canvas). Only the
+    // below-layer snapshots can safely use the dirty rect since they write back
+    // into an existing canvas via putImageData at (dirtyRect.x, dirtyRect.y).
+    const activePixels = _aFullData;
+    const belowPixelsBefore = mergeDirtyRect
+      ? bCtx.getImageData(
+          mergeDirtyRect.x,
+          mergeDirtyRect.y,
+          mergeDirtyRect.w,
+          mergeDirtyRect.h,
+        )
+      : _bFullData;
 
     const activeIsClip = !!activeLayer.isClippingMask;
     const belowIsClip = !!(belowLayer as PaintLayer).isClippingMask;
 
     if (activeIsClip && !belowIsClip) {
-      const tmpCanvas = document.createElement("canvas");
-      tmpCanvas.width = canvasWidth;
-      tmpCanvas.height = canvasHeight;
-      const tmpCtx = tmpCanvas.getContext("2d")!;
+      // Resize module-level canvases to match current canvas dimensions.
+      // Assigning .width/.height also clears pixel data — no clearRect needed.
+      _mergeTmpCanvas.width = canvasWidth;
+      _mergeTmpCanvas.height = canvasHeight;
+      _mergeClipTmpCanvas.width = canvasWidth;
+      _mergeClipTmpCanvas.height = canvasHeight;
+
+      const tmpCtx = _mergeTmpCanvas.getContext("2d")!;
 
       tmpCtx.globalAlpha = 1;
       tmpCtx.globalCompositeOperation = "source-over";
       tmpCtx.drawImage(belowLc, 0, 0);
 
-      const clipTmp = document.createElement("canvas");
-      clipTmp.width = canvasWidth;
-      clipTmp.height = canvasHeight;
-      const clipCtx = clipTmp.getContext("2d")!;
+      const clipCtx = _mergeClipTmpCanvas.getContext("2d")!;
       clipCtx.globalAlpha = activeLayer.opacity;
       clipCtx.globalCompositeOperation = "source-over";
       clipCtx.drawImage(activeLc, 0, 0);
@@ -866,12 +1081,18 @@ export function useLayerSystem({
       tmpCtx.globalAlpha = 1;
       tmpCtx.globalCompositeOperation = (activeLayer.blendMode ||
         "source-over") as GlobalCompositeOperation;
-      tmpCtx.drawImage(clipTmp, 0, 0);
+      tmpCtx.drawImage(_mergeClipTmpCanvas, 0, 0);
       tmpCtx.globalCompositeOperation = "source-over";
 
       bCtx.clearRect(0, 0, canvasWidth, canvasHeight);
-      bCtx.drawImage(tmpCanvas, 0, 0);
+      bCtx.drawImage(_mergeTmpCanvas, 0, 0);
       markLayerBitmapDirty(belowLayer.id);
+
+      // Release pixel data immediately by shrinking back to 1×1
+      _mergeTmpCanvas.width = 1;
+      _mergeTmpCanvas.height = 1;
+      _mergeClipTmpCanvas.width = 1;
+      _mergeClipTmpCanvas.height = 1;
     } else {
       bCtx.globalAlpha = activeLayer.opacity;
       bCtx.globalCompositeOperation = (activeLayer.blendMode ||
@@ -882,7 +1103,14 @@ export function useLayerSystem({
       markLayerBitmapDirty(belowLayer.id);
     }
 
-    const belowPixelsAfter = bCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+    const belowPixelsAfter = mergeDirtyRect
+      ? bCtx.getImageData(
+          mergeDirtyRect.x,
+          mergeDirtyRect.y,
+          mergeDirtyRect.w,
+          mergeDirtyRect.h,
+        )
+      : bCtx.getImageData(0, 0, canvasWidth, canvasHeight);
     const belowLayerIsClippingMaskAfter = activeIsClip && belowIsClip;
 
     if (belowLayerIsClippingMaskAfter !== belowIsClip) {
@@ -905,12 +1133,19 @@ export function useLayerSystem({
       belowPixelsAfter,
       belowLayerIsClippingMaskBefore: belowIsClip,
       belowLayerIsClippingMaskAfter,
+      dirtyRect: mergeDirtyRect ?? {
+        x: 0,
+        y: 0,
+        w: canvasWidth,
+        h: canvasHeight,
+      },
     });
 
     markCanvasDirty(belowLayer.id);
     setLayers((prev) => prev.filter((l) => l.id !== activeId));
     setActiveLayerId(belowLayer.id);
     layerCanvasesRef.current.delete(activeId);
+    evictLayerBitmap(activeId);
     setTimeout(() => composite(), 0);
     markCanvasDirty();
   }, [
@@ -1293,6 +1528,7 @@ export function useLayerSystem({
                 );
               }
               layerCanvasesRef.current.delete(entry.id);
+              evictLayerBitmap(entry.id);
             }
           }
         }
@@ -1378,6 +1614,10 @@ export function useLayerSystem({
     handleToggleVisible,
     handleRenameLayer,
     handleToggleAlphaLock,
+    handleToggleLockLayer,
+    handleDuplicateLayer,
+    handleCutToNewLayer,
+    handleCopyToNewLayer,
     handleSetOpacity,
     handleSetOpacityLive,
     handleSetOpacityCommit,

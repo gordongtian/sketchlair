@@ -6,6 +6,13 @@ import type {
 } from "@/context/PaintingContext";
 import { useCallback } from "react";
 import type React from "react";
+import type { WebGLBrushContext } from "../utils/webglBrush";
+import {
+  cancelScheduledComposite,
+  forceResetCompositeSchedule,
+} from "./useCompositing";
+import { setLiquifyStrokeActive } from "./useLiquifySystem";
+import { clearSmearBuffers } from "./useStrokeEngine";
 
 export interface ToolSwitchSystemParams {
   // Refs
@@ -24,6 +31,8 @@ export interface ToolSwitchSystemParams {
   lastPaintToolRef2: React.MutableRefObject<Tool>;
   lastPaintLayerIdRef: React.MutableRefObject<string>;
   activeLayerIdRef: React.MutableRefObject<string>;
+  /** WebGL brush context ref — used to destroy liquify GPU state on tool switch. */
+  webglBrushRef?: React.MutableRefObject<WebGLBrushContext | null>;
   // State values
   activeTool: Tool;
   activeLayerId: string;
@@ -69,12 +78,36 @@ export function useToolSwitchSystem({
   setActiveLayerId,
   handleAdjustmentsToggle,
   collapseRulerHistory,
+  webglBrushRef,
 }: ToolSwitchSystemParams): ToolSwitchSystemReturn {
   // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
   const handleToolChange = useCallback(
     (tool: Tool) => {
       // Cancel any in-progress selection when switching tools
       cancelInProgressSelectionRef.current();
+      // FIX 4: When switching away from smudge, release the per-stroke smear working
+      // buffers. If a stroke is active it will have been committed by the pointer-up
+      // handler already; this handles the case where tool switch occurs between strokes
+      // (buffers are already null) or in edge cases where they are not yet released.
+      if (activeToolRef.current === "smudge" && tool !== "smudge") {
+        clearSmearBuffers();
+      }
+      // FIX: When switching away from liquify, destroy all GPU resources and clear
+      // the stroke-active compositing guard. This prevents the guard from staying
+      // true when the user creates a new layer or switches tools while on liquify,
+      // which would suppress all subsequent compositing and make brush strokes invisible.
+      if (activeToolRef.current === "liquify" && tool !== "liquify") {
+        webglBrushRef?.current?.destroyLiquifyGPU();
+        webglBrushRef?.current?.destroyAllLiquifyGPULayers();
+        setLiquifyStrokeActive(false);
+      }
+      // FIX B (belt-and-suspenders): always clear the liquify stroke guard and any
+      // stuck composite-scheduled flag when switching to any non-liquify tool.
+      // This covers fast tool switches, pointer-up misses, and other edge cases.
+      if (tool !== "liquify") {
+        setLiquifyStrokeActive(false);
+        forceResetCompositeSchedule();
+      }
       // Clean up rotate tool state when switching away from rotate
       // Use activeToolRef.current (not the closed-over activeTool state) so this
       // is always current even when called from a hotkey handler that fires before

@@ -50,6 +50,12 @@ export function SessionEndScreen({
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : "Compilation failed.";
         setState({ status: "error", message: msg });
+      })
+      .finally(() => {
+        // Release snapshot ImageData objects after the collage is compiled.
+        // The compiler has finished reading from them — clearing the array
+        // lets GC reclaim the pixel buffers (one full-canvas ImageData per pose).
+        snapshotsRef.current.length = 0;
       });
 
     return () => {
@@ -60,7 +66,8 @@ export function SessionEndScreen({
   const handleDownload = async () => {
     const blob = blobRef.current;
     if (!blob) return;
-    const filename = `sketchlair-session-${Date.now()}.png`;
+    // FIX 6: use JPEG extension (was PNG)
+    const filename = `sketchlair-session-${Date.now()}.jpg`;
 
     if ("showSaveFilePicker" in window) {
       try {
@@ -74,7 +81,7 @@ export function SessionEndScreen({
         ).showSaveFilePicker({
           suggestedName: filename,
           types: [
-            { description: "PNG image", accept: { "image/png": [".png"] } },
+            { description: "JPEG image", accept: { "image/jpeg": [".jpg"] } },
           ],
         });
         const writable = await handle.createWritable();
@@ -97,8 +104,9 @@ export function SessionEndScreen({
   const handleShare = async () => {
     const blob = blobRef.current;
     if (!blob) return;
-    const filename = `sketchlair-session-${Date.now()}.png`;
-    const file = new File([blob], filename, { type: "image/png" });
+    // FIX 6: use JPEG extension and MIME type (was PNG)
+    const filename = `sketchlair-session-${Date.now()}.jpg`;
+    const file = new File([blob], filename, { type: "image/jpeg" });
 
     if (navigator.share && navigator.canShare?.({ files: [file] })) {
       try {

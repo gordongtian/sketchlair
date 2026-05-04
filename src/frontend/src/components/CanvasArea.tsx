@@ -1,29 +1,19 @@
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import type { HSVAColor } from "@/utils/colorUtils";
 import type { Preset } from "@/utils/toolPresets";
-import {
-  Check,
-  Eraser,
-  FolderPlus,
-  Layers,
-  Lock,
-  MapPin,
-  Palette,
-  Plus,
-  Scissors,
-} from "lucide-react";
+import { Layers, MapPin, Palette } from "lucide-react";
 import {
   type ReactNode,
   type RefObject,
   useCallback,
+  useEffect,
   useRef,
   useState,
 } from "react";
+import type { MobileLayoutState } from "../hooks/useIsMobile";
+import {
+  readMobileLayoutState,
+  writeMobileLayoutState,
+} from "../hooks/useIsMobile";
 import type { ViewTransform } from "../types";
 import type { BrushSettings } from "./BrushSettingsPanel";
 import { ColorPickerPanel } from "./ColorPickerPanel";
@@ -59,12 +49,34 @@ export const PANEL_DRAG_AUTOPIN_THRESHOLD = 50;
 /** Side the panel opens on — right (LP panels) or left (presets from toolbar) */
 type PanelSide = "right" | "left";
 
+interface UsePanelDragOptions {
+  /** Which side the panel defaults to when not pinned. */
+  side?: PanelSide;
+  /**
+   * Left-hand mode flag — flips the default/snap-back position:
+   * - LP panels (normally "right"): open to right of LP tabs on LEFT edge → left: LP_TAB_WIDTH + 8
+   * - Presets panel (normally "left"): open to left of toolbar on RIGHT edge → right: TOOLBAR_WIDTH + 8
+   */
+  leftHanded?: boolean;
+  isMobile?: boolean;
+  /** When false, toolbar-side constraint is removed so panels can reach the toolbar edge */
+  showFOBSliders?: boolean;
+}
+
 /**
  * Hook that provides pin state + drag behaviour for a single mobile panel.
  * Position is tracked in a ref during drag to avoid re-renders.
  * Only the pinned boolean lives in state.
  */
-function usePanelDrag(side: PanelSide = "right") {
+function usePanelDrag(options: UsePanelDragOptions | PanelSide = "right") {
+  // Support both old string API and new object API
+  const opts: UsePanelDragOptions =
+    typeof options === "string" ? { side: options } : options;
+  const side: PanelSide = opts.side ?? "right";
+  const leftHanded = opts.leftHanded ?? false;
+  const isMobile = opts.isMobile ?? false;
+  const showFOBSliders = opts.showFOBSliders ?? true;
+
   const [pinned, setPinned] = useState(false);
   // Saved position ref — survives unpins, reset only on app reload
   const lastPosRef = useRef<PanelPosition | null>(null);
@@ -82,7 +94,15 @@ function usePanelDrag(side: PanelSide = "right") {
   const pinnedRef = useRef(pinned);
   pinnedRef.current = pinned;
 
-  /** Clamp panel position to stay within canvas and clear of the LP tab */
+  /**
+   * Effective side: in left-hand mode on mobile, LP panels flip from "right"
+   * to "left" (they open from the left edge), and presets flip from "left"
+   * to "right" (they open from the right edge near the toolbar).
+   */
+  const effectiveSide: PanelSide =
+    isMobile && leftHanded ? (side === "right" ? "left" : "right") : side;
+
+  /** Clamp panel position to stay within canvas and clear of the toolbar when FOB sliders are shown */
   const clampPosition = useCallback(
     (x: number, y: number): PanelPosition => {
       const el = panelRef.current;
@@ -94,15 +114,25 @@ function usePanelDrag(side: PanelSide = "right") {
       );
       const cw = container ? container.clientWidth : window.innerWidth;
       const ch = container ? container.clientHeight : window.innerHeight;
+      // Keep a small handle visible on screen (24px minimum handle strip)
+      const HANDLE = 24;
       let maxX: number;
       let minX: number;
-      if (side === "right") {
-        maxX = cw - LP_TAB_WIDTH - 8 - pw; // must not cover LP tab
-        minX = 0;
+      if (effectiveSide === "left") {
+        // Panel opens from left edge
+        // No LP tab constraint — panels can overlap tabs
+        minX = -pw + HANDLE; // allow sliding mostly off-screen left but keep a handle visible
+        // Right-side: only constrain if FOB sliders are shown (toolbar visible on right in left-hand mode)
+        maxX =
+          isMobile && leftHanded && showFOBSliders
+            ? cw - TOOLBAR_WIDTH - 4 - pw
+            : cw - HANDLE;
       } else {
-        // left-side panels (presets): must not cover toolbar
-        minX = 0;
-        maxX = cw - LP_TAB_WIDTH - 8 - pw;
+        // Panel opens from right edge
+        // Left-side: only constrain if FOB sliders are shown (toolbar visible on left in normal mode)
+        minX = !leftHanded && showFOBSliders ? TOOLBAR_WIDTH + 4 : HANDLE - pw;
+        // No LP tab constraint — panels can overlap tabs
+        maxX = cw - HANDLE;
       }
       const maxY = ch - ph;
       return {
@@ -110,7 +140,7 @@ function usePanelDrag(side: PanelSide = "right") {
         y: Math.max(0, Math.min(y, maxY)),
       };
     },
-    [side],
+    [effectiveSide, leftHanded, isMobile, showFOBSliders],
   );
 
   /** Apply position to DOM element directly (no React state) */
@@ -205,7 +235,13 @@ function usePanelDrag(side: PanelSide = "right") {
         const cw = container ? container.clientWidth : window.innerWidth;
         const pw = el.offsetWidth;
         let snapX: number;
-        if (side === "right") {
+        if (effectiveSide === "left") {
+          // LP panels in left-hand mode open from left edge
+          snapX = LP_TAB_WIDTH + 8;
+        } else if (isMobile && leftHanded) {
+          // Presets in left-hand mode snap to right of toolbar on right edge
+          snapX = cw - TOOLBAR_WIDTH - 8 - pw;
+        } else if (side === "right") {
           snapX = cw - LP_TAB_WIDTH - 8 - pw;
         } else {
           snapX = TOOLBAR_WIDTH + 8;
@@ -213,7 +249,7 @@ function usePanelDrag(side: PanelSide = "right") {
         applyPosition(clampPosition(snapX, defaultY));
       }
     },
-    [side, applyPosition, clampPosition],
+    [side, effectiveSide, leftHanded, isMobile, applyPosition, clampPosition],
   );
 
   /**
@@ -260,7 +296,7 @@ function usePanelDrag(side: PanelSide = "right") {
   /**
    * Get the inline style for the panel.
    * - Pinned with last position: use last position
-   * - Default: button-aligned position (right or left side)
+   * - Default: button-aligned position based on effective side
    */
   const getPanelStyle = useCallback(
     (buttonY?: number): React.CSSProperties => {
@@ -275,7 +311,28 @@ function usePanelDrag(side: PanelSide = "right") {
       }
       // Use buttonY if provided, otherwise fall back to defaultYRef (set on last open)
       const topY = buttonY !== undefined ? buttonY : defaultYRef.current;
+      if (effectiveSide === "left") {
+        // LP panels in left-hand mode: open to the right of the LP tab strip on the left edge
+        return {
+          position: "absolute",
+          top: topY,
+          transform: "none",
+          left: LP_TAB_WIDTH + 8,
+          right: "auto",
+        };
+      }
+      if (isMobile && leftHanded) {
+        // Presets in left-hand mode: open to the left of the toolbar on the right edge
+        return {
+          position: "absolute",
+          top: topY,
+          transform: "none",
+          right: TOOLBAR_WIDTH + 8,
+          left: "auto",
+        };
+      }
       if (side === "right") {
+        // LP panels in normal mode: open to the left of the LP tab strip on the right edge
         return {
           position: "absolute",
           top: topY,
@@ -284,7 +341,7 @@ function usePanelDrag(side: PanelSide = "right") {
           left: "auto",
         };
       }
-      // Left-side (presets opened from toolbar)
+      // Presets in normal mode: open to the right of the toolbar on the left edge
       return {
         position: "absolute",
         top: topY,
@@ -293,7 +350,7 @@ function usePanelDrag(side: PanelSide = "right") {
         right: "auto",
       };
     },
-    [pinned, side],
+    [pinned, side, effectiveSide, leftHanded, isMobile],
   );
 
   return {
@@ -307,6 +364,8 @@ function usePanelDrag(side: PanelSide = "right") {
     handleTitleBarPointerDown,
     handleTitleBarPointerMove,
     handleTitleBarPointerUp,
+    /** Effective side accounting for left-hand mode — used for animation direction */
+    effectiveSide,
   };
 }
 
@@ -382,6 +441,11 @@ export interface CanvasAreaProps {
   onMergeLayers: () => void;
   onRenameLayer: (id: string, name: string) => void;
   onToggleAlphaLock: (id: string) => void;
+  onToggleLockLayer: (id: string) => void;
+  onDuplicateLayer: () => void;
+  onCutToNewLayer: () => void;
+  onCopyToNewLayer: () => void;
+  hasSelection?: boolean;
   onCtrlClickLayer: (id: string) => void;
   onToggleRulerActive: (id: string) => void;
   onToggleGroupCollapse: (groupId: string) => void;
@@ -424,10 +488,12 @@ export interface CanvasAreaProps {
   showMobileColorPanel: boolean;
   showMobilePresetsPanel: boolean;
   showMobileLayersPanel: boolean;
+  showFOBSliders?: boolean;
   recentColors: string[];
   wandTolerance: number;
   wandContiguous: boolean;
   wandGrowShrink: number;
+  wandEdgeExpand: number;
 
   // CSS cursor
   cursor: string;
@@ -469,6 +535,7 @@ export interface CanvasAreaProps {
   onWandToleranceChange: (v: number) => void;
   onWandContiguousChange: (v: boolean) => void;
   onWandGrowShrinkChange: (v: number) => void;
+  onWandEdgeExpandChange: (v: number) => void;
   onSelectFillMode: (mode: FillMode) => void;
   onFillSettingsChange: (settings: FillSettings) => void;
   onRulerPresetTypeChange: (type: RulerPresetType) => void;
@@ -507,8 +574,10 @@ export interface CanvasAreaProps {
    */
   mobileAdjustmentsPanel?: ReactNode;
 
-  /** Called when the user taps "Draw New" in the mobile presets panel — opens the inline brush tip editor */
+  /** Called when brush tip editor opens — mobile only */
   onEnterBrushTipEditor?: (onAccept: (dataUrl: string) => void) => void;
+  /** Ref that CanvasArea writes a saveMobileLayoutState function into — caller invokes before mode switch */
+  saveMobileLayoutRef?: React.MutableRefObject<(() => void) | null>;
 }
 
 export function CanvasArea({
@@ -555,6 +624,11 @@ export function CanvasArea({
   onMergeLayers,
   onRenameLayer,
   onToggleAlphaLock,
+  onToggleLockLayer,
+  onDuplicateLayer,
+  onCutToNewLayer,
+  onCopyToNewLayer,
+  hasSelection = false,
   onCtrlClickLayer,
   onToggleRulerActive,
   onToggleGroupCollapse,
@@ -580,10 +654,12 @@ export function CanvasArea({
   showMobileColorPanel,
   showMobilePresetsPanel,
   showMobileLayersPanel,
+  showFOBSliders = true,
   recentColors,
   wandTolerance,
   wandContiguous,
   wandGrowShrink,
+  wandEdgeExpand,
   cursor,
   onSetActiveMobilePanel,
   onRecentColorClick,
@@ -607,6 +683,7 @@ export function CanvasArea({
   onWandToleranceChange,
   onWandContiguousChange,
   onWandGrowShrinkChange,
+  onWandEdgeExpandChange,
   onSelectFillMode,
   onFillSettingsChange,
   onRulerPresetTypeChange,
@@ -629,14 +706,155 @@ export function CanvasArea({
   onSelectionOverlayCanvasRef,
   mobileAdjustmentsPanel,
   onEnterBrushTipEditor,
+  saveMobileLayoutRef,
 }: CanvasAreaProps) {
   // Derive ruler layer props from layers array
   const rulerLayer = layers.find((l) => l.isRuler);
 
+  // ── Change 5: Read stored mobile layout BEFORE hooks initialize ──────────
+  // This is a module-level read that happens synchronously so panel positions
+  // can be injected into lastPosRef before the first render.
+  const storedLayoutRef = useRef<MobileLayoutState | null>(null);
+  if (storedLayoutRef.current === null) {
+    storedLayoutRef.current = readMobileLayoutState();
+  }
+
   // --- Mobile panel drag hooks (one per panel) ---
-  const colorDrag = usePanelDrag("right");
-  const presetsDrag = usePanelDrag("left");
-  const layersDrag = usePanelDrag("right");
+  // In left-hand mode: LP panels (color/layers) flip to left side, presets flip to right side
+  const colorDrag = usePanelDrag({
+    side: "right",
+    leftHanded,
+    isMobile,
+    showFOBSliders,
+  });
+  const presetsDrag = usePanelDrag({
+    side: "left",
+    leftHanded,
+    isMobile,
+    showFOBSliders,
+  });
+  const layersDrag = usePanelDrag({
+    side: "right",
+    leftHanded,
+    isMobile,
+    showFOBSliders,
+  });
+
+  // Restore stored panel positions into lastPosRef on first mount (Change 5)
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional one-time restore on mount
+  useEffect(() => {
+    if (!isMobile) return;
+    const stored = storedLayoutRef.current;
+    if (!stored) return;
+    if (stored.palettePanel) {
+      colorDrag.panelRef.current?.style.setProperty(
+        "left",
+        `${stored.palettePanel.x}px`,
+      );
+      colorDrag.panelRef.current?.style.setProperty(
+        "top",
+        `${stored.palettePanel.y}px`,
+      );
+      // If was pinned, restore pin state
+      if (stored.palettePanel.pinned) {
+        colorDrag.setPinned(true);
+      }
+    }
+    if (stored.layersPanel) {
+      layersDrag.panelRef.current?.style.setProperty(
+        "left",
+        `${stored.layersPanel.x}px`,
+      );
+      layersDrag.panelRef.current?.style.setProperty(
+        "top",
+        `${stored.layersPanel.y}px`,
+      );
+      if (stored.layersPanel.pinned) {
+        layersDrag.setPinned(true);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isMobile]);
+
+  /** Save current mobile layout to localStorage (Change 5) */
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally omits ref.current (stable DOM refs)
+  const saveMobileLayoutState = useCallback(() => {
+    const el0 = colorDrag.panelRef.current;
+    const el1 = layersDrag.panelRef.current;
+    const state: MobileLayoutState = {
+      palettePanel: el0
+        ? {
+            x: Number.parseFloat(el0.style.left) || 0,
+            y: Number.parseFloat(el0.style.top) || 0,
+            pinned: colorDrag.pinned,
+          }
+        : undefined,
+      layersPanel: el1
+        ? {
+            x: Number.parseFloat(el1.style.left) || 0,
+            y: Number.parseFloat(el1.style.top) || 0,
+            pinned: layersDrag.pinned,
+          }
+        : undefined,
+      showFOBSliders,
+    };
+    writeMobileLayoutState(state);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [colorDrag.pinned, layersDrag.pinned, showFOBSliders]);
+
+  // Expose saveMobileLayoutState via ref so PaintingApp can call it before mode switch
+  useEffect(() => {
+    if (saveMobileLayoutRef) {
+      saveMobileLayoutRef.current = saveMobileLayoutState;
+    }
+  }, [saveMobileLayoutRef, saveMobileLayoutState]);
+
+  // ── Change 1: Mobile panel z-order tracking ───────────────────────────────
+  type PanelId = "palette" | "layers" | "presets";
+  const [panelZOrder, setPanelZOrder] = useState<PanelId[]>([]);
+
+  const bringPanelToFront = useCallback(
+    (panelId: PanelId) => {
+      if (!isMobile) return;
+      setPanelZOrder((prev) => {
+        const filtered = prev.filter((id) => id !== panelId);
+        return [...filtered, panelId];
+      });
+    },
+    [isMobile],
+  );
+
+  const removePanelFromZOrder = useCallback((panelId: PanelId) => {
+    setPanelZOrder((prev) => prev.filter((id) => id !== panelId));
+  }, []);
+
+  /** Derive z-index for a panel. Base = 50 (above canvas, below save/export overlays).
+   *  Last element in panelZOrder gets highest z-index. */
+  const getPanelZIndex = useCallback(
+    (panelId: PanelId) => {
+      if (!isMobile) return 50;
+      const idx = panelZOrder.indexOf(panelId);
+      if (idx === -1) return 50;
+      return 50 + idx + 1;
+    },
+    [isMobile, panelZOrder],
+  );
+
+  // ── Issue 2: Bring panel to front whenever it is opened (show prop → true) ──
+  // biome-ignore lint/correctness/useExhaustiveDependencies: bringPanelToFront is stable
+  useEffect(() => {
+    if (showMobileColorPanel) bringPanelToFront("palette");
+  }, [showMobileColorPanel]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: bringPanelToFront is stable
+  useEffect(() => {
+    if (showMobilePresetsPanel) bringPanelToFront("presets");
+  }, [showMobilePresetsPanel]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: bringPanelToFront is stable
+  useEffect(() => {
+    if (showMobileLayersPanel) bringPanelToFront("layers");
+  }, [showMobileLayersPanel]);
 
   // Pinned panels are visible independently of activeMobilePanel
   const colorVisible = showMobileColorPanel || colorDrag.pinned;
@@ -709,8 +927,10 @@ export function CanvasArea({
       data-canvas-area
       style={{ cursor, touchAction: "none" }}
     >
-      {/* Mobile: vertical canvas edge sliders (Flow, Opacity, Size) — only for tools that use them */}
+      {/* Mobile: vertical canvas edge sliders (Flow, Opacity, Size) — only for tools that use them.
+          Only shown when showFOBSliders is true (Change 4). */}
       {isMobile &&
+        showFOBSliders &&
         (activeTool === "brush" ||
           activeTool === "eraser" ||
           activeTool === "smudge" ||
@@ -736,7 +956,7 @@ export function CanvasArea({
           style={{
             position: "absolute",
             top: "max(8px, env(safe-area-inset-top, 8px))",
-            right: 0,
+            ...(leftHanded ? { left: 0 } : { right: 0 }),
             zIndex: 25,
             display: "flex",
             flexDirection: "column",
@@ -752,6 +972,7 @@ export function CanvasArea({
             onClick={() => {
               if (showMobileLayersPanel || layersDrag.pinned) {
                 // Always close — unpin if needed
+                removePanelFromZOrder("layers");
                 layersDrag.forceClose(() => onSetActiveMobilePanel(null));
               } else {
                 // Measure button Y relative to canvas container
@@ -765,6 +986,7 @@ export function CanvasArea({
                   const buttonY = btnRect.top - cRect.top;
                   layersDrag.setDefaultY(buttonY);
                 }
+                bringPanelToFront("layers");
                 onSetActiveMobilePanel("layers");
               }
             }}
@@ -783,7 +1005,7 @@ export function CanvasArea({
                 showMobileLayersPanel || layersDrag.pinned
                   ? undefined
                   : "blur(6px)",
-              borderRadius: "8px 0 0 0",
+              borderRadius: leftHanded ? "0 8px 0 0" : "8px 0 0 0",
               border:
                 showMobileLayersPanel || layersDrag.pinned
                   ? "1px solid oklch(var(--accent))"
@@ -807,6 +1029,7 @@ export function CanvasArea({
             onClick={() => {
               if (showMobileColorPanel || colorDrag.pinned) {
                 // Always close — unpin if needed
+                removePanelFromZOrder("palette");
                 colorDrag.forceClose(() => onSetActiveMobilePanel(null));
               } else {
                 // Measure button Y relative to canvas container
@@ -820,6 +1043,7 @@ export function CanvasArea({
                   const buttonY = btnRect.top - cRect.top;
                   colorDrag.setDefaultY(buttonY);
                 }
+                bringPanelToFront("palette");
                 onSetActiveMobilePanel("palette");
               }
             }}
@@ -838,7 +1062,7 @@ export function CanvasArea({
                 showMobileColorPanel || colorDrag.pinned
                   ? undefined
                   : "blur(6px)",
-              borderRadius: "0 0 0 8px",
+              borderRadius: leftHanded ? "0 0 8px 0" : "0 0 0 8px",
               border:
                 showMobileColorPanel || colorDrag.pinned
                   ? "1px solid oklch(var(--accent))"
@@ -867,21 +1091,27 @@ export function CanvasArea({
             data-ocid="mobile.color_panel"
             style={{
               ...colorDrag.getPanelStyle(),
-              zIndex: colorDrag.pinned ? 55 : 50,
+              zIndex: getPanelZIndex("palette"),
               background: "oklch(var(--sidebar-left))",
               border: "1px solid oklch(var(--border))",
               borderRadius: 10,
               boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
-              width: 240,
+              width: 260,
               maxHeight: "calc(100dvh - 80px)",
               overflow: "hidden",
               display: "flex",
               flexDirection: "column",
+              transition: "height 0.15s ease",
               animation: colorDrag.pinned
                 ? undefined
-                : "slideInFromRight 0.18s ease-out",
+                : leftHanded
+                  ? "slideInFromLeft 0.18s ease-out"
+                  : "slideInFromRight 0.18s ease-out",
             }}
-            onPointerDown={(e) => e.stopPropagation()}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              bringPanelToFront("palette");
+            }}
           >
             {/* Title bar */}
             <div
@@ -889,7 +1119,10 @@ export function CanvasArea({
                 ...titleBarStyle,
                 cursor: colorDrag.pinned ? "grab" : "default",
               }}
-              onPointerDown={colorDrag.handleTitleBarPointerDown}
+              onPointerDown={(e) => {
+                bringPanelToFront("palette");
+                colorDrag.handleTitleBarPointerDown(e);
+              }}
               onPointerMove={(e) => colorDrag.handleTitleBarPointerMove(e)}
               onPointerUp={colorDrag.handleTitleBarPointerUp}
             >
@@ -910,12 +1143,20 @@ export function CanvasArea({
               </button>
             </div>
             {/* Content */}
-            <div style={{ overflow: "hidden auto", flex: 1 }}>
+            <div
+              style={{
+                overflow: "visible",
+                display: "flex",
+                flexDirection: "column",
+              }}
+            >
               <ColorPickerPanel
                 color={color}
                 onColorChange={onColorChange}
                 recentColors={recentColors}
                 onRecentColorClick={onRecentColorClick}
+                onInteract={() => bringPanelToFront("palette")}
+                isMobile={true}
               />
             </div>
           </div>
@@ -932,7 +1173,7 @@ export function CanvasArea({
             data-ocid="mobile.presets_panel"
             style={{
               ...presetsDrag.getPanelStyle(),
-              zIndex: presetsDrag.pinned ? 55 : 50,
+              zIndex: getPanelZIndex("presets"),
               background: "oklch(var(--sidebar-left))",
               border: "1px solid oklch(var(--border))",
               borderRadius: 10,
@@ -944,9 +1185,14 @@ export function CanvasArea({
               flexDirection: "column",
               animation: presetsDrag.pinned
                 ? undefined
-                : "slideInFromLeft 0.18s ease-out",
+                : leftHanded
+                  ? "slideInFromRight 0.18s ease-out"
+                  : "slideInFromLeft 0.18s ease-out",
             }}
-            onPointerDown={(e) => e.stopPropagation()}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              bringPanelToFront("presets");
+            }}
           >
             {/* Title bar */}
             <div
@@ -954,7 +1200,10 @@ export function CanvasArea({
                 ...titleBarStyle,
                 cursor: presetsDrag.pinned ? "grab" : "default",
               }}
-              onPointerDown={presetsDrag.handleTitleBarPointerDown}
+              onPointerDown={(e) => {
+                bringPanelToFront("presets");
+                presetsDrag.handleTitleBarPointerDown(e);
+              }}
               onPointerMove={(e) => presetsDrag.handleTitleBarPointerMove(e)}
               onPointerUp={presetsDrag.handleTitleBarPointerUp}
             >
@@ -1024,6 +1273,7 @@ export function CanvasArea({
                     currentOpacity={color.a}
                     onSaveCurrentToPreset={onSaveCurrentToPreset}
                     onEnterBrushTipEditor={onEnterBrushTipEditor}
+                    onInteract={() => bringPanelToFront("presets")}
                   />
                 ) : activeSubpanel === "lasso" ? (
                   <LassoPresetsPanel
@@ -1038,6 +1288,8 @@ export function CanvasArea({
                     onWandContiguousChange={onWandContiguousChange}
                     wandGrowShrink={wandGrowShrink}
                     onWandGrowShrinkChange={onWandGrowShrinkChange}
+                    wandEdgeExpand={wandEdgeExpand}
+                    onWandEdgeExpandChange={onWandEdgeExpandChange}
                   />
                 ) : activeSubpanel === "fill" ? (
                   <FillPresetsPanel
@@ -1101,7 +1353,7 @@ export function CanvasArea({
             data-ocid="mobile.layers_panel"
             style={{
               ...layersDrag.getPanelStyle(),
-              zIndex: layersDrag.pinned ? 55 : 50,
+              zIndex: getPanelZIndex("layers"),
               background: "oklch(var(--sidebar-right))",
               border: "1px solid oklch(var(--border))",
               borderRadius: 10,
@@ -1113,113 +1365,29 @@ export function CanvasArea({
               flexDirection: "column",
               animation: layersDrag.pinned
                 ? undefined
-                : "slideInFromRight 0.18s ease-out",
+                : leftHanded
+                  ? "slideInFromLeft 0.18s ease-out"
+                  : "slideInFromRight 0.18s ease-out",
             }}
-            onPointerDown={(e) => e.stopPropagation()}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              bringPanelToFront("layers");
+            }}
           >
-            {/* Single authoritative title bar: title + action buttons + pin */}
+            {/* Single authoritative title bar: title + pin */}
             <div
               style={{
                 ...titleBarStyle,
                 cursor: layersDrag.pinned ? "grab" : "default",
               }}
-              onPointerDown={layersDrag.handleTitleBarPointerDown}
+              onPointerDown={(e) => {
+                bringPanelToFront("layers");
+                layersDrag.handleTitleBarPointerDown(e);
+              }}
               onPointerMove={(e) => layersDrag.handleTitleBarPointerMove(e)}
               onPointerUp={layersDrag.handleTitleBarPointerUp}
             >
               <span style={titleBarTextStyle}>Layers</span>
-              {/* Action buttons — same ones that were in LayersPanel's internal header */}
-              <TooltipProvider>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 2,
-                    marginLeft: 4,
-                    marginRight: 4,
-                  }}
-                  onPointerDown={(e) => e.stopPropagation()}
-                >
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        onClick={() => onToggleAlphaLock(activeLayerId)}
-                        className={`p-1 rounded hover:bg-accent ${layers.find((l) => l.id === activeLayerId)?.alphaLock ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                        data-ocid="layers.toggle.button"
-                      >
-                        <Lock size={12} />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent>Alpha Lock</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        onClick={() => onToggleClippingMask(activeLayerId)}
-                        className={`p-1 rounded hover:bg-accent ${layers.find((l) => l.id === activeLayerId)?.isClippingMask ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                        data-ocid="layers.clipping_mask_button"
-                      >
-                        <Scissors size={12} />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent>Clipping Mask</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        onClick={onClearLayer}
-                        className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
-                        data-ocid="layers.clear_button"
-                      >
-                        <Eraser size={12} />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent>Clear Layer</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        onClick={onMergeLayers}
-                        className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
-                        data-ocid="layers.merge_button"
-                      >
-                        <Check size={12} />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent>Merge Down</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        onClick={onCreateGroup}
-                        className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
-                        data-ocid="layers.create_group_button"
-                      >
-                        <FolderPlus size={12} />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent>New Group</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        onClick={onAddLayer}
-                        className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
-                        data-ocid="layers.add_button"
-                      >
-                        <Plus size={12} />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent>Add Layer</TooltipContent>
-                  </Tooltip>
-                </div>
-              </TooltipProvider>
               <button
                 type="button"
                 title={layersDrag.pinned ? "Unpin panel" : "Pin panel"}
@@ -1235,6 +1403,7 @@ export function CanvasArea({
                 />
               </button>
             </div>
+
             {/* Content */}
             <div
               style={{
@@ -1263,6 +1432,11 @@ export function CanvasArea({
                 onMergeLayers={onMergeLayers}
                 onRenameLayer={onRenameLayer}
                 onToggleAlphaLock={onToggleAlphaLock}
+                onToggleLockLayer={onToggleLockLayer}
+                onDuplicateLayer={onDuplicateLayer}
+                onCutToNewLayer={onCutToNewLayer}
+                onCopyToNewLayer={onCopyToNewLayer}
+                hasActiveSelection={hasSelection}
                 thumbnails={layerThumbnails}
                 onCtrlClickLayer={onCtrlClickLayer}
                 onToggleRulerActive={onToggleRulerActive}
@@ -1280,6 +1454,7 @@ export function CanvasArea({
                 onToggleLayerSelection={onToggleLayerSelection}
                 onCreateGroup={onCreateGroup}
                 shiftHeld={shiftHeld}
+                onInteract={() => bringPanelToFront("layers")}
               />
             </div>
           </div>
@@ -1308,6 +1483,7 @@ export function CanvasArea({
         <canvas
           ref={displayCanvasRef}
           data-ocid="canvas.canvas_target"
+          tabIndex={0}
           style={{
             position: "absolute",
             left: 0,
@@ -1316,32 +1492,39 @@ export function CanvasArea({
             height: "100%",
             touchAction: "none",
             cursor: "inherit",
+            outline: "none",
           }}
           onDoubleClick={onCanvasDoubleClick}
         />
-        {/* Selection / Transform overlay canvas */}
-        <canvas
-          ref={(el) => {
-            onSelectionOverlayCanvasRef(el);
-            if (
-              el &&
-              (el.width !== canvasWidthRef.current ||
-                el.height !== canvasHeightRef.current)
-            ) {
-              el.width = canvasWidthRef.current;
-              el.height = canvasHeightRef.current;
-            }
-          }}
-          style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            width: "100%",
-            height: "100%",
-            pointerEvents: "none",
-          }}
-        />
       </div>
+      {/*
+        Selection / Transform overlay canvas — lives OUTSIDE the canvas wrapper so
+        transform handles can extend beyond the canvas bounds. The drawing code in
+        PaintingApp applies the same canvas-space → container-space transform as
+        the ruler overlay, so all coordinates still map correctly.
+        pointer-events: none so pointer events fall through to the canvas/container.
+      */}
+      <canvas
+        ref={(el) => {
+          onSelectionOverlayCanvasRef(el);
+          // Size to the full viewport so handles outside the container's
+          // overflow:hidden boundary are still visible and interactive.
+          if (el) {
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+            if (el.width !== vw || el.height !== vh) {
+              el.width = vw;
+              el.height = vh;
+            }
+          }
+        }}
+        style={{
+          position: "fixed",
+          inset: 0,
+          pointerEvents: "none",
+          zIndex: 11,
+        }}
+      />
       {/*
         Ruler overlay canvas — lives OUTSIDE the canvas wrapper so it is not clipped
         to the canvas rect. Positioned to fill the container so ruler lines can extend

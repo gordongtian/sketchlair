@@ -5,7 +5,7 @@ import type { SelectionSnapshot } from "../selectionTypes";
 import type { LayerNode } from "../types";
 import { applyCanvasResizeSideEffects } from "../utils/canvasResize";
 import type { WebGLBrushContext } from "../utils/webglBrush";
-import { markCanvasDirty } from "./useCompositing";
+import { evictLayerBitmap, markCanvasDirty } from "./useCompositing";
 import type { LayerSystemEntry, UndoEntry } from "./useLayerSystem";
 
 // Module-level reusable canvas for thumbnail generation in history operations
@@ -74,6 +74,118 @@ interface UseHistoryProps {
   undoLayerEntryRef: React.MutableRefObject<(entry: LayerSystemEntry) => void>;
 }
 
+// ── Memory management helpers ──────────────────────────────────────────────────
+
+/**
+ * Explicitly nulls all ImageData fields on an undo entry so the GC can reclaim
+ * the pixel buffers without waiting for the entry object itself to be collected.
+ *
+ * Call this ONLY on entries that have already been consumed (evicted from the
+ * undo cap, cleared from the redo stack on new action, or cleared on doc close).
+ * Never call on an entry that may still be used by undo/redo restore logic.
+ *
+ * The `type` field is intentionally preserved so any downstream code that
+ * inspects entry type after eviction still works correctly.
+ */
+export function nullifyUndoEntry(entry: UndoEntry): void {
+  switch (entry.type) {
+    case "pixels": {
+      const e = entry as { before: ImageData | null; after: ImageData | null };
+      e.before = null as unknown as ImageData;
+      e.after = null as unknown as ImageData;
+      break;
+    }
+    case "layer-add-pixels": {
+      const e = entry as {
+        pixels: ImageData | null;
+        srcBefore?: ImageData | null;
+        srcAfter?: ImageData | null;
+      };
+      e.pixels = null as unknown as ImageData;
+      if (e.srcBefore !== undefined) e.srcBefore = null;
+      if (e.srcAfter !== undefined) e.srcAfter = null;
+      break;
+    }
+    case "layer-delete": {
+      const e = entry as { pixels: ImageData | null };
+      e.pixels = null as unknown as ImageData;
+      break;
+    }
+    case "layer-merge": {
+      const e = entry as {
+        activePixels: ImageData | null;
+        belowPixelsBefore: ImageData | null;
+        belowPixelsAfter: ImageData | null;
+      };
+      e.activePixels = null as unknown as ImageData;
+      e.belowPixelsBefore = null as unknown as ImageData;
+      e.belowPixelsAfter = null as unknown as ImageData;
+      break;
+    }
+    case "canvas-resize": {
+      const e = entry as {
+        layerPixelsBefore: Map<string, ImageData | null>;
+        layerPixelsAfter: Map<string, ImageData | null>;
+      };
+      for (const k of e.layerPixelsBefore.keys())
+        e.layerPixelsBefore.set(k, null);
+      for (const k of e.layerPixelsAfter.keys())
+        e.layerPixelsAfter.set(k, null);
+      break;
+    }
+    case "layer-group-delete": {
+      const e = entry as {
+        deletedCanvases: Map<string, ImageData | null>;
+      };
+      for (const k of e.deletedCanvases.keys()) e.deletedCanvases.set(k, null);
+      break;
+    }
+    case "multi-layer-pixels": {
+      const e = entry as {
+        layers: Map<
+          string,
+          { before: ImageData | null; after: ImageData | null }
+        >;
+      };
+      for (const v of e.layers.values()) {
+        v.before = null as unknown as ImageData;
+        v.after = null as unknown as ImageData;
+      }
+      break;
+    }
+    // These entry types contain no ImageData — nothing to null.
+    case "layer-add":
+    case "blend-mode":
+    case "selection":
+    case "ruler-edit":
+    case "layers-clear-rulers":
+    case "layer-group-create":
+    case "layer-opacity-change":
+    case "group-opacity-change":
+    case "layer-visibility-change":
+    case "alpha-lock-change":
+    case "lock-layer-change":
+    case "clipping-mask-change":
+    case "layer-rename":
+    case "layer-reorder":
+      break;
+    default:
+      break;
+  }
+}
+
+/**
+ * Drains an entire undo/redo stack, nullifying ImageData on every entry and
+ * clearing the array in-place. Safe to call on both the live ref stack and
+ * any saved copy of a stack (e.g. doc.undoStack on document close).
+ */
+export function drainUndoStack(stack: UndoEntry[]): void {
+  for (const entry of stack) {
+    nullifyUndoEntry(entry);
+  }
+  stack.length = 0;
+}
+
 // ── Type guard ────────────────────────────────────────────────────────────────
 
 /** Returns true if the entry's undo/redo logic lives in useLayerSystem. */
@@ -90,6 +202,39 @@ function isLayerSystemEntry(entry: UndoEntry): entry is LayerSystemEntry {
     entry.type === "layer-group-create" ||
     entry.type === "layer-group-delete"
   );
+}
+
+// ── Named constants for undo memory limits ────────────────────────────────────
+
+/** Hard maximum undo entry count (the user-configurable per-doc cap is separate and lower). */
+const MAX_UNDO_ENTRIES = 50;
+
+/**
+ * Total memory budget for the undo history in MB (both undo and redo stacks combined).
+ * 500 MB accommodates large canvases and multi-layer transforms without being too restrictive.
+ */
+const MAX_UNDO_MEMORY_MB = 500;
+
+// Module-level cap ref — shared across all useHistory instances (one per document session).
+// Using a module-level ref means setHistoryCap works without needing React context.
+const _historyCapRef = { current: 20 };
+
+/**
+ * Update the undo history cap at runtime.
+ * - Updates the module-level cap.
+ * - Trims the provided undo stack to the new cap (oldest entries first), nullifying evicted entries.
+ * - Does NOT affect the redo stack.
+ */
+export function setHistoryCap(
+  n: number,
+  undoStackRef?: React.MutableRefObject<UndoEntry[]>,
+): void {
+  _historyCapRef.current = n;
+  if (!undoStackRef) return;
+  while (undoStackRef.current.length > n) {
+    const evicted = undoStackRef.current.shift();
+    if (evicted) nullifyUndoEntry(evicted);
+  }
 }
 
 export function useHistory({
@@ -140,7 +285,54 @@ export function useHistory({
   const pushHistory = useCallback(
     (entry: UndoEntry) => {
       undoStackRef.current.push(entry);
-      if (undoStackRef.current.length > 50) undoStackRef.current.shift();
+      // Enforce the user-configurable entry count cap (max MAX_UNDO_ENTRIES)
+      const effectiveCap = Math.min(_historyCapRef.current, MAX_UNDO_ENTRIES);
+      while (undoStackRef.current.length > effectiveCap) {
+        const evicted = undoStackRef.current.shift();
+        if (evicted) nullifyUndoEntry(evicted);
+      }
+      // Enforce the memory budget — evict oldest entries if total pixel data
+      // across both stacks exceeds MAX_UNDO_MEMORY_MB.
+      const calcStackBytes = (stack: UndoEntry[]): number =>
+        stack.reduce((sum, e) => {
+          if (e.type === "pixels") {
+            return (
+              sum +
+              (e.before ? e.before.data.byteLength : 0) +
+              (e.after ? e.after.data.byteLength : 0)
+            );
+          }
+          if (e.type === "multi-layer-pixels") {
+            let total = 0;
+            for (const l of e.layers.values()) {
+              total +=
+                (l.before ? l.before.data.byteLength : 0) +
+                (l.after ? l.after.data.byteLength : 0);
+            }
+            return sum + total;
+          }
+          if (e.type === "layer-merge") {
+            return (
+              sum +
+              (e.activePixels ? e.activePixels.data.byteLength : 0) +
+              (e.belowPixelsBefore ? e.belowPixelsBefore.data.byteLength : 0) +
+              (e.belowPixelsAfter ? e.belowPixelsAfter.data.byteLength : 0)
+            );
+          }
+          return sum;
+        }, 0);
+      const budgetBytes = MAX_UNDO_MEMORY_MB * 1024 * 1024;
+      while (
+        undoStackRef.current.length > 0 &&
+        calcStackBytes(undoStackRef.current) +
+          calcStackBytes(redoStackRef.current) >
+          budgetBytes
+      ) {
+        const evicted = undoStackRef.current.shift();
+        if (evicted) nullifyUndoEntry(evicted);
+      }
+      // Null all redo entries being discarded before clearing the stack
+      for (const old of redoStackRef.current) nullifyUndoEntry(old);
       redoStackRef.current = [];
       setUndoCount(undoStackRef.current.length);
       setRedoCount(0);
@@ -274,6 +466,7 @@ export function useHistory({
     } else if (entry.type === "layer-add") {
       setLayers((prev) => prev.filter((l) => l.id !== entry.layer.id));
       layerCanvasesRef.current.delete(entry.layer.id);
+      evictLayerBitmap(entry.layer.id);
       // Restore the active layer to whatever was active before the layer was added.
       // Without this, the active layer ID would point to the just-deleted layer.
       if (entry.previousActiveLayerId) {
@@ -281,6 +474,7 @@ export function useHistory({
       }
     } else if (entry.type === "layer-add-pixels") {
       layerCanvasesRef.current.delete(entry.layer.id);
+      evictLayerBitmap(entry.layer.id);
       setLayers((prev) => prev.filter((l) => l.id !== entry.layer.id));
       if (entry.srcLayerId && entry.srcBefore) {
         const srcId = entry.srcLayerId;
@@ -316,7 +510,11 @@ export function useHistory({
       if (belowLc) {
         const ctx = belowLc.getContext("2d", { willReadFrequently: true });
         if (ctx) {
-          ctx.putImageData(entry.belowPixelsBefore, 0, 0);
+          ctx.putImageData(
+            entry.belowPixelsBefore,
+            entry.dirtyRect?.x ?? 0,
+            entry.dirtyRect?.y ?? 0,
+          );
           markLayerBitmapDirty(entry.belowLayerId);
         }
         markCanvasDirty(entry.belowLayerId);
@@ -396,12 +594,20 @@ export function useHistory({
         revertTransformRef.current();
       }
       const dirtyIds: string[] = [];
-      for (const [layerId, { before }] of entry.layers) {
+      for (const [layerId, layerEntry] of entry.layers) {
         const lc = layerCanvasesRef.current.get(layerId);
         if (lc) {
           const ctx = lc.getContext("2d", { willReadFrequently: true });
           if (ctx) {
-            ctx.putImageData(before, 0, 0);
+            if (layerEntry.dirtyRect) {
+              ctx.putImageData(
+                layerEntry.before,
+                layerEntry.dirtyRect.x,
+                layerEntry.dirtyRect.y,
+              );
+            } else {
+              ctx.putImageData(layerEntry.before, 0, 0);
+            }
             dirtyIds.push(layerId);
           }
           markCanvasDirty(layerId);
@@ -415,7 +621,10 @@ export function useHistory({
     }
 
     redoStackRef.current.push(entry);
-    if (redoStackRef.current.length > 50) redoStackRef.current.shift();
+    if (redoStackRef.current.length > _historyCapRef.current) {
+      const evicted = redoStackRef.current.shift();
+      if (evicted) nullifyUndoEntry(evicted);
+    }
     composite();
     updateNavigator();
     setUndoCount(undoStackRef.current.length);
@@ -433,6 +642,7 @@ export function useHistory({
       if (entry.type === "layer-group-delete") {
         for (const layerId of entry.deletedCanvases.keys()) {
           layerCanvasesRef.current.delete(layerId);
+          evictLayerBitmap(layerId);
         }
       }
       applyLayerEntryRef.current(entry);
@@ -485,6 +695,7 @@ export function useHistory({
     } else if (entry.type === "layer-delete") {
       setLayers((prev) => prev.filter((l) => l.id !== entry.layer.id));
       layerCanvasesRef.current.delete(entry.layer.id);
+      evictLayerBitmap(entry.layer.id);
     } else if (entry.type === "selection") {
       restoreSelectionSnapshot(entry.after);
     } else if (entry.type === "ruler-edit") {
@@ -499,7 +710,11 @@ export function useHistory({
       if (belowLc2) {
         const ctx = belowLc2.getContext("2d", { willReadFrequently: true });
         if (ctx) {
-          ctx.putImageData(entry.belowPixelsAfter, 0, 0);
+          ctx.putImageData(
+            entry.belowPixelsAfter,
+            entry.dirtyRect?.x ?? 0,
+            entry.dirtyRect?.y ?? 0,
+          );
           markLayerBitmapDirty(entry.belowLayerId);
         }
         markCanvasDirty(entry.belowLayerId);
@@ -552,16 +767,25 @@ export function useHistory({
       setLayers((prev) => prev.filter((l) => !ids.has(l.id)));
       for (const { layer } of entry.removedLayers) {
         layerCanvasesRef.current.delete(layer.id);
+        evictLayerBitmap(layer.id);
       }
     } else if (entry.type === "multi-layer-pixels") {
       // Redo: atomically re-apply ALL layers involved in the multi-layer transform.
       const dirtyIds: string[] = [];
-      for (const [layerId, { after }] of entry.layers) {
+      for (const [layerId, layerEntry] of entry.layers) {
         const lc = layerCanvasesRef.current.get(layerId);
         if (lc) {
           const ctx = lc.getContext("2d", { willReadFrequently: true });
           if (ctx) {
-            ctx.putImageData(after, 0, 0);
+            if (layerEntry.dirtyRect) {
+              ctx.putImageData(
+                layerEntry.after,
+                layerEntry.dirtyRect.x,
+                layerEntry.dirtyRect.y,
+              );
+            } else {
+              ctx.putImageData(layerEntry.after, 0, 0);
+            }
             dirtyIds.push(layerId);
           }
           markCanvasDirty(layerId);
@@ -575,7 +799,10 @@ export function useHistory({
     }
 
     undoStackRef.current.push(entry);
-    if (undoStackRef.current.length > 50) undoStackRef.current.shift();
+    if (undoStackRef.current.length > _historyCapRef.current) {
+      const evicted = undoStackRef.current.shift();
+      if (evicted) nullifyUndoEntry(evicted);
+    }
     composite();
     updateNavigator();
     setUndoCount(undoStackRef.current.length);

@@ -953,7 +953,78 @@ export function useTransformSystem({
           ctx.globalAlpha = 1;
 
           const after = ctx.getImageData(0, 0, lc.width, lc.height);
-          pushHistory({ type: "pixels", layerId, before, after });
+          // Compute dirty rect: union of source content area and destination bounding box,
+          // clamped to canvas, padded by 4px. Both regions changed (erase + draw).
+          const _fcDrPad = 4;
+          const _fcUMinX = Math.max(0, Math.min(srcX, dstMinX) - _fcDrPad);
+          const _fcUMinY = Math.max(0, Math.min(srcY, dstMinY) - _fcDrPad);
+          const _fcUMaxX = Math.min(
+            lc.width,
+            Math.max(srcX + srcW, dstMaxX) + _fcDrPad,
+          );
+          const _fcUMaxY = Math.min(
+            lc.height,
+            Math.max(srcY + srcH, dstMaxY) + _fcDrPad,
+          );
+          const _fcDrW = _fcUMaxX - _fcUMinX;
+          const _fcDrH = _fcUMaxY - _fcUMinY;
+          if (
+            _fcDrW > 0 &&
+            _fcDrH > 0 &&
+            _fcDrW * _fcDrH < lc.width * lc.height * 0.5
+          ) {
+            // Crop before-snapshot to the dirty region
+            const _fcTmp = document.createElement("canvas");
+            _fcTmp.width = _fcDrW;
+            _fcTmp.height = _fcDrH;
+            const _fcTmpCtx = _fcTmp.getContext("2d", {
+              willReadFrequently: true,
+            });
+            if (_fcTmpCtx) {
+              _fcTmpCtx.putImageData(before, -_fcUMinX, -_fcUMinY);
+              const _fcCroppedBefore = _fcTmpCtx.getImageData(
+                0,
+                0,
+                _fcDrW,
+                _fcDrH,
+              );
+              const _fcCroppedAfter = ctx.getImageData(
+                _fcUMinX,
+                _fcUMinY,
+                _fcDrW,
+                _fcDrH,
+              );
+              const _fcDirtyRect = {
+                x: _fcUMinX,
+                y: _fcUMinY,
+                w: _fcDrW,
+                h: _fcDrH,
+              };
+              pushHistory({
+                type: "pixels",
+                layerId,
+                dirtyRect: _fcDirtyRect,
+                before: _fcCroppedBefore,
+                after: _fcCroppedAfter,
+              });
+            } else {
+              pushHistory({
+                type: "pixels",
+                layerId,
+                dirtyRect: { x: 0, y: 0, w: lc.width, h: lc.height },
+                before,
+                after,
+              });
+            }
+          } else {
+            pushHistory({
+              type: "pixels",
+              layerId,
+              dirtyRect: { x: 0, y: 0, w: lc.width, h: lc.height },
+              before,
+              after,
+            });
+          }
           markLayerBitmapDirtyRef?.current(layerId);
 
           freeCornerStateRef.current = null;
@@ -1137,7 +1208,78 @@ export function useTransformSystem({
       ctx.globalCompositeOperation = "source-over";
       ctx.globalAlpha = 1;
       const after = ctx.getImageData(0, 0, lc.width, lc.height);
-      pushHistory({ type: "pixels", layerId, before, after });
+      // Compute dirty rect: union of original content area (obCommit) and destination
+      // area (xfCommit), padded and clamped to canvas. Both regions change.
+      const _xfObX = obCommit?.x ?? 0;
+      const _xfObY = obCommit?.y ?? 0;
+      const _xfObW = obCommit?.w ?? lc.width;
+      const _xfObH = obCommit?.h ?? lc.height;
+      const _xfDstX = xfCommit?.x ?? 0;
+      const _xfDstY = xfCommit?.y ?? 0;
+      const _xfDstW = xfCommit?.w ?? lc.width;
+      const _xfDstH = xfCommit?.h ?? lc.height;
+      const _xfPad = 4;
+      const _xfUMinX = Math.max(0, Math.min(_xfObX, _xfDstX) - _xfPad);
+      const _xfUMinY = Math.max(0, Math.min(_xfObY, _xfDstY) - _xfPad);
+      const _xfUMaxX = Math.min(
+        lc.width,
+        Math.max(_xfObX + _xfObW, _xfDstX + _xfDstW) + _xfPad,
+      );
+      const _xfUMaxY = Math.min(
+        lc.height,
+        Math.max(_xfObY + _xfObH, _xfDstY + _xfDstH) + _xfPad,
+      );
+      const _xfDrW = _xfUMaxX - _xfUMinX;
+      const _xfDrH = _xfUMaxY - _xfUMinY;
+      if (
+        _xfDrW > 0 &&
+        _xfDrH > 0 &&
+        _xfDrW * _xfDrH < lc.width * lc.height * 0.5
+      ) {
+        const _xfTmp = document.createElement("canvas");
+        _xfTmp.width = _xfDrW;
+        _xfTmp.height = _xfDrH;
+        const _xfTmpCtx = _xfTmp.getContext("2d", { willReadFrequently: true });
+        if (_xfTmpCtx) {
+          _xfTmpCtx.putImageData(before, -_xfUMinX, -_xfUMinY);
+          const _xfCroppedBefore = _xfTmpCtx.getImageData(0, 0, _xfDrW, _xfDrH);
+          const _xfCroppedAfter = ctx.getImageData(
+            _xfUMinX,
+            _xfUMinY,
+            _xfDrW,
+            _xfDrH,
+          );
+          const _xfDirtyRect = {
+            x: _xfUMinX,
+            y: _xfUMinY,
+            w: _xfDrW,
+            h: _xfDrH,
+          };
+          pushHistory({
+            type: "pixels",
+            layerId,
+            dirtyRect: _xfDirtyRect,
+            before: _xfCroppedBefore,
+            after: _xfCroppedAfter,
+          });
+        } else {
+          pushHistory({
+            type: "pixels",
+            layerId,
+            dirtyRect: { x: 0, y: 0, w: lc.width, h: lc.height },
+            before,
+            after,
+          });
+        }
+      } else {
+        pushHistory({
+          type: "pixels",
+          layerId,
+          dirtyRect: { x: 0, y: 0, w: lc.width, h: lc.height },
+          before,
+          after,
+        });
+      }
       markLayerBitmapDirtyRef?.current(layerId);
 
       _updateSelectionAfterCommit(xfCommit, obCommit, opts, lc);

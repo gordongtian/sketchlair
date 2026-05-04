@@ -56,6 +56,27 @@ export function invalidateAllLayerBitmaps(): void {
   _layerBitmapPending.clear();
 }
 
+/**
+ * Close and evict the cached ImageBitmap for a single layer.
+ * Call whenever a layer canvas is permanently removed (layer delete, undo of layer add, etc.)
+ * so the GPU memory is freed immediately rather than waiting for the next full invalidation.
+ *
+ * Also removes the layer ID from the pending thumbnail set so a debounced thumbnail
+ * flush firing up to 80ms later cannot re-access the already-removed canvas.
+ */
+export function evictLayerBitmap(id: string): void {
+  const bm = _layerBitmapCache.get(id);
+  if (bm) {
+    bm.close();
+    _layerBitmapCache.delete(id);
+  }
+  _layerBitmapDirty.delete(id);
+  _layerBitmapPending.delete(id);
+  // Remove from pending thumbnail set so the debounced flush does not attempt to
+  // regenerate a thumbnail for a canvas that has already been removed from the map.
+  _pendingThumbLayerIds.delete(id);
+}
+
 export function setActiveLayerIdForBitmap(id: string): void {
   _activeLayerIdForBitmap = id;
 }
@@ -63,7 +84,9 @@ export function setActiveLayerIdForBitmap(id: string): void {
 export function getBitmapOrCanvas(
   id: string,
   lc: HTMLCanvasElement,
-): HTMLCanvasElement | ImageBitmap {
+): HTMLCanvasElement | ImageBitmap | OffscreenCanvas {
+  // During a liquify stroke the GPU pipeline writes the preview directly to the
+  // display canvas via blitLiquifyPreview — no offscreen substitution needed here.
   // Active layer changes on every stroke — skip cache entirely to avoid async upload overhead.
   if (id === _activeLayerIdForBitmap) return lc;
   if (_layerBitmapDirty.has(id)) {
@@ -104,17 +127,48 @@ export function getBitmapOrCanvas(
 // cancelling only _liqRafPendingRef is insufficient when the first RAF already
 // fired and enqueued the scheduleComposite inner RAF before pointer-down ran.
 let _scheduleCompositeRafId: number | null = null;
+// Module-level scheduled flag — must stay in sync with compositeScheduledRef inside
+// the hook closure. cancelScheduledComposite() resets BOTH so that the next
+// scheduleComposite() call (e.g. from a brush stroke on a new layer after liquify)
+// correctly enqueues a new RAF instead of short-circuiting.
+let _scheduleCompositeScheduled = false;
 
 /**
  * Cancel the pending scheduleComposite RAF if one is in flight.
  * Call at liquify pointer-down to prevent a trailing composite from the previous
  * stroke's last pointer-move from flashing inactive layers' pre-warp state.
+ *
+ * FIX A: Also resets _scheduleCompositeScheduled so the next scheduleComposite()
+ * call after a liquify stroke correctly enqueues a new RAF. Without this reset,
+ * compositeScheduledRef stays true after the RAF is cancelled, causing all
+ * subsequent scheduleComposite() calls to short-circuit — making brush strokes
+ * on new layers appear invisible (display never updates).
  */
 export function cancelScheduledComposite(): void {
   if (_scheduleCompositeRafId !== null) {
     cancelAnimationFrame(_scheduleCompositeRafId);
     _scheduleCompositeRafId = null;
   }
+  // Reset the scheduled flag so the next scheduleComposite() call can enqueue
+  _scheduleCompositeScheduled = false;
+}
+
+/**
+ * Force-reset all composite scheduling state — both the RAF ID and the
+ * scheduled flag.  Call from any liquify pointer-up/cancel finally block to
+ * guarantee the scheduling machinery is clean for the next operation,
+ * regardless of what happened inside the try block.
+ *
+ * Identical to cancelScheduledComposite() in effect; exported under a
+ * distinct name so call-sites make their intent clear (unconditional reset
+ * vs. "cancel if pending").
+ */
+export function forceResetCompositeSchedule(): void {
+  if (_scheduleCompositeRafId !== null) {
+    cancelAnimationFrame(_scheduleCompositeRafId);
+    _scheduleCompositeRafId = null;
+  }
+  _scheduleCompositeScheduled = false;
 }
 
 // ─── Canvas-dirty signal ─────────────────────────────────────────────────────
@@ -541,15 +595,8 @@ export function useCompositing({
       const drH = drY2 - drY;
       if (useDR) {
         ctx.clearRect(drX, drY, drW, drH);
-        // Safety net: fill the dirty region with opaque white so the HTML page background
-        // never shows through if the bottommost layer canvas is still transparent.
-        ctx.fillStyle = "#ffffff";
-        ctx.fillRect(drX, drY, drW, drH);
       } else {
         ctx.clearRect(0, 0, dW, dH);
-        // Safety net: fill the full canvas with opaque white before drawing any layer.
-        ctx.fillStyle = "#ffffff";
-        ctx.fillRect(0, 0, dW, dH);
       }
 
       // Iterate the flat layers array directly (bottom-to-top = painter's algorithm).
@@ -570,10 +617,6 @@ export function useCompositing({
       // Group scope stack — innermost-first.
       // Each entry tracks the enclosing group's opacity/visibility for cascading.
       const groupScopeStack: GroupScope[] = [];
-
-      // FIX 3: Validation counters for the debug log at the end of composite().
-      let paintedCount = 0;
-      const totalPaintLayers = ls.filter(isFlatLayer).length;
 
       for (let i = ls.length - 1; i >= 0; i--) {
         const entry = ls[i];
@@ -698,7 +741,6 @@ export function useCompositing({
         // FIX 2a: Use getOrCreateLayerCanvas for paint layers so missing or
         // wrongly-sized canvases are self-healed rather than silently skipped.
         const lc = getOrCreateLayerCanvas(layer.id);
-        paintedCount++;
 
         // Effective opacity cascades through all ancestor group opacities
         const effectiveOpacity = effectiveOpacityFromStack(
@@ -1016,11 +1058,6 @@ export function useCompositing({
 
       ctx.globalAlpha = 1;
       if (useDR) ctx.restore();
-      // FIX 3: Debug log — how many paint layers were actually painted vs total.
-      // Gated behind console.debug so it only shows in dev tools when enabled.
-      console.debug(
-        `[Composite] painted ${paintedCount}/${totalPaintLayers} paint layers`,
-      );
       // Notify subscribers (e.g. navigator) that a full composite just completed.
       _scheduleCompositeDone();
     },
@@ -1419,17 +1456,6 @@ export function useCompositing({
     if (!belowCtx) return;
     if (!cacheValid) {
       belowCtx.clearRect(0, 0, W, H);
-      // Belt-and-suspenders: fill belowActiveCanvas with opaque white before
-      // drawing any layers. If getBitmapOrCanvas returns a stale (smaller)
-      // ImageBitmap for a layer that was just resized, the drawImage only fills
-      // the old (smaller) region — leaving the expanded area transparent.
-      // That transparent region bleeds into compositeWithStrokePreview's
-      // displayCtx.drawImage(below, ...) call, producing a visible transparency
-      // flash in the newly expanded canvas area.
-      // The white fill ensures the expanded area is always opaque, even when
-      // bitmaps are momentarily stale (they are invalidated async via markLayerBitmapDirty).
-      belowCtx.fillStyle = "#ffffff";
-      belowCtx.fillRect(0, 0, W, H);
       belowCtx.globalAlpha = 1;
       // Build a group scope stack for cascaded opacity/visibility while
       // iterating below layers (same bottom-to-top direction as composite()).
@@ -1693,23 +1719,44 @@ export function useCompositing({
   );
 
   // ── scheduleComposite ────────────────────────────────────────────────────
-  // Gated by getLiquifyStrokeActive(): while a liquify stroke is in progress,
-  // any trailing RAF from the previous stroke's pointer-move is suppressed here
-  // so pre-warp layer state is never drawn to the canvas at stroke start.
-  // This is the single authoritative gate (A4 fix — collapsed from three stacked fixes).
+  // During a liquify stroke, suppress all reactive compositing — blitLiquifyPreview
+  // writes the warped result directly to the display canvas each frame. If composite()
+  // runs on the same frame it overwrites the preview with the pre-warp layer canvas.
+  // The guard is cleared in the pointer-up handler BEFORE composite() is called
+  // explicitly, so the committed result always appears on screen.
+  //
+  // FIX A: compositeScheduledRef is kept in sync with the module-level
+  // _scheduleCompositeScheduled flag so that cancelScheduledComposite() can reset
+  // both atomically. Without this sync, cancelling the RAF (e.g. at liquify
+  // pointer-down) leaves compositeScheduledRef.current=true, causing all subsequent
+  // scheduleComposite() calls to short-circuit — making brush strokes invisible.
   const compositeScheduledRef = useRef(false);
   const scheduleComposite = useCallback(() => {
-    // Gate: skip if a liquify stroke is active so no pre-warp render can sneak through.
+    // Suppress reactive composites during liquify stroke — preview is drawn
+    // directly to the display canvas by blitLiquifyPreview each frame.
     if (getLiquifyStrokeActive()) return;
+    // FIX A (self-healing): if the scheduled flag is set but no RAF is pending,
+    // the RAF was cancelled (e.g. by cancelScheduledComposite at liquify pointer-down)
+    // but the flag was left true. Reset it so the next stroke is not permanently stuck.
+    if (_scheduleCompositeScheduled && !_scheduleCompositeRafId) {
+      _scheduleCompositeScheduled = false;
+      compositeScheduledRef.current = false;
+    }
+    // Sync from module-level flag in case cancelScheduledComposite() reset it
+    // while compositeScheduledRef.current was still true (e.g. after liquify).
+    if (_scheduleCompositeScheduled === false) {
+      compositeScheduledRef.current = false;
+    }
     if (compositeScheduledRef.current) return;
     compositeScheduledRef.current = true;
-    requestAnimationFrame(() => {
+    _scheduleCompositeScheduled = true;
+    const rafId = requestAnimationFrame(() => {
+      _scheduleCompositeRafId = null;
       compositeScheduledRef.current = false;
-      // Re-check inside the RAF — pointer-down may have set the flag while
-      // this frame was already pending.
-      if (getLiquifyStrokeActive()) return;
+      _scheduleCompositeScheduled = false;
       composite();
     });
+    _scheduleCompositeRafId = rafId;
   }, [composite]);
 
   // ── _strokeCommitDirty ────────────────────────────────────────────────────

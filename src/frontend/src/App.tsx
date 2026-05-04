@@ -4,7 +4,11 @@ import { DocumentTabBar } from "@/components/DocumentTabBar";
 import { MarketplaceScreen } from "@/components/MarketplaceScreen";
 import { NewDocumentModal } from "@/components/NewDocumentModal";
 import { PaintingApp } from "@/components/PaintingApp";
+import { ProfileScreen } from "@/components/ProfileScreen";
+import { PurchaseConfirmation } from "@/components/PurchaseConfirmation";
 import { SplashScreen } from "@/components/SplashScreen";
+import { DialogueProvider } from "@/components/dialogue/DialogueContext";
+import { DialoguePlayer } from "@/components/dialogue/DialoguePlayer";
 import { FigureDrawingSetup } from "@/components/learn/FigureDrawingSetup";
 import { SessionEndScreen } from "@/components/learn/SessionEndScreen";
 import { Toaster } from "@/components/ui/sonner";
@@ -15,6 +19,8 @@ import {
 import { useAuth } from "@/hooks/useAuth";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { usePreferences } from "@/hooks/usePreferences";
+import { useSubscriptionStatus } from "@/hooks/useSubscriptionStatus";
+import type { PurchaseConfirmationData } from "@/types/marketplace";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import { AnimatePresence } from "motion/react";
@@ -25,6 +31,7 @@ import {
   useInternetIdentity,
 } from "./hooks/useInternetIdentity";
 import type { PresetsPayload } from "./hooks/usePresetSystem";
+import { IS_IOS, IS_STANDALONE } from "./pwa";
 import type { FigureDrawingConfig, ImageSet } from "./types/learn";
 import { type ThemeId, applyThemeOverrides } from "./utils/themeOverrides";
 
@@ -110,6 +117,28 @@ function AppInner() {
     [],
   );
 
+  // Profile page state
+  const [showProfile, setShowProfile] = useState(false);
+  const onShowProfile = useCallback(() => setShowProfile(true), []);
+  const onCloseProfile = useCallback(() => setShowProfile(false), []);
+
+  // Post-checkout purchase confirmation
+  const [purchaseConfirmation, setPurchaseConfirmation] =
+    useState<PurchaseConfirmationData | null>(null);
+  const _onPurchaseConfirmed = useCallback(
+    (data: PurchaseConfirmationData) => setPurchaseConfirmation(data),
+    [],
+  );
+  const onPurchaseConfirmationDismiss = useCallback(
+    () => setPurchaseConfirmation(null),
+    [],
+  );
+
+  // Subscription status
+  const { active: subscriptionActive } = useSubscriptionStatus(
+    isLoggedIn ? identity : null,
+  );
+
   // ── Figure Drawing state ─────────────────────────────────────────────────
   const [figDrawView, setFigDrawView] = useState<FigureDrawingView>({
     mode: "idle",
@@ -173,6 +202,7 @@ function AppInner() {
     getSktchBlob,
     setDirty,
     handleSwitchDocument,
+    getNextUntitledIndex,
   } = useDocumentContext();
 
   // Update page title whenever the active document changes
@@ -230,11 +260,14 @@ function AppInner() {
 
   const handleNewCanvas = useCallback(
     (opts: { width: number; height: number }) => {
-      createDocument(opts.width, opts.height, "Untitled-1.sktch");
+      // Use getNextUntitledIndex so the filename is unique and never collides
+      // with a previously-saved document (e.g. an Untitled-1 that was renamed).
+      const idx = getNextUntitledIndex();
+      createDocument(opts.width, opts.height, `Untitled-${idx}.sktch`);
       setShowSplash(false);
       localStorage.setItem(SESSION_EXISTS_KEY, "1");
     },
-    [createDocument],
+    [createDocument, getNextUntitledIndex],
   );
 
   const handleOpenFile = useCallback(
@@ -451,6 +484,15 @@ function AppInner() {
               flexDirection: "column",
               height: "100vh",
               overflow: "hidden",
+              // iOS PWA safe area insets — avoids notch and home indicator overlap
+              paddingTop:
+                IS_STANDALONE && IS_IOS
+                  ? "env(safe-area-inset-top)"
+                  : undefined,
+              paddingBottom:
+                IS_STANDALONE && IS_IOS
+                  ? "env(safe-area-inset-bottom)"
+                  : undefined,
             }}
           >
             {/* Main canvas area — paddingBottom compensates for fixed DocumentTabBar height */}
@@ -573,6 +615,7 @@ function AppInner() {
             }}
             onAdminPortal={() => setShowAdminPortal(true)}
             onShowMarketplace={handleShowMarketplace}
+            onShowProfile={isLoggedIn ? onShowProfile : undefined}
           />
         )}
 
@@ -586,10 +629,48 @@ function AppInner() {
         <MarketplaceScreen
           onClose={handleCloseMarketplace}
           identity={identity ?? undefined}
+          onPurchaseSuccess={(data) => {
+            // Find the purchased item from the catalog on next refetch
+            handleCloseMarketplace();
+            void data; // refetch entitlements on next open
+          }}
+          subscriptionActive={subscriptionActive}
+        />
+      )}
+
+      {/* Profile screen — full-screen overlay, only for logged-in users */}
+      {showProfile && isLoggedIn && identity && (
+        <ProfileScreen
+          identity={identity}
+          onClose={onCloseProfile}
+          onShowMarketplace={() => {
+            onCloseProfile();
+            handleShowMarketplace();
+          }}
+        />
+      )}
+
+      {/* Purchase confirmation overlay */}
+      {purchaseConfirmation && (
+        <PurchaseConfirmation
+          data={purchaseConfirmation}
+          onViewInLearn={() => {
+            onPurchaseConfirmationDismiss();
+            handleCloseMarketplace();
+            // Navigate to learn via splash
+            setShowSplash(true);
+          }}
+          onBackToShop={() => {
+            onPurchaseConfirmationDismiss();
+            handleShowMarketplace();
+          }}
         />
       )}
 
       <Toaster />
+
+      {/* DialoguePlayer — root-level overlay, always mounted, z-[9800] */}
+      <DialoguePlayer />
     </>
   );
 }
@@ -599,7 +680,9 @@ export default function App() {
     <QueryClientProvider client={queryClient}>
       <InternetIdentityProvider>
         <DocumentProvider>
-          <AppInner />
+          <DialogueProvider>
+            <AppInner />
+          </DialogueProvider>
         </DocumentProvider>
       </InternetIdentityProvider>
     </QueryClientProvider>

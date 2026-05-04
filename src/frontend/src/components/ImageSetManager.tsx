@@ -2,6 +2,7 @@
  * ImageSetManager — admin UI for managing figure drawing image sets.
  */
 
+import { ContentType } from "@/backend";
 import type { ImageReference, ImageSet, backendInterface } from "@/backend.d";
 import { createActorWithConfig, loadConfig } from "@/config";
 import type { paymentsInterface } from "@/payments.d";
@@ -45,10 +46,17 @@ interface NewSetForm {
   isFree: boolean;
   isDefault: boolean;
   price: string;
+  contentType: ContentType;
+  isSubscriberContent: boolean;
+  description: string;
   error: string | null;
 }
 
 const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB
+
+// These two sets are hardcoded in the backend and can never be deleted.
+// All other sets — including default or free ones — are deletable.
+const STARTER_SET_IDS = new Set(["starter-male", "starter-female"]);
 
 // ── Lightbox ─────────────────────────────────────────────────────────────────
 
@@ -177,7 +185,7 @@ function NewSetDialog({
       style={{ background: "rgba(0,0,0,0.7)" }}
     >
       <div
-        className="rounded-xl p-6 max-w-sm w-full mx-4 flex flex-col gap-4"
+        className="rounded-xl p-6 max-w-md w-full mx-4 flex flex-col gap-4"
         style={{
           backgroundColor: "oklch(var(--toolbar))",
           border: "1px solid oklch(var(--outline))",
@@ -228,6 +236,39 @@ function NewSetDialog({
           )}
         </div>
 
+        {/* Content Type */}
+        <div className="flex flex-col gap-1">
+          <label
+            htmlFor="new-set-content-type"
+            className="text-xs"
+            style={{ color: "oklch(var(--muted-text))" }}
+          >
+            Content Type
+          </label>
+          <select
+            id="new-set-content-type"
+            data-ocid="new_set.content_type_select"
+            value={form.contentType}
+            onChange={(e) =>
+              onChange({
+                ...form,
+                contentType: e.target.value as ContentType,
+                error: null,
+              })
+            }
+            className="px-3 py-2 rounded-lg text-sm"
+            style={{
+              backgroundColor: "oklch(var(--sidebar-left))",
+              border: "1px solid oklch(var(--outline))",
+              color: "oklch(var(--text))",
+              outline: "none",
+            }}
+          >
+            <option value="referencepack">Reference Pack</option>
+            <option value="learningmodule">Learning Module</option>
+          </select>
+        </div>
+
         {/* Free / Paid toggle */}
         <div className="flex items-center gap-3">
           <button
@@ -237,6 +278,7 @@ function NewSetDialog({
               onChange({
                 ...form,
                 isFree: !form.isFree,
+                isDefault: form.isFree ? form.isDefault : false,
                 price: "",
                 error: null,
               })
@@ -304,22 +346,90 @@ function NewSetDialog({
           </div>
         )}
 
-        {/* Mark as default checkbox */}
+        {/* Subscriber Content toggle */}
         <label
           className="flex items-center gap-2.5 cursor-pointer select-none"
-          data-ocid="new_set.default_checkbox"
+          data-ocid="new_set.subscriber_toggle"
         >
           <input
             type="checkbox"
-            checked={form.isDefault}
-            onChange={(e) => onChange({ ...form, isDefault: e.target.checked })}
+            checked={form.isSubscriberContent}
+            onChange={(e) =>
+              onChange({ ...form, isSubscriberContent: e.target.checked })
+            }
             className="w-4 h-4 rounded"
             style={{ accentColor: "oklch(var(--accent))" }}
           />
           <span className="text-xs" style={{ color: "oklch(var(--text))" }}>
-            Mark as default set
+            Subscriber Content
+          </span>
+          <span
+            className="text-xs"
+            style={{ color: "oklch(var(--muted-text))" }}
+          >
+            (included with subscription)
           </span>
         </label>
+
+        {/* Mark as default checkbox — hidden for free sets */}
+        {!form.isFree && (
+          <label
+            className="flex items-center gap-2.5 cursor-pointer select-none"
+            data-ocid="new_set.default_checkbox"
+          >
+            <input
+              type="checkbox"
+              checked={form.isDefault}
+              onChange={(e) =>
+                onChange({ ...form, isDefault: e.target.checked })
+              }
+              className="w-4 h-4 rounded"
+              style={{ accentColor: "oklch(var(--accent))" }}
+            />
+            <span className="text-xs" style={{ color: "oklch(var(--text))" }}>
+              Mark as default set
+            </span>
+          </label>
+        )}
+
+        {/* Description */}
+        <div className="flex flex-col gap-1">
+          <label
+            htmlFor="new-set-description"
+            className="text-xs"
+            style={{ color: "oklch(var(--muted-text))" }}
+          >
+            Description (optional, max 500 characters)
+          </label>
+          <textarea
+            id="new-set-description"
+            data-ocid="new_set.description_textarea"
+            value={form.description}
+            onChange={(e) =>
+              onChange({ ...form, description: e.target.value.slice(0, 500) })
+            }
+            rows={2}
+            placeholder="Brief description for the marketplace…"
+            className="px-3 py-2 rounded-lg text-sm resize-none"
+            style={{
+              backgroundColor: "oklch(var(--sidebar-left))",
+              border: "1px solid oklch(var(--outline))",
+              color: "oklch(var(--text))",
+              outline: "none",
+            }}
+          />
+          <span
+            className="text-xs self-end"
+            style={{
+              color:
+                form.description.length >= 490
+                  ? "oklch(0.65 0.2 25)"
+                  : "oklch(var(--muted-text))",
+            }}
+          >
+            {form.description.length}/500
+          </span>
+        </div>
 
         <div className="flex gap-3 justify-end">
           <button
@@ -484,12 +594,17 @@ interface SetCardProps {
   onRemoveImage: (setId: string, imageId: string) => void;
   onDeleteSet: (setId: string) => void;
   onSetDefault: (setId: string) => void;
+  onUnsetDefault: (setId: string) => void;
   onOpenLightbox: (url: string) => void;
   uploading: UploadingFile[];
   priceUsdCents?: bigint;
   onSavePrice: (packId: string, cents: bigint) => Promise<void>;
   onSaveTags: (setId: string, tags: string[]) => Promise<void>;
   onRenameSet: (setId: string, newName: string) => Promise<void>;
+  onSaveContentType: (setId: string, ct: ContentType) => Promise<void>;
+  onSaveSubscriberContent: (setId: string, val: boolean) => Promise<void>;
+  onSaveDescription: (setId: string, desc: string) => Promise<void>;
+  hasOtherNonDefaultSet: boolean;
 }
 
 function ImageSetCard({
@@ -498,12 +613,17 @@ function ImageSetCard({
   onRemoveImage,
   onDeleteSet,
   onSetDefault,
+  onUnsetDefault,
   onOpenLightbox,
   uploading,
   priceUsdCents,
   onSavePrice,
   onSaveTags,
   onRenameSet,
+  onSaveContentType,
+  onSaveSubscriberContent,
+  onSaveDescription,
+  hasOtherNonDefaultSet,
 }: SetCardProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -639,6 +759,77 @@ function ImageSetCard({
     } finally {
       setIsSavingPrice(false);
     }
+  };
+
+  // ── Content type, subscriber content, description state ────────────────────
+  const [localContentType, setLocalContentType] = useState<ContentType>(
+    set.contentType ?? ContentType.referencepack,
+  );
+  const [isSavingContentType, setIsSavingContentType] = useState(false);
+
+  const handleContentTypeChange = async (ct: ContentType) => {
+    if (ct === localContentType) return;
+    setIsSavingContentType(true);
+    try {
+      await onSaveContentType(set.id, ct);
+      setLocalContentType(ct);
+    } catch {
+      toast.error("Failed to update content type");
+    } finally {
+      setIsSavingContentType(false);
+    }
+  };
+
+  const [localSubscriberContent, setLocalSubscriberContent] = useState(
+    set.isSubscriberContent ?? false,
+  );
+  const [isSavingSubscriber, setIsSavingSubscriber] = useState(false);
+
+  const handleSubscriberContentChange = async (val: boolean) => {
+    setIsSavingSubscriber(true);
+    try {
+      await onSaveSubscriberContent(set.id, val);
+      setLocalSubscriberContent(val);
+    } catch {
+      toast.error("Failed to update subscriber content setting");
+    } finally {
+      setIsSavingSubscriber(false);
+    }
+  };
+
+  const [localDescription, setLocalDescription] = useState(
+    set.description ?? "",
+  );
+  const [isEditingDescription, setIsEditingDescription] = useState(false);
+  const [descriptionDraft, setDescriptionDraft] = useState("");
+  const [isSavingDescription, setIsSavingDescription] = useState(false);
+
+  const handleStartEditDescription = () => {
+    setDescriptionDraft(localDescription);
+    setIsEditingDescription(true);
+  };
+
+  const handleSaveDescription = async () => {
+    const trimmed = descriptionDraft.trim();
+    if (trimmed === localDescription) {
+      setIsEditingDescription(false);
+      return;
+    }
+    setIsSavingDescription(true);
+    try {
+      await onSaveDescription(set.id, trimmed);
+      setLocalDescription(trimmed);
+      setIsEditingDescription(false);
+    } catch {
+      toast.error("Failed to save description");
+    } finally {
+      setIsSavingDescription(false);
+    }
+  };
+
+  const handleCancelDescription = () => {
+    setDescriptionDraft("");
+    setIsEditingDescription(false);
   };
 
   return (
@@ -862,6 +1053,19 @@ function ImageSetCard({
           >
             {set.isFree ? "Free" : "Paid"}
           </span>
+          {localSubscriberContent && (
+            <span
+              className="text-xs px-2 py-0.5 rounded-full flex items-center gap-1"
+              style={{
+                backgroundColor: "oklch(0.55 0.18 280 / 0.15)",
+                color: "oklch(0.72 0.18 280)",
+                border: "1px solid oklch(0.55 0.18 280 / 0.3)",
+              }}
+            >
+              <Star size={9} />
+              Subscriber
+            </span>
+          )}
         </div>
 
         {/* Image count */}
@@ -1052,7 +1256,30 @@ function ImageSetCard({
             </button>
           )}
 
-          {!set.isDefault && (
+          {set.isDefault && (
+            <button
+              type="button"
+              data-ocid="image_set.remove_default_button"
+              onClick={() => onUnsetDefault(set.id)}
+              disabled={!hasOtherNonDefaultSet && !set.isFree}
+              title={
+                hasOtherNonDefaultSet || set.isFree
+                  ? "Remove default status"
+                  : "Cannot remove default: no other set to become default"
+              }
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-opacity hover:opacity-80 disabled:opacity-40 disabled:cursor-not-allowed"
+              style={{
+                backgroundColor: "oklch(var(--sidebar-left))",
+                color: "oklch(0.7 0.15 60)",
+                border: "1px solid oklch(0.6 0.15 60 / 0.4)",
+              }}
+            >
+              <Star size={11} />
+              Remove Default
+            </button>
+          )}
+
+          {!STARTER_SET_IDS.has(set.id) && (
             <button
               type="button"
               data-ocid="image_set.delete_button"
@@ -1077,9 +1304,197 @@ function ImageSetCard({
           className="flex flex-col gap-4 px-5 pb-5"
           style={{ borderTop: "1px solid oklch(var(--outline) / 0.5)" }}
         >
+          {/* ── Marketplace metadata ───────────────────────────────────────── */}
+          <div className="flex flex-wrap gap-4 pt-4">
+            {/* Content Type */}
+            <div className="flex flex-col gap-1.5 min-w-[180px]">
+              <label
+                htmlFor={`content-type-${set.id}`}
+                className="text-xs font-medium"
+                style={{ color: "oklch(var(--muted-text))" }}
+              >
+                Content Type
+              </label>
+              <div className="flex items-center gap-1">
+                <select
+                  id={`content-type-${set.id}`}
+                  data-ocid="image_set.content_type_select"
+                  value={localContentType}
+                  onChange={(e) =>
+                    void handleContentTypeChange(e.target.value as ContentType)
+                  }
+                  disabled={isSavingContentType}
+                  className="px-2 py-1.5 rounded-lg text-xs"
+                  style={{
+                    backgroundColor: "oklch(var(--sidebar-left))",
+                    border: "1px solid oklch(var(--outline))",
+                    color: "oklch(var(--text))",
+                    outline: "none",
+                  }}
+                >
+                  <option value="referencepack">Reference Pack</option>
+                  <option value="learningmodule">Learning Module</option>
+                </select>
+                {isSavingContentType && (
+                  <Loader2
+                    size={12}
+                    className="animate-spin"
+                    style={{ color: "oklch(var(--muted-text))" }}
+                  />
+                )}
+              </div>
+            </div>
+
+            {/* Subscriber Content toggle */}
+            <div className="flex flex-col gap-1.5 justify-center">
+              <p
+                className="text-xs font-medium"
+                style={{ color: "oklch(var(--muted-text))" }}
+              >
+                Subscriber Content
+              </p>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  data-ocid="image_set.subscriber_content_toggle"
+                  onClick={() =>
+                    void handleSubscriberContentChange(!localSubscriberContent)
+                  }
+                  disabled={isSavingSubscriber}
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs transition-opacity hover:opacity-80 disabled:opacity-50"
+                  style={{
+                    backgroundColor: localSubscriberContent
+                      ? "oklch(0.55 0.18 280 / 0.15)"
+                      : "oklch(var(--sidebar-left))",
+                    border: `1px solid ${localSubscriberContent ? "oklch(0.55 0.18 280 / 0.4)" : "oklch(var(--outline))"}`,
+                    color: localSubscriberContent
+                      ? "oklch(0.72 0.18 280)"
+                      : "oklch(var(--muted-text))",
+                  }}
+                >
+                  <Star size={10} />
+                  {localSubscriberContent ? "Included" : "Not included"}
+                </button>
+                {isSavingSubscriber && (
+                  <Loader2
+                    size={12}
+                    className="animate-spin"
+                    style={{ color: "oklch(var(--muted-text))" }}
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Description */}
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between">
+              <p
+                className="text-xs font-medium"
+                style={{ color: "oklch(var(--muted-text))" }}
+              >
+                Description
+              </p>
+              {!isEditingDescription && (
+                <button
+                  type="button"
+                  data-ocid="image_set.edit_description_button"
+                  onClick={handleStartEditDescription}
+                  className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-md transition-opacity hover:opacity-80"
+                  style={{
+                    backgroundColor: "oklch(var(--sidebar-left))",
+                    color: "oklch(var(--muted-text))",
+                    border: "1px solid oklch(var(--outline))",
+                  }}
+                >
+                  <Pencil size={9} />
+                  Edit
+                </button>
+              )}
+            </div>
+            {isEditingDescription ? (
+              <div className="flex flex-col gap-2">
+                <textarea
+                  data-ocid="image_set.description_textarea"
+                  value={descriptionDraft}
+                  onChange={(e) =>
+                    setDescriptionDraft(e.target.value.slice(0, 500))
+                  }
+                  rows={3}
+                  placeholder="Brief description of this set for the marketplace…"
+                  className="px-3 py-2 rounded-lg text-xs resize-none"
+                  style={{
+                    backgroundColor: "oklch(var(--sidebar-left))",
+                    border: "1px solid oklch(var(--accent) / 0.5)",
+                    color: "oklch(var(--text))",
+                    outline: "none",
+                  }}
+                  // biome-ignore lint/a11y/noAutofocus: intentional for inline description editing
+                  autoFocus
+                />
+                <div className="flex items-center justify-between">
+                  <span
+                    className="text-xs"
+                    style={{
+                      color:
+                        descriptionDraft.length >= 490
+                          ? "oklch(0.65 0.2 25)"
+                          : "oklch(var(--muted-text))",
+                    }}
+                  >
+                    {descriptionDraft.length}/500
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      data-ocid="image_set.description_cancel_button"
+                      onClick={handleCancelDescription}
+                      disabled={isSavingDescription}
+                      className="px-3 py-1 rounded-md text-xs transition-opacity hover:opacity-80"
+                      style={{
+                        backgroundColor: "oklch(var(--sidebar-left))",
+                        color: "oklch(var(--muted-text))",
+                        border: "1px solid oklch(var(--outline))",
+                      }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      data-ocid="image_set.description_save_button"
+                      onClick={() => void handleSaveDescription()}
+                      disabled={isSavingDescription}
+                      className="px-3 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition-opacity hover:opacity-80 disabled:opacity-50"
+                      style={{
+                        backgroundColor: "oklch(var(--accent))",
+                        color: "oklch(var(--accent-text))",
+                      }}
+                    >
+                      {isSavingDescription && (
+                        <Loader2 size={10} className="animate-spin" />
+                      )}
+                      Save
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <p
+                className="text-xs leading-relaxed"
+                style={{
+                  color: localDescription
+                    ? "oklch(var(--text))"
+                    : "oklch(var(--muted-text))",
+                }}
+              >
+                {localDescription || "No description — click Edit to add one."}
+              </p>
+            )}
+          </div>
+
           {/* Thumbnail grid */}
           {set.images.length > 0 && (
-            <div className="flex flex-wrap gap-2 pt-4">
+            <div className="flex flex-wrap gap-2">
               {set.images.map((img, idx) => (
                 <div
                   key={img.id}
@@ -1126,7 +1541,7 @@ function ImageSetCard({
           {set.images.length === 0 && uploading.length === 0 && (
             <div
               data-ocid="image_set.empty_state"
-              className="mt-4 py-6 flex flex-col items-center gap-2 rounded-lg"
+              className="py-6 flex flex-col items-center gap-2 rounded-lg"
               style={{ border: "1px dashed oklch(var(--outline))" }}
             >
               <ImagePlus
@@ -1144,7 +1559,7 @@ function ImageSetCard({
 
           {/* Upload progress */}
           {uploading.length > 0 && (
-            <div className="flex flex-col gap-2 mt-4">
+            <div className="flex flex-col gap-2">
               {uploading.map((f, i) => (
                 <div
                   key={`upload-${f.name}-${i}`}
@@ -1222,6 +1637,9 @@ export function ImageSetManager({ identity }: ImageSetManagerProps) {
     isFree: true,
     isDefault: false,
     price: "",
+    contentType: ContentType.referencepack,
+    isSubscriberContent: false,
+    description: "",
     error: null,
   });
   const [isCreatingSet, setIsCreatingSet] = useState(false);
@@ -1247,7 +1665,8 @@ export function ImageSetManager({ identity }: ImageSetManagerProps) {
 
   const getActor = useCallback(async (): Promise<backendInterface> => {
     if (!actorRef.current) {
-      actorRef.current = await createActorWithConfig({ identity });
+      const base = await createActorWithConfig({ identity });
+      actorRef.current = base as unknown as backendInterface;
     }
     return actorRef.current;
   }, [identity]);
@@ -1287,12 +1706,11 @@ export function ImageSetManager({ identity }: ImageSetManagerProps) {
         err.message.includes("CANISTER_ID_PAYMENTS")
       ) {
         console.warn(
-          "[ImageSetManager] Payments canister not configured — pack prices unavailable. " +
-            "Deploy the payments canister and ensure payments_canister_id is set in env.json.",
+          "[ImageSetManager] Payments canister not configured — admin price features unavailable",
         );
         return;
       }
-      console.error("[ImageSetManager] Failed to load pack prices:", err);
+      console.error("[ImageSetManager] Failed to create payments actor:", err);
     }
   }, [getPaymentsActor]);
 
@@ -1476,27 +1894,105 @@ export function ImageSetManager({ identity }: ImageSetManagerProps) {
 
   const handleDeleteSet = useCallback(
     (setId: string) => {
+      const target = sets.find((s) => s.id === setId);
+      const isDefault = target?.isDefault ?? false;
+      // Describe what will happen if the set is currently the default
+      const extraNote = isDefault
+        ? " This set is currently the default — default status will be transferred to a starter set automatically before deleting."
+        : "";
       setConfirmState({
-        message:
-          "Delete this entire set and all its images? This cannot be undone.",
+        message: `Delete this entire set and all its images? This cannot be undone.${extraNote}`,
         onConfirm: async () => {
           setConfirmState(null);
           try {
             const actor = await getActor();
-            await actor.deleteImageSet(setId);
+            // If this set is default, transfer default to a starter set first
+            // so the backend's isDefault guard won't block the delete.
+            if (isDefault) {
+              // Use "starter-male" as the safe transfer target — it always exists.
+              const transferred =
+                await actor.setImageSetDefault("starter-male");
+              if (!transferred) {
+                toast.error(
+                  "Failed to transfer default status before delete — check that you are signed in as admin.",
+                );
+                return;
+              }
+              setSets((prev) =>
+                prev.map((s) => ({ ...s, isDefault: s.id === "starter-male" })),
+              );
+            }
+            const ok = await actor.deleteImageSet(setId);
+            if (!ok) {
+              toast.error(
+                "Failed to delete set — the backend rejected the request. If this set is marked as default, use the Remove Default button first.",
+              );
+              return;
+            }
             setSets((prev) => prev.filter((s) => s.id !== setId));
+            toast.success("Image set deleted.");
           } catch (err) {
-            setGlobalError(
+            toast.error(
               err instanceof Error ? err.message : "Failed to delete set",
             );
           }
         },
       });
     },
-    [getActor],
+    [getActor, sets],
   );
 
-  // ── Set Default ────────────────────────────────────────────────────────────
+  // ── Unset Default ──────────────────────────────────────────────────────────
+  // If another non-default, non-starter set exists, transfer default to it.
+  // Otherwise (e.g. the only non-starter set is the one being unset, or it's
+  // a free set that should never be default), fall back to the starter-male set
+  // which always exists and is the safe default holder.
+
+  const handleUnsetDefault = useCallback(
+    async (setId: string) => {
+      const setBeingUnset = sets.find((s) => s.id === setId);
+      // Prefer a non-starter, non-default set as the new default.
+      // If none exists, fall back to the starter-male set.
+      const candidate =
+        sets.find(
+          (s) => s.id !== setId && !s.isDefault && !STARTER_SET_IDS.has(s.id),
+        ) ?? sets.find((s) => s.id === "starter-male" && s.id !== setId);
+
+      if (!candidate) {
+        toast.error(
+          "Cannot remove default status — no suitable set to transfer to.",
+        );
+        return;
+      }
+      setConfirmState({
+        message: `Transfer default status to "${candidate.name}"? This will allow "${setBeingUnset?.name ?? setId}" to be deleted.`,
+        onConfirm: async () => {
+          setConfirmState(null);
+          try {
+            const actor = await getActor();
+            const ok = await actor.setImageSetDefault(candidate.id);
+            if (!ok) {
+              toast.error(
+                "Failed to transfer default — check that you are signed in as admin.",
+              );
+              return;
+            }
+            setSets((prev) =>
+              prev.map((s) => ({ ...s, isDefault: s.id === candidate.id })),
+            );
+            toast.success(`Default transferred to "${candidate.name}".`);
+          } catch (err) {
+            toast.error(
+              err instanceof Error
+                ? err.message
+                : "Failed to remove default status",
+            );
+          }
+        },
+      });
+    },
+    [sets, getActor],
+  );
 
   const handleSetDefault = useCallback(
     async (setId: string) => {
@@ -1526,10 +2022,11 @@ export function ImageSetManager({ identity }: ImageSetManagerProps) {
   const handleSavePackPrice = useCallback(
     async (packId: string, cents: bigint) => {
       const actor = await getPaymentsActor();
-      const ok = await actor.setPackPrice(packId, cents);
-      if (!ok) {
+      const result = await actor.setPackPrice(packId, cents);
+      if ("err" in result) {
         toast.error(
-          "Failed to update price — check that you are signed in as admin.",
+          result.err ||
+            "Failed to update price — check that you are signed in as admin.",
         );
         return;
       }
@@ -1549,6 +2046,50 @@ export function ImageSetManager({ identity }: ImageSetManagerProps) {
         throw new Error("updateSetTags returned false");
       }
       setSets((prev) => prev.map((s) => (s.id === setId ? { ...s, tags } : s)));
+    },
+    [getActor],
+  );
+
+  // ── Set Content Type ────────────────────────────────────────────────────────
+
+  const handleSaveContentType = useCallback(
+    async (setId: string, ct: ContentType) => {
+      const actor = await getActor();
+      const ok = await actor.setContentType(setId, ct);
+      if (!ok) throw new Error("setContentType returned false");
+      setSets((prev) =>
+        prev.map((s) => (s.id === setId ? { ...s, contentType: ct } : s)),
+      );
+    },
+    [getActor],
+  );
+
+  // ── Set Subscriber Content ───────────────────────────────────────────────────
+
+  const handleSaveSubscriberContent = useCallback(
+    async (setId: string, val: boolean) => {
+      const actor = await getActor();
+      const ok = await actor.setSubscriberContent(setId, val);
+      if (!ok) throw new Error("setSubscriberContent returned false");
+      setSets((prev) =>
+        prev.map((s) =>
+          s.id === setId ? { ...s, isSubscriberContent: val } : s,
+        ),
+      );
+    },
+    [getActor],
+  );
+
+  // ── Set Description ──────────────────────────────────────────────────────────
+
+  const handleSaveDescription = useCallback(
+    async (setId: string, desc: string) => {
+      const actor = await getActor();
+      const ok = await actor.setDescription(setId, desc);
+      if (!ok) throw new Error("setDescription returned false");
+      setSets((prev) =>
+        prev.map((s) => (s.id === setId ? { ...s, description: desc } : s)),
+      );
     },
     [getActor],
   );
@@ -1669,12 +2210,24 @@ export function ImageSetManager({ identity }: ImageSetManagerProps) {
         await actor.setImageSetDefault(newId);
       }
 
+      // Apply new marketplace metadata after creation
+      await Promise.allSettled([
+        actor.setContentType(newId, newSetForm.contentType),
+        actor.setSubscriberContent(newId, newSetForm.isSubscriberContent),
+        newSetForm.description.trim()
+          ? actor.setDescription(newId, newSetForm.description.trim())
+          : Promise.resolve(true),
+      ]);
+
       setShowNewSetDialog(false);
       setNewSetForm({
         name: "",
         isFree: true,
         isDefault: false,
         price: "",
+        contentType: ContentType.referencepack,
+        isSubscriberContent: false,
+        description: "",
         error: null,
       });
       await loadSets();
@@ -1721,6 +2274,9 @@ export function ImageSetManager({ identity }: ImageSetManagerProps) {
               isFree: true,
               isDefault: false,
               price: "",
+              contentType: ContentType.referencepack,
+              isSubscriberContent: false,
+              description: "",
               error: null,
             });
             setShowNewSetDialog(true);
@@ -1799,12 +2355,19 @@ export function ImageSetManager({ identity }: ImageSetManagerProps) {
               onRemoveImage={handleRemoveImage}
               onDeleteSet={handleDeleteSet}
               onSetDefault={handleSetDefault}
+              onUnsetDefault={handleUnsetDefault}
               onOpenLightbox={(url) => setLightboxSrc(url)}
               uploading={uploadingBySet[set.id] ?? []}
               priceUsdCents={packPrices.get(set.id)}
               onSavePrice={handleSavePackPrice}
               onSaveTags={handleSaveTags}
               onRenameSet={handleRenameSet}
+              onSaveContentType={handleSaveContentType}
+              onSaveSubscriberContent={handleSaveSubscriberContent}
+              onSaveDescription={handleSaveDescription}
+              hasOtherNonDefaultSet={sets.some(
+                (s) => s.id !== set.id && !s.isDefault,
+              )}
             />
           ))}
         </div>

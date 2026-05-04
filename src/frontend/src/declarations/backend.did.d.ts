@@ -26,6 +26,19 @@ export interface BrushPreset {
   'isDefault' : boolean,
 }
 export type CanvasSave = string;
+export interface CatalogItem {
+  'id' : string,
+  'contentType' : ContentType,
+  'name' : string,
+  'imageCount' : bigint,
+  'description' : string,
+  'isFree' : boolean,
+  'previewThumbnail' : string,
+  'isSubscriberContent' : boolean,
+  'priceUsdCents' : [] | [bigint],
+}
+export type ContentType = { 'learningmodule' : null } |
+  { 'referencepack' : null };
 export interface HotkeyAssignments {
   'assignments' : string,
   'modifiedAt' : bigint,
@@ -38,12 +51,16 @@ export interface ImageReference {
 }
 export interface ImageSet {
   'id' : string,
+  'contentType' : ContentType,
   'name' : string,
   'tags' : Array<string>,
   'imageCount' : bigint,
+  'description' : string,
   'isFree' : boolean,
   'previewThumbnail' : string,
   'isDefault' : boolean,
+  'isSubscriberContent' : boolean,
+  'priceUsdCents' : [] | [bigint],
   'priceICP' : [] | [string],
   'images' : Array<ImageReference>,
 }
@@ -56,6 +73,10 @@ export interface PublicImageSet {
   'isDefault' : boolean,
 }
 export type SettingsSave = string;
+export interface SubscriptionStatus {
+  'active' : boolean,
+  'expiryDateMs' : [] | [bigint],
+}
 export interface UserPreferences {
   'brushes' : Array<BrushPreset>,
   'hotkeys' : HotkeyAssignments,
@@ -132,6 +153,18 @@ export interface _SERVICE {
    */
   'deleteImageSet' : ActorMethod<[string], boolean>,
   /**
+   * / Admin only — remove an animation from the mascot registry.
+   * / If the deleted animation was the default idle, clears defaultIdleAnimationName.
+   * / Returns true on success, false if caller is not admin or name not found.
+   */
+  'deleteMascotAnimation' : ActorMethod<[string], boolean>,
+  /**
+   * / Admin only — remove an expression from the mascot registry.
+   * / If the deleted expression was the default, clears defaultExpressionName.
+   * / Returns true on success, false if caller is not admin or name not found.
+   */
+  'deleteMascotExpression' : ActorMethod<[string], boolean>,
+  /**
    * / Admin only — get all image sets including paid ones, for admin management UI.
    * / Returns an empty array if caller is not admin.
    * / Uses an update call (not query) so it can run ensureStarterSetsCleared()
@@ -146,18 +179,50 @@ export interface _SERVICE {
   'getAllPublicImageSets' : ActorMethod<[], Array<PublicImageSet>>,
   /**
    * / Public query — returns all free sets plus sets the caller has purchased entitlements for.
+   * / Also includes subscriber-tagged sets if the caller has an active subscription.
    */
   'getAvailableImageSets' : ActorMethod<[], Array<ImageSet>>,
   'getBrushPresets' : ActorMethod<[], [] | [string]>,
   'getCallerUserProfile' : ActorMethod<[], [] | [UserProfile]>,
   'getCallerUserRole' : ActorMethod<[], UserRole>,
   'getCanvasHash' : ActorMethod<[], [] | [CanvasSave]>,
+  'getFullCatalog' : ActorMethod<
+    [],
+    { 'packs' : Array<CatalogItem>, 'modules' : Array<CatalogItem> }
+  >,
+  /**
+   * / Public query — returns the in-app guide script, or null if not yet set.
+   * / Equivalent to getModuleScript("guide").
+   */
+  'getGuideScript' : ActorMethod<[], [] | [string]>,
+  /**
+   * / Public query — returns all mascot registry data: expressions, animations, and defaults.
+   * / Returns empty arrays and null defaults if nothing has been uploaded yet.
+   */
+  'getMascotAssets' : ActorMethod<
+    [],
+    {
+      'defaultIdleAnimationName' : [] | [string],
+      'animations' : Array<[string, string]>,
+      'expressions' : Array<[string, string]>,
+      'defaultExpressionName' : [] | [string],
+    }
+  >,
+  /**
+   * / Public query — returns the script text for a module, or null if not stored.
+   */
+  'getModuleScript' : ActorMethod<[string], [] | [string]>,
   /**
    * / Returns the username for the caller's principal, or null if none registered.
    */
   'getMyUsername' : ActorMethod<[], [] | [string]>,
   'getPreferences' : ActorMethod<[], [] | [UserPreferences]>,
   'getSchemaVersion' : ActorMethod<[], bigint>,
+  /**
+   * / Adds a new admin. Only an existing admin may call this.
+   * / Returns false if the caller is not an admin.
+   */
+  'getSubscriptionStatus' : ActorMethod<[], SubscriptionStatus>,
   /**
    * / Returns the set IDs the caller has been explicitly granted.
    */
@@ -185,12 +250,14 @@ export interface _SERVICE {
    * / pack does not exist in the image set registry.
    */
   'grantPackEntitlement' : ActorMethod<[Principal, string], boolean>,
+  'grantSubscription' : ActorMethod<[Principal, string, bigint], boolean>,
   /**
    * / Returns true if the given principal is in the admin set.
    * / Safe as a query because isAdminPrincipal() never mutates state.
    */
   'isAdmin' : ActorMethod<[Principal], boolean>,
   'isCallerAdmin' : ActorMethod<[], boolean>,
+  'isEntitledTo' : ActorMethod<[Principal, string], boolean>,
   /**
    * / Registers a username for the caller's principal.
    * / Returns true on success, false if the caller already has a username
@@ -218,12 +285,38 @@ export interface _SERVICE {
    * / Admin: revoke a set from a principal. Returns false if the set does not exist.
    */
   'revokeEntitlement' : ActorMethod<[Principal, string], boolean>,
+  'revokeSubscription' : ActorMethod<[Principal], boolean>,
   'saveBrush' : ActorMethod<[BrushPreset], undefined>,
   'saveBrushPresets' : ActorMethod<[string], undefined>,
   'saveCallerUserProfile' : ActorMethod<[UserProfile], undefined>,
   'saveCanvasHash' : ActorMethod<[CanvasSave], undefined>,
+  /**
+   * / Admin only — save or overwrite the in-app guide dialogue script.
+   * / Equivalent to saveModuleScript("guide", scriptText).
+   * / Returns true on success, false if caller is not admin.
+   */
+  'saveGuideScript' : ActorMethod<[string], boolean>,
+  /**
+   * / Admin only — save or overwrite the dialogue script for a module.
+   * / Module IDs are simple strings like "figure-drawing" or "still-life".
+   * / Use moduleId = "guide" to set the in-app guide script.
+   * / Returns true on success, false if caller is not admin.
+   */
+  'saveModuleScript' : ActorMethod<[string, string], boolean>,
   'savePreferences' : ActorMethod<[UserPreferences], undefined>,
   'saveUserSettings' : ActorMethod<[SettingsSave], undefined>,
+  'setContentType' : ActorMethod<[string, ContentType], boolean>,
+  /**
+   * / Admin only — set the default expression name.
+   * / Returns false if no expression with that name exists or caller is not admin.
+   */
+  'setDefaultExpression' : ActorMethod<[string], boolean>,
+  /**
+   * / Admin only — set the default idle animation name.
+   * / Returns false if no animation with that name exists or caller is not admin.
+   */
+  'setDefaultIdleAnimation' : ActorMethod<[string], boolean>,
+  'setDescription' : ActorMethod<[string, string], boolean>,
   /**
    * / Admin only — mark a set as the sole default set.
    * / Unsets isDefault on all other sets. Returns false if caller is not admin
@@ -242,12 +335,27 @@ export interface _SERVICE {
    * / Returns false if the caller is not an admin.
    */
   'setPaymentsCanisterPrincipal' : ActorMethod<[Principal], boolean>,
+  'setPriceUsdCents' : ActorMethod<[string, [] | [bigint]], boolean>,
+  'setSubscriberContent' : ActorMethod<[string, boolean], boolean>,
   /**
    * / Admin only — update the tags for an image set.
    * / All tags are normalized to lowercase before storing.
    * / Returns false if caller is not admin or setId doesn't exist.
    */
   'updateSetTags' : ActorMethod<[string, Array<string>], boolean>,
+  'updateSubscriptionExpiry' : ActorMethod<[Principal, bigint], boolean>,
+  /**
+   * / Admin only — add or replace an animation (Lottie JSON) in the mascot registry.
+   * / If an animation with the same name already exists, its blobUrl is replaced.
+   * / Returns true on success, false if caller is not admin.
+   */
+  'uploadMascotAnimation' : ActorMethod<[string, string], boolean>,
+  /**
+   * / Admin only — add or replace an expression (PNG) in the mascot registry.
+   * / If an expression with the same name already exists, its blobUrl is replaced.
+   * / Returns true on success, false if caller is not admin.
+   */
+  'uploadMascotExpression' : ActorMethod<[string, string], boolean>,
 }
 export declare const idlService: IDL.ServiceClass;
 export declare const idlInitArgs: IDL.Type[];

@@ -1269,6 +1269,10 @@ export function useCursorSystem(
   // ── Main brush cursor update ───────────────────────────────────────────────
   // biome-ignore lint/correctness/useExhaustiveDependencies: cursor helper fns are stable
   const updateBrushCursor = useCallback(() => {
+    // Read cursorType / cursorCenter from refs so the function always uses the
+    // latest value even when called before a React re-render (e.g. from event handlers).
+    const cursorType = cursorTypeRef.current;
+    const cursorCenter = cursorCenterRef.current;
     // Immediately clear the software cursor canvas so the previous tool's outline
     // does not linger while the new cursor shape is being computed (may be async).
     {
@@ -1696,6 +1700,51 @@ export function useCursorSystem(
   useEffect(() => {
     updateBrushCursorRef.current = updateBrushCursor;
   }, [updateBrushCursor]);
+
+  // ── Re-apply cursor when Settings panel changes cursor preferences ─────────
+  // SettingsPanel writes to sk-cursor-type / sk-cursor-center then dispatches
+  // 'sl:cursor-settings-changed'. We re-read those keys and rebuild the cursor.
+  // Note: setCursorType/setCursorCenter schedule async state updates; we also
+  // store the latest values in refs so updateBrushCursorRef can use them
+  // immediately without waiting for the next render cycle.
+  const cursorTypeRef = useRef(cursorType);
+  const cursorCenterRef = useRef(cursorCenter);
+  useEffect(() => {
+    cursorTypeRef.current = cursorType;
+  }, [cursorType]);
+  useEffect(() => {
+    cursorCenterRef.current = cursorCenter;
+  }, [cursorCenter]);
+
+  useEffect(() => {
+    const handler = () => {
+      const stored = localStorage.getItem("sk-cursor-type");
+      if (
+        stored === "brush-outline" ||
+        stored === "crosshair" ||
+        stored === "circle"
+      ) {
+        setCursorType(stored);
+        cursorTypeRef.current = stored;
+      }
+      const storedCenter = localStorage.getItem("sk-cursor-center");
+      if (
+        storedCenter === "crosshair" ||
+        storedCenter === "dot" ||
+        storedCenter === "none"
+      ) {
+        setCursorCenter(storedCenter);
+        cursorCenterRef.current = storedCenter;
+      }
+      // Rebuild cursor immediately using the latest values from the refs.
+      // The React state update will also trigger a re-render + useEffect rebuild,
+      // but calling via ref here ensures the visual updates without waiting.
+      requestAnimationFrame(() => updateBrushCursorRef.current());
+    };
+    window.addEventListener("sl:cursor-settings-changed", handler);
+    return () =>
+      window.removeEventListener("sl:cursor-settings-changed", handler);
+  }, []);
 
   // Re-run cursor update when relevant state changes
   // biome-ignore lint/correctness/useExhaustiveDependencies: updateBrushCursor uses refs

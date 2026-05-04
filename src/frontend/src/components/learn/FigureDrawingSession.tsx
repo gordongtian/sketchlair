@@ -230,6 +230,16 @@ export function FigureDrawingSession({
   const [initDone, setInitDone] = useState(false);
   const timerRef = useRef<LearnTimerHandle>(null);
 
+  // On unmount, close the current pose image to free GPU memory.
+  useEffect(() => {
+    return () => {
+      setCurrentImage((prev) => {
+        if (prev) prev.close();
+        return null;
+      });
+    };
+  }, []);
+
   // ── Side canvas lifecycle ─────────────────────────────────────────────────
   // The side canvas must live inside canvasWrapperRef (world-space container) as
   // a position:absolute sibling of the main canvas. This way it is affected by the
@@ -550,7 +560,11 @@ export function FigureDrawingSession({
         // image is handled by ReferenceViewer via currentImage state
       }
 
-      setCurrentImage(firstImage);
+      // Close the previous pose image (if any) before storing the new one.
+      setCurrentImage((prev) => {
+        if (prev && prev !== firstImage) prev.close();
+        return firstImage;
+      });
       if (refMode === "flash") {
         setIsFlashing(true);
       } else {
@@ -636,7 +650,11 @@ export function FigureDrawingSession({
         drawToSideCanvasRef.current(nextImage, nextW);
       }
 
-      setCurrentImage(nextImage);
+      // Close the previous pose image before storing the new one.
+      setCurrentImage((prev) => {
+        if (prev && prev !== nextImage) prev.close();
+        return nextImage;
+      });
       currentPoseIndexRef.current = nextIndex;
       setCurrentPoseIndex(nextIndex);
 
@@ -691,6 +709,9 @@ export function FigureDrawingSession({
   // ── Abort ──────────────────────────────────────────────────────────────────
   const handleAbortConfirm = useCallback(() => {
     setShowAbortConfirm(false);
+    // Release any snapshots accumulated before the abort — they will never be
+    // compiled into a collage, so there is no reason to keep them in memory.
+    snapshotsRef.current = [];
     onAbort();
   }, [onAbort]);
 

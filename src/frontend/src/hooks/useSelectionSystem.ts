@@ -352,18 +352,82 @@ export function useSelectionSystem({
     if (!lc) return;
     const ctx = lc.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
-    const before = ctx.getImageData(0, 0, lc.width, lc.height);
-    ctx.save();
-    ctx.globalCompositeOperation = "destination-out";
-    ctx.drawImage(selectionMaskRef.current, 0, 0);
-    ctx.restore();
-    const after = ctx.getImageData(0, 0, lc.width, lc.height);
-    pushHistory({
-      type: "pixels",
-      layerId,
-      before,
-      after,
+    const W = lc.width;
+    const H = lc.height;
+    const before = ctx.getImageData(0, 0, W, H);
+
+    // Read float weights from the selection mask canvas.
+    // The mask stores float weights as: alpha channel = weight × 255.
+    const maskCtx = selectionMaskRef.current.getContext("2d", {
+      willReadFrequently: true,
     });
+    if (!maskCtx) return;
+    const maskData = maskCtx.getImageData(0, 0, W, H).data;
+
+    // Apply weighted erase: multiply each pixel's alpha by (1 - weight)
+    // so partial-weight pixels are only partially erased.
+    const imgData = ctx.getImageData(0, 0, W, H);
+    const d = imgData.data;
+    for (let i = 0; i < W * H; i++) {
+      const weight = maskData[i * 4 + 3] / 255; // 0.0–1.0
+      if (weight <= 0) continue;
+      if (weight >= 1) {
+        d[i * 4 + 3] = 0;
+      } else {
+        d[i * 4 + 3] = Math.round(d[i * 4 + 3] * (1 - weight));
+      }
+    }
+    ctx.putImageData(imgData, 0, 0);
+
+    // Use selection bounding box as the dirty rect — only that region changed.
+    const _delBounds = computeMaskBounds(selectionMaskRef.current);
+    if (_delBounds && _delBounds.w > 0 && _delBounds.h > 0) {
+      const _delDr = {
+        x: _delBounds.x,
+        y: _delBounds.y,
+        w: _delBounds.w,
+        h: _delBounds.h,
+      };
+      const _delTmp = document.createElement("canvas");
+      _delTmp.width = _delDr.w;
+      _delTmp.height = _delDr.h;
+      const _delTmpCtx = _delTmp.getContext("2d", { willReadFrequently: true });
+      if (_delTmpCtx) {
+        _delTmpCtx.putImageData(before, -_delDr.x, -_delDr.y);
+        const _croppedBefore = _delTmpCtx.getImageData(
+          0,
+          0,
+          _delDr.w,
+          _delDr.h,
+        );
+        const after = ctx.getImageData(_delDr.x, _delDr.y, _delDr.w, _delDr.h);
+        pushHistory({
+          type: "pixels",
+          layerId,
+          dirtyRect: _delDr,
+          before: _croppedBefore,
+          after,
+        });
+      } else {
+        const after = ctx.getImageData(0, 0, W, H);
+        pushHistory({
+          type: "pixels",
+          layerId,
+          dirtyRect: { x: 0, y: 0, w: W, h: H },
+          before,
+          after,
+        });
+      }
+    } else {
+      const after = ctx.getImageData(0, 0, W, H);
+      pushHistory({
+        type: "pixels",
+        layerId,
+        dirtyRect: { x: 0, y: 0, w: W, h: H },
+        before,
+        after,
+      });
+    }
     compositeRef.current();
   }, [activeLayerIdRef, layerCanvasesRef, pushHistory, compositeRef]);
 
@@ -434,35 +498,60 @@ export function useSelectionSystem({
       const srcCtx = lc.getContext("2d", { willReadFrequently: true });
       if (!srcCtx) return;
 
-      // Capture source before state (for cut undo)
-      const srcBefore = cut
-        ? srcCtx.getImageData(0, 0, canvasWidth, canvasHeight)
-        : undefined;
+      const W = canvasWidth;
+      const H = canvasHeight;
 
-      // Create new layer canvas with just the selected pixels
+      // Read float weights from the selection mask canvas.
+      // The mask stores weights as alpha channel: alpha = weight × 255.
+      const maskCtx = selectionMaskRef.current!.getContext("2d", {
+        willReadFrequently: true,
+      });
+      if (!maskCtx) return;
+      const maskData = maskCtx.getImageData(0, 0, W, H).data;
+
+      // Capture source before state (for cut undo)
+      const srcBefore = cut ? srcCtx.getImageData(0, 0, W, H) : undefined;
+
+      // Create new layer canvas with selected pixels weighted by selection mask
       const newLayerData = newLayerFn();
       const nl = document.createElement("canvas");
-      nl.width = canvasWidth;
-      nl.height = canvasHeight;
+      nl.width = W;
+      nl.height = H;
       const nlCtx = nl.getContext("2d", { willReadFrequently: true })!;
-      nlCtx.drawImage(lc, 0, 0);
-      nlCtx.globalCompositeOperation = "destination-in";
-      nlCtx.drawImage(selectionMaskRef.current!, 0, 0);
-      nlCtx.globalCompositeOperation = "source-over";
-      const newLayerPixels = nlCtx.getImageData(
-        0,
-        0,
-        canvasWidth,
-        canvasHeight,
-      );
+
+      // Copy source pixels to new layer with float-weighted alpha
+      const srcPixels = srcCtx.getImageData(0, 0, W, H);
+      const nlImgData = nlCtx.createImageData(W, H);
+      const sd = srcPixels.data;
+      const nd = nlImgData.data;
+      for (let i = 0; i < W * H; i++) {
+        const weight = maskData[i * 4 + 3] / 255; // 0.0–1.0
+        if (weight <= 0) continue;
+        const pi = i * 4;
+        nd[pi] = sd[pi];
+        nd[pi + 1] = sd[pi + 1];
+        nd[pi + 2] = sd[pi + 2];
+        nd[pi + 3] = weight >= 1 ? sd[pi + 3] : Math.round(sd[pi + 3] * weight);
+      }
+      nlCtx.putImageData(nlImgData, 0, 0);
+      const newLayerPixels = nlCtx.getImageData(0, 0, W, H);
 
       let srcAfter: ImageData | undefined;
       if (cut) {
-        srcCtx.save();
-        srcCtx.globalCompositeOperation = "destination-out";
-        srcCtx.drawImage(selectionMaskRef.current!, 0, 0);
-        srcCtx.restore();
-        srcAfter = srcCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+        // Weighted erase from source: multiply each pixel's alpha by (1 - weight)
+        const eraseData = srcCtx.getImageData(0, 0, W, H);
+        const ed = eraseData.data;
+        for (let i = 0; i < W * H; i++) {
+          const weight = maskData[i * 4 + 3] / 255;
+          if (weight <= 0) continue;
+          if (weight >= 1) {
+            ed[i * 4 + 3] = 0;
+          } else {
+            ed[i * 4 + 3] = Math.round(ed[i * 4 + 3] * (1 - weight));
+          }
+        }
+        srcCtx.putImageData(eraseData, 0, 0);
+        srcAfter = srcCtx.getImageData(0, 0, W, H);
         // Invalidate the source layer's bitmap cache AFTER the pixel write so that
         // composite() and thumbnail generation both see the post-cut canvas content,
         // not the stale cached ImageBitmap from before the cut.

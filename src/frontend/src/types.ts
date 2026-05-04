@@ -29,6 +29,8 @@ export interface PaintLayer extends RulerFields {
   blendMode: string;
   isClippingMask: boolean;
   alphaLock: boolean;
+  /** When true, no tool can modify this layer (paint, erase, fill, smudge, liquify, transform). */
+  isLocked?: boolean;
 }
 
 // ── Group header marker ───────────────────────────────────────────────────────

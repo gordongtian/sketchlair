@@ -25,7 +25,7 @@ import {
   markCanvasDirty,
 } from "./useCompositing";
 import type { UndoEntry } from "./useLayerSystem";
-import { resetLiquifyField } from "./useLiquifySystem";
+import { liquifyFreeState } from "./useLiquifySystem";
 
 // Module-level navigator canvas — imported from PaintingApp module scope via params
 // (we receive it as a ref so we don't duplicate the singleton)
@@ -272,8 +272,8 @@ export function useCropSystem(p: CropSystemParams) {
       return l;
     });
 
-    // Clear liquify displacement field on canvas resize to avoid stale state
-    resetLiquifyField();
+    // Free any in-progress liquify stroke on canvas resize to avoid stale state
+    liquifyFreeState();
 
     p.pushHistory({
       type: "canvas-resize",

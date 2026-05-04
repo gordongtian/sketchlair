@@ -68,6 +68,13 @@ export interface UseFileIOSystemReturn {
   handleSilentSave: () => Promise<void>;
   /** Load a .sktch file and replace the current canvas */
   handleLoadFile: (file: File) => Promise<void>;
+  /**
+   * Reset file I/O state for a new untitled document.
+   * Clears the file handle (preventing silent overwrite of the previous file)
+   * and resets the suggested filename to "untitled.sktch".
+   * Call this whenever the active document switches to a brand-new untitled document.
+   */
+  resetFileState: (suggestedFilename?: string) => void;
 }
 
 /**
@@ -412,6 +419,14 @@ export function useFileIOSystem({
     [setLayers, setActiveLayerId, clearSelection], // refs are stable
   );
 
+  // Reset file I/O state for a new untitled document.
+  // Clears the file handle so Ctrl+S prompts Save As instead of silently overwriting
+  // the previously saved file, and resets the suggested filename.
+  const resetFileState = useCallback((suggestedFilename?: string) => {
+    fileHandleRef.current = null;
+    loadedFileNameRef.current = suggestedFilename ?? "untitled.sktch";
+  }, []);
+
   // Register save/load functions with App for cloud operations
   // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
   useEffect(() => {
@@ -445,5 +460,6 @@ export function useFileIOSystem({
     handleSaveFile,
     handleSilentSave,
     handleLoadFile,
+    resetFileState,
   };
 }

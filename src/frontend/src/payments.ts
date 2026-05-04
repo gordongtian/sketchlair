@@ -8,7 +8,7 @@
 
 import { Actor, HttpAgent, type HttpAgentOptions, type ActorConfig, type Agent, type ActorSubclass } from "@icp-sdk/core/agent";
 import type { Principal } from "@icp-sdk/core/principal";
-import { idlFactory, type _SERVICE } from "./declarations/payments.did";
+import { idlFactory, type _SERVICE } from "./declarations/declarations/payments.did";
 export interface Some<T> {
     __kind__: "Some";
     value: T;
@@ -89,9 +89,23 @@ export class ExternalBlob {
         return this;
     }
 }
-export interface _ImmutableObjectStorageRefillResult {
-    success?: boolean;
-    topped_up_amount?: bigint;
+export interface TransformArgs {
+    context: Uint8Array;
+    response: HttpRequestResult;
+}
+export interface HttpRequestResult {
+    status: bigint;
+    body: Uint8Array;
+    headers: Array<HttpHeader>;
+}
+export interface HttpResponse {
+    body: Uint8Array;
+    headers: Array<[string, string]>;
+    upgrade?: boolean;
+    status_code: number;
+}
+export interface _ImmutableObjectStorageRefillInformation {
+    proposed_top_up_amount?: bigint;
 }
 export interface _ImmutableObjectStorageCreateCertificateResult {
     method: string;
@@ -103,14 +117,13 @@ export interface HttpRequest {
     body: Uint8Array;
     headers: Array<[string, string]>;
 }
-export interface HttpResponse {
-    body: Uint8Array;
-    headers: Array<[string, string]>;
-    upgrade?: boolean;
-    status_code: number;
+export interface HttpHeader {
+    value: string;
+    name: string;
 }
-export interface _ImmutableObjectStorageRefillInformation {
-    proposed_top_up_amount?: bigint;
+export interface _ImmutableObjectStorageRefillResult {
+    success?: boolean;
+    topped_up_amount?: bigint;
 }
 export enum UserRole {
     admin = "admin",
@@ -125,16 +138,15 @@ export interface paymentsInterface {
     _immutableObjectStorageRefillCashier(refillInformation: _ImmutableObjectStorageRefillInformation | null): Promise<_ImmutableObjectStorageRefillResult>;
     _immutableObjectStorageUpdateGatewayPrincipals(): Promise<void>;
     _initializeAccessControl(): Promise<void>;
+    addPaymentsAdmin(principal: string): Promise<boolean>;
     assignCallerUserRole(user: Principal, role: UserRole): Promise<void>;
     /**
-     * / Create a Stripe Checkout session for a given pack.
-     * / - Rejects anonymous callers.
-     * / - Uses ICP HTTPS outcalls to POST to the Stripe API.
-     * / - Stores the session → (principal, itemType, itemId) mapping.
-     * / - Returns the Stripe-hosted Checkout URL on success.
-     * / - successUrl and cancelUrl must be provided by the frontend (window.location.origin-based).
+     * / Create a Stripe Checkout session.
+     * / - When isSubscription = true: recurring monthly subscription at global price.
+     * / - When isSubscription = false: one-time purchase for the given packId.
+     * / Returns #ok with the Stripe-hosted URL, or #err with a reason.
      */
-    createCheckoutSession(packId: string, successUrl: string, cancelUrl: string): Promise<{
+    createCheckoutSession(packId: string, successUrl: string, cancelUrl: string, isSubscription: boolean): Promise<{
         __kind__: "ok";
         ok: string;
     } | {
@@ -142,39 +154,68 @@ export interface paymentsInterface {
         err: string;
     }>;
     getCallerUserRole(): Promise<UserRole>;
-    /**
-     * / Return all pack IDs and their current prices (USD cents). Public.
-     */
+    getCanisterHealth(): Promise<{
+        hasBackendCanisterId: boolean;
+        hasWebhookSecret: boolean;
+        deployTimestamp: bigint;
+        isConfigured: boolean;
+        hasStripeSecretKey: boolean;
+        missingConfig: Array<string>;
+        initWindowOpen: boolean;
+    }>;
     getPackPrices(): Promise<Array<[string, bigint]>>;
-    /**
-     * / Standard ICP HTTP query handler.
-     * / For POST /stripe/webhook, upgrades to http_request_update.
-     */
+    getStripeKeyAudit(): Promise<{
+        webhookSecret?: {
+            setter: string;
+            timestamp: bigint;
+        };
+        secretKey?: {
+            setter: string;
+            timestamp: bigint;
+        };
+    }>;
+    getSubscriptionPrice(): Promise<bigint>;
     http_request(request: HttpRequest): Promise<HttpResponse>;
     /**
      * / Update handler for POST /stripe/webhook.
-     * / - Verifies HMAC-SHA256 Stripe signature.
-     * / - Handles checkout.session.completed events.
-     * / - Idempotency: skips already-processed sessions.
-     * / - Calls imageSets canister to grant entitlement to buyer.
-     * / - Returns HTTP 200 on success, 400/500 on failure.
+     * / Verifies Stripe HMAC-SHA256 signature on ALL events before processing.
+     * / Handles: checkout.session.completed, customer.subscription.created/updated/deleted,
+     * / invoice.payment_succeeded.
      */
     http_request_update(request: HttpRequest): Promise<HttpResponse>;
+    initFromEnv(backendId: string): Promise<{
+        __kind__: "ok";
+        ok: null;
+    } | {
+        __kind__: "err";
+        err: string;
+    }>;
     isCallerAdmin(): Promise<boolean>;
+    listPaymentsAdmins(): Promise<Array<string>>;
+    removePaymentsAdmin(principal: string): Promise<boolean>;
+    setBackendCanisterId(canisterId: string): Promise<boolean>;
     /**
      * / Set the price (in USD cents) for a purchasable pack. Admin only.
      */
-    setPackPrice(packId: string, priceUsdCents: bigint): Promise<boolean>;
-    /**
-     * / Store the Stripe secret key. Admin only. Write-only — never returned.
-     */
+    setPackPrice(packId: string, priceUsdCents: bigint): Promise<{
+        __kind__: "ok";
+        ok: null;
+    } | {
+        __kind__: "err";
+        err: string;
+    }>;
     setStripeSecretKey(key: string): Promise<boolean>;
-    /**
-     * / Store the Stripe webhook signing secret. Admin only. Write-only — never returned.
-     */
     setStripeWebhookSecret(secret: string): Promise<boolean>;
+    setSubscriptionPrice(priceUsdCents: bigint): Promise<{
+        __kind__: "ok";
+        ok: null;
+    } | {
+        __kind__: "err";
+        err: string;
+    }>;
+    transformStripeResponse(args: TransformArgs): Promise<HttpRequestResult>;
 }
-import type { HttpResponse as _HttpResponse, UserRole as _UserRole, _ImmutableObjectStorageRefillInformation as __ImmutableObjectStorageRefillInformation, _ImmutableObjectStorageRefillResult as __ImmutableObjectStorageRefillResult } from "./declarations/payments.did.d.ts";
+import type { HttpResponse as _HttpResponse, UserRole as _UserRole, _ImmutableObjectStorageRefillInformation as __ImmutableObjectStorageRefillInformation, _ImmutableObjectStorageRefillResult as __ImmutableObjectStorageRefillResult } from "./declarations/declarations/payments.did.d.ts";
 export class Payments implements paymentsInterface {
     constructor(private actor: ActorSubclass<_SERVICE>, private _uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, private _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, private processError?: (error: unknown) => never){}
     async _immutableObjectStorageBlobsAreLive(arg0: Array<Uint8Array>): Promise<Array<boolean>> {
@@ -275,6 +316,20 @@ export class Payments implements paymentsInterface {
             return result;
         }
     }
+    async addPaymentsAdmin(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.addPaymentsAdmin(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.addPaymentsAdmin(arg0);
+            return result;
+        }
+    }
     async assignCallerUserRole(arg0: Principal, arg1: UserRole): Promise<void> {
         if (this.processError) {
             try {
@@ -289,7 +344,7 @@ export class Payments implements paymentsInterface {
             return result;
         }
     }
-    async createCheckoutSession(arg0: string, arg1: string, arg2: string): Promise<{
+    async createCheckoutSession(arg0: string, arg1: string, arg2: string, arg3: boolean): Promise<{
         __kind__: "ok";
         ok: string;
     } | {
@@ -298,14 +353,14 @@ export class Payments implements paymentsInterface {
     }> {
         if (this.processError) {
             try {
-                const result = await this.actor.createCheckoutSession(arg0, arg1, arg2);
+                const result = await this.actor.createCheckoutSession(arg0, arg1, arg2, arg3);
                 return from_candid_variant_n10(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
-            const result = await this.actor.createCheckoutSession(arg0, arg1, arg2);
+            const result = await this.actor.createCheckoutSession(arg0, arg1, arg2, arg3);
             return from_candid_variant_n10(this._uploadFile, this._downloadFile, result);
         }
     }
@@ -323,6 +378,28 @@ export class Payments implements paymentsInterface {
             return from_candid_UserRole_n11(this._uploadFile, this._downloadFile, result);
         }
     }
+    async getCanisterHealth(): Promise<{
+        hasBackendCanisterId: boolean;
+        hasWebhookSecret: boolean;
+        deployTimestamp: bigint;
+        isConfigured: boolean;
+        hasStripeSecretKey: boolean;
+        missingConfig: Array<string>;
+        initWindowOpen: boolean;
+    }> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getCanisterHealth();
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getCanisterHealth();
+            return result;
+        }
+    }
     async getPackPrices(): Promise<Array<[string, bigint]>> {
         if (this.processError) {
             try {
@@ -337,32 +414,89 @@ export class Payments implements paymentsInterface {
             return result;
         }
     }
+    async getStripeKeyAudit(): Promise<{
+        webhookSecret?: {
+            setter: string;
+            timestamp: bigint;
+        };
+        secretKey?: {
+            setter: string;
+            timestamp: bigint;
+        };
+    }> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getStripeKeyAudit();
+                return from_candid_record_n13(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getStripeKeyAudit();
+            return from_candid_record_n13(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getSubscriptionPrice(): Promise<bigint> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getSubscriptionPrice();
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getSubscriptionPrice();
+            return result;
+        }
+    }
     async http_request(arg0: HttpRequest): Promise<HttpResponse> {
         if (this.processError) {
             try {
                 const result = await this.actor.http_request(arg0);
-                return from_candid_HttpResponse_n13(this._uploadFile, this._downloadFile, result);
+                return from_candid_HttpResponse_n15(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.http_request(arg0);
-            return from_candid_HttpResponse_n13(this._uploadFile, this._downloadFile, result);
+            return from_candid_HttpResponse_n15(this._uploadFile, this._downloadFile, result);
         }
     }
     async http_request_update(arg0: HttpRequest): Promise<HttpResponse> {
         if (this.processError) {
             try {
                 const result = await this.actor.http_request_update(arg0);
-                return from_candid_HttpResponse_n13(this._uploadFile, this._downloadFile, result);
+                return from_candid_HttpResponse_n15(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.http_request_update(arg0);
-            return from_candid_HttpResponse_n13(this._uploadFile, this._downloadFile, result);
+            return from_candid_HttpResponse_n15(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async initFromEnv(arg0: string): Promise<{
+        __kind__: "ok";
+        ok: null;
+    } | {
+        __kind__: "err";
+        err: string;
+    }> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.initFromEnv(arg0);
+                return from_candid_variant_n17(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.initFromEnv(arg0);
+            return from_candid_variant_n17(this._uploadFile, this._downloadFile, result);
         }
     }
     async isCallerAdmin(): Promise<boolean> {
@@ -379,18 +513,66 @@ export class Payments implements paymentsInterface {
             return result;
         }
     }
-    async setPackPrice(arg0: string, arg1: bigint): Promise<boolean> {
+    async listPaymentsAdmins(): Promise<Array<string>> {
         if (this.processError) {
             try {
-                const result = await this.actor.setPackPrice(arg0, arg1);
+                const result = await this.actor.listPaymentsAdmins();
                 return result;
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
-            const result = await this.actor.setPackPrice(arg0, arg1);
+            const result = await this.actor.listPaymentsAdmins();
             return result;
+        }
+    }
+    async removePaymentsAdmin(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.removePaymentsAdmin(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.removePaymentsAdmin(arg0);
+            return result;
+        }
+    }
+    async setBackendCanisterId(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setBackendCanisterId(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setBackendCanisterId(arg0);
+            return result;
+        }
+    }
+    async setPackPrice(arg0: string, arg1: bigint): Promise<{
+        __kind__: "ok";
+        ok: null;
+    } | {
+        __kind__: "err";
+        err: string;
+    }> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setPackPrice(arg0, arg1);
+                return from_candid_variant_n17(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setPackPrice(arg0, arg1);
+            return from_candid_variant_n17(this._uploadFile, this._downloadFile, result);
         }
     }
     async setStripeSecretKey(arg0: string): Promise<boolean> {
@@ -421,9 +603,43 @@ export class Payments implements paymentsInterface {
             return result;
         }
     }
+    async setSubscriptionPrice(arg0: bigint): Promise<{
+        __kind__: "ok";
+        ok: null;
+    } | {
+        __kind__: "err";
+        err: string;
+    }> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setSubscriptionPrice(arg0);
+                return from_candid_variant_n17(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setSubscriptionPrice(arg0);
+            return from_candid_variant_n17(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async transformStripeResponse(arg0: TransformArgs): Promise<HttpRequestResult> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.transformStripeResponse(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.transformStripeResponse(arg0);
+            return result;
+        }
+    }
 }
-function from_candid_HttpResponse_n13(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _HttpResponse): HttpResponse {
-    return from_candid_record_n14(_uploadFile, _downloadFile, value);
+function from_candid_HttpResponse_n15(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _HttpResponse): HttpResponse {
+    return from_candid_record_n16(_uploadFile, _downloadFile, value);
 }
 function from_candid_UserRole_n11(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _UserRole): UserRole {
     return from_candid_variant_n12(_uploadFile, _downloadFile, value);
@@ -431,13 +647,46 @@ function from_candid_UserRole_n11(_uploadFile: (file: ExternalBlob) => Promise<U
 function from_candid__ImmutableObjectStorageRefillResult_n4(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: __ImmutableObjectStorageRefillResult): _ImmutableObjectStorageRefillResult {
     return from_candid_record_n5(_uploadFile, _downloadFile, value);
 }
+function from_candid_opt_n14(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [{
+        setter: string;
+        timestamp: bigint;
+    }]): {
+    setter: string;
+    timestamp: bigint;
+} | null {
+    return value.length === 0 ? null : value[0];
+}
 function from_candid_opt_n6(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [boolean]): boolean | null {
     return value.length === 0 ? null : value[0];
 }
 function from_candid_opt_n7(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [bigint]): bigint | null {
     return value.length === 0 ? null : value[0];
 }
-function from_candid_record_n14(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+function from_candid_record_n13(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+    webhookSecret: [] | [{
+            setter: string;
+            timestamp: bigint;
+        }];
+    secretKey: [] | [{
+            setter: string;
+            timestamp: bigint;
+        }];
+}): {
+    webhookSecret?: {
+        setter: string;
+        timestamp: bigint;
+    };
+    secretKey?: {
+        setter: string;
+        timestamp: bigint;
+    };
+} {
+    return {
+        webhookSecret: record_opt_to_undefined(from_candid_opt_n14(_uploadFile, _downloadFile, value.webhookSecret)),
+        secretKey: record_opt_to_undefined(from_candid_opt_n14(_uploadFile, _downloadFile, value.secretKey))
+    };
+}
+function from_candid_record_n16(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
     body: Uint8Array;
     headers: Array<[string, string]>;
     upgrade: [] | [boolean];
@@ -494,6 +743,25 @@ function from_candid_variant_n12(_uploadFile: (file: ExternalBlob) => Promise<Ui
     guest: null;
 }): UserRole {
     return "admin" in value ? UserRole.admin : "user" in value ? UserRole.user : "guest" in value ? UserRole.guest : value;
+}
+function from_candid_variant_n17(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+    ok: null;
+} | {
+    err: string;
+}): {
+    __kind__: "ok";
+    ok: null;
+} | {
+    __kind__: "err";
+    err: string;
+} {
+    return "ok" in value ? {
+        __kind__: "ok",
+        ok: value.ok
+    } : "err" in value ? {
+        __kind__: "err",
+        err: value.err
+    } : value;
 }
 function to_candid_UserRole_n8(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: UserRole): _UserRole {
     return to_candid_variant_n9(_uploadFile, _downloadFile, value);

@@ -1,5 +1,6 @@
 import type { Principal } from "@icp-sdk/core/principal";
-import type { backendInterface, ImageSet, PublicImageSet, UserPreferences, UserRole } from "../backend";
+import { ContentType } from "../backend";
+import type { CatalogItem, backendInterface, ImageSet, PublicImageSet, SubscriptionStatus, UserPreferences, UserRole } from "../backend";
 
 export const mockBackend: backendInterface = {
   _immutableObjectStorageBlobsAreLive: async () => [],
@@ -26,6 +27,9 @@ export const mockBackend: backendInterface = {
       isFree: true,
       images: [],
       tags: [],
+      contentType: ContentType.referencepack,
+      description: "",
+      isSubscriberContent: false,
     },
     {
       id: "starter-female",
@@ -36,6 +40,9 @@ export const mockBackend: backendInterface = {
       isFree: true,
       images: [],
       tags: [],
+      contentType: ContentType.referencepack,
+      description: "",
+      isSubscriberContent: false,
     },
   ],
   getAllPublicImageSets: async (): Promise<Array<PublicImageSet>> => [
@@ -74,6 +81,9 @@ export const mockBackend: backendInterface = {
       isFree: true,
       images: [],
       tags: [],
+      contentType: ContentType.referencepack,
+      description: "",
+      isSubscriberContent: false,
     },
     {
       id: "starter-female",
@@ -84,6 +94,9 @@ export const mockBackend: backendInterface = {
       isFree: true,
       images: [],
       tags: [],
+      contentType: ContentType.referencepack,
+      description: "",
+      isSubscriberContent: false,
     },
     {
       id: "anatomy-pro",
@@ -95,6 +108,9 @@ export const mockBackend: backendInterface = {
       priceICP: "4.99",
       images: [],
       tags: [],
+      contentType: ContentType.referencepack,
+      description: "",
+      isSubscriberContent: false,
     },
   ],
   getBrushPresets: async () => null,
@@ -115,6 +131,9 @@ export const mockBackend: backendInterface = {
       isFree: true,
       images: [],
       tags: [],
+      contentType: ContentType.referencepack,
+      description: "",
+      isSubscriberContent: false,
     },
     {
       id: "starter-female",
@@ -125,6 +144,9 @@ export const mockBackend: backendInterface = {
       isFree: true,
       images: [],
       tags: [],
+      contentType: ContentType.referencepack,
+      description: "",
+      isSubscriberContent: false,
     },
   ],
   getUserProfile: async () => null,
@@ -149,4 +171,25 @@ export const mockBackend: backendInterface = {
   renameSet: async (_setId: string, _newName: string) => false,
   setPaymentsCanisterPrincipal: async (_p: Principal) => false,
   updateSetTags: async (_setId: string, _tags: Array<string>) => false,
+  deleteMascotAnimation: async (_name: string) => false,
+  deleteMascotExpression: async (_name: string) => false,
+  getMascotAssets: async () => ({ expressions: [], animations: [], defaultExpressionName: undefined, defaultIdleAnimationName: undefined }),
+  getModuleScript: async (_moduleId: string) => null,
+  saveModuleScript: async (_moduleId: string, _scriptText: string) => false,
+  setDefaultExpression: async (_name: string) => false,
+  setDefaultIdleAnimation: async (_name: string) => false,
+  uploadMascotAnimation: async (_name: string, _blobUrl: string) => false,
+  uploadMascotExpression: async (_name: string, _blobUrl: string) => false,
+  getGuideScript: async () => null,
+  saveGuideScript: async (_scriptText: string) => false,
+  getFullCatalog: async (): Promise<{ modules: CatalogItem[]; packs: CatalogItem[] }> => ({ modules: [], packs: [] }),
+  getSubscriptionStatus: async (): Promise<SubscriptionStatus> => ({ active: false, expiryDateMs: undefined }),
+  grantSubscription: async (_userPrincipal: Principal, _stripeSubId: string, _expiryDateMs: bigint) => false,
+  isEntitledTo: async (_userPrincipal: Principal, _packId: string) => false,
+  setSubscriberContent: async (_setId: string, _isSubscriberContent: boolean) => false,
+  revokeSubscription: async (_userPrincipal: Principal) => false,
+  setContentType: async (_setId: string, _contentType: ContentType) => false,
+  setDescription: async (_setId: string, _description: string) => false,
+  setPriceUsdCents: async (_setId: string, _priceUsdCents: bigint | null) => false,
+  updateSubscriptionExpiry: async (_userPrincipal: Principal, _newExpiryMs: bigint) => false,
 };

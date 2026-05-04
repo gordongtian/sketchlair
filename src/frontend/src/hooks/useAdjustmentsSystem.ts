@@ -101,7 +101,13 @@ export function useAdjustmentsSystem({
 
   const onAdjustmentsPushUndo = useCallback(
     (layerId: string, before: ImageData, after: ImageData) => {
-      pushHistory({ type: "pixels", layerId, before, after });
+      pushHistory({
+        type: "pixels",
+        layerId,
+        dirtyRect: { x: 0, y: 0, w: before.width, h: before.height },
+        before,
+        after,
+      });
     },
     [pushHistory],
   );

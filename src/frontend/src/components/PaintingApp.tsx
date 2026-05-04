@@ -53,12 +53,16 @@ import { useCursorSystem } from "../hooks/useCursorSystem";
 import { useEllipseGridRuler } from "../hooks/useEllipseGridRuler";
 import { useFileIOSystem } from "../hooks/useFileIOSystem";
 import { useFillSystem } from "../hooks/useFillSystem";
-import { useHistory } from "../hooks/useHistory";
+import { drainUndoStack, setHistoryCap, useHistory } from "../hooks/useHistory";
 import { useIsMobile } from "../hooks/useIsMobile";
 import { useLayerSystem } from "../hooks/useLayerSystem";
 import type { UndoEntry } from "../hooks/useLayerSystem";
 import { useLineRuler } from "../hooks/useLineRuler";
-import { resetLiquifyField, useLiquifySystem } from "../hooks/useLiquifySystem";
+import {
+  liquifyFreeState,
+  setLiquifyStrokeActive,
+  useLiquifySystem,
+} from "../hooks/useLiquifySystem";
 import { usePaintingCanvasEvents } from "../hooks/usePaintingCanvasEvents";
 import type { PaintingCanvasEventsCallbacks } from "../hooks/usePaintingCanvasEvents";
 import { brushPresetToPreset } from "../hooks/usePreferences";
@@ -67,7 +71,7 @@ import type { BrushSizes, PresetsPayload } from "../hooks/usePresetSystem";
 import { useRulerUIHandlers } from "../hooks/useRulerUIHandlers";
 import { useSelectionSystem } from "../hooks/useSelectionSystem";
 import { useSnapSystem } from "../hooks/useSnapSystem";
-import { useStrokeEngine } from "../hooks/useStrokeEngine";
+import { clearSmearBuffers, useStrokeEngine } from "../hooks/useStrokeEngine";
 import { useToolSwitchSystem } from "../hooks/useToolSwitchSystem";
 import { useTransformSystem } from "../hooks/useTransformSystem";
 import type { SelectionGeom, SelectionSnapshot } from "../selectionTypes";
@@ -76,7 +80,7 @@ import { isIPad } from "../utils/constants";
 import {
   chaikinSmooth,
   computeMaskBounds,
-  growShrinkMask,
+  growShrinkFloatMask,
 } from "../utils/selectionUtils";
 import { getThumbCanvas, getThumbCtx } from "../utils/thumbnailCache";
 import { createWebGLBrushContext } from "../utils/webglBrush";
@@ -208,7 +212,7 @@ const _buildChainsFromMask = (
   const data = tc.getImageData(0, 0, sw, sh).data;
   const isSel = (x: number, y: number) => {
     if (x < 0 || x >= sw || y < 0 || y >= sh) return false;
-    return data[(y * sw + x) * 4 + 3] > 64;
+    return data[(y * sw + x) * 4 + 3] > 13;
   };
   type Seg4 = [number, number, number, number];
   const segs: Seg4[] = [];
@@ -301,8 +305,11 @@ const _rebuildChainsNow = (
 
 // ---- ImageBitmap cache functions are now in useCompositing.ts ----
 // markLayerBitmapDirty, invalidateAllLayerBitmaps, getBitmapOrCanvas imported at top
-// ---- Liquify displacement field functions are now in useLiquifySystem.ts ----
-// updateLiquifyDisplacementField, renderLiquifyFromSnapshot, initLiquifyField, resetLiquifyField imported at top
+// ---- Liquify system is now GPU-based via WebGLBrushContext ----
+// The CPU functions renderLiquifyFromSnapshot, updateLiquifyDisplacementField,
+// initLiquifyField, resetLiquifyField have been removed. The GPU pipeline
+// (initLiquifyGPU / renderLiquifyFrame / blitLiquifyPreview / commitLiquify)
+// is wired in usePaintingCanvasEvents.ts.
 // ---- evalPressureCurve, applyColorJitter, PRESSURE_SMOOTHING → now in useStrokeEngine.ts ----
 
 // BrushSizes type is imported from usePresetSystem
@@ -353,9 +360,9 @@ interface PaintingAppProps {
 
 export function PaintingApp({
   isLoggedIn = false,
-  identity,
-  onLogin,
-  onLogout,
+  identity: _identity,
+  onLogin: _onLogin,
+  onLogout: _onLogout,
   cloudSave,
   getCanvasHash,
   onPresetsMutated,
@@ -403,16 +410,21 @@ export function PaintingApp({
   const {
     liquifySize,
     liquifyStrength,
+    liquifyHardness,
+    liquifyStretch,
     liquifyScope,
     setLiquifySize,
     setLiquifyStrength,
+    setLiquifyHardness,
+    setLiquifyStretch,
     setLiquifyScope,
     liquifySizeRef,
     liquifyStrengthRef,
+    liquifyHardnessRef,
+    liquifyStretchRef,
     liquifyScopeRef,
     liquifyBeforeSnapshotRef,
     liquifyMultiBeforeSnapshotsRef,
-    liquifyHoldIntervalRef,
   } = useLiquifySystem();
   const [color, setColor] = useState<HSVAColor>({ h: 0, s: 0, v: 0.05, a: 1 });
   const [layers, setLayers] = useState<Layer[]>([
@@ -458,7 +470,7 @@ export function PaintingApp({
   const DEFAULT_PRESSURE_CURVE: [number, number, number, number] = [
     0.25, 0.25, 0.75, 0.75,
   ];
-  const [universalPressureCurve, setUniversalPressureCurve] = useState<
+  const [universalPressureCurve, _setUniversalPressureCurve] = useState<
     [number, number, number, number]
   >(() => {
     try {
@@ -567,8 +579,40 @@ export function PaintingApp({
     return () => window.removeEventListener("beforeunload", handler);
   }, [brushTipEditorMode?.active]);
   // Mobile layout state
-  const { isMobile, forceDesktop, leftHanded, setForceDesktop, setLeftHanded } =
-    useIsMobile();
+  const {
+    isMobile,
+    forceDesktop: _forceDesktop,
+    leftHanded,
+    setForceDesktop: _setForceDesktop,
+    setLeftHanded,
+    uiModeOverride,
+    setUIModeOverride,
+    showFOBSliders,
+    setShowFOBSliders,
+  } = useIsMobile();
+
+  // Stable refs for isMobile and setUIModeOverride so the hotkey handler
+  // in usePaintingCanvasEvents always sees the latest values without needing
+  // to be recreated on every render.
+  const isMobileRef = useRef(isMobile);
+  isMobileRef.current = isMobile;
+  const setUIModeOverrideRef = useRef(setUIModeOverride);
+  setUIModeOverrideRef.current = setUIModeOverride;
+
+  // Ref that CanvasArea writes saveMobileLayoutState into — called before mode switch
+  const saveMobileLayoutRef = useRef<(() => void) | null>(null);
+
+  // When switching from mobile → desktop, save the current mobile layout first
+  const handleUIModeOverrideChange = useCallback(
+    (override: "mobile" | "desktop" | null) => {
+      if (isMobileRef.current && override === "desktop") {
+        saveMobileLayoutRef.current?.();
+      }
+      setUIModeOverride(override);
+    },
+    [setUIModeOverride],
+  );
+
   const [activeMobilePanel, setActiveMobilePanel] = useState<
     "layers" | "presets" | "palette" | null
   >(null);
@@ -618,8 +662,8 @@ export function PaintingApp({
     handleActivatePreset,
     handleReorderPresets,
     handleSaveCurrentToPreset,
-    handleExportBrushes,
-    handleImportBrushes,
+    handleExportBrushes: _handleExportBrushes,
+    handleImportBrushes: _handleImportBrushes,
     processImportAppend,
     resolveConflict,
     loadPresets,
@@ -712,6 +756,7 @@ export function PaintingApp({
   const [wandContiguous, setWandContiguous] = useState(true);
   // wandToleranceRef, wandContiguousRef, wandGrowShrinkRef → now in toolRefs group (declared below)
   const [wandGrowShrink, setWandGrowShrink] = useState(0);
+  const [wandEdgeExpand, setWandEdgeExpand] = useState(1);
   // brushBlendModeRef → now in brushRefs group (declared below)
   // Eyedropper settings UI state
   const [eyedropperSampleSource, setEyedropperSampleSource] = useState<
@@ -922,6 +967,7 @@ export function PaintingApp({
     wandToleranceRef: useRef(32),
     wandContiguousRef: useRef(true),
     wandGrowShrinkRef: useRef(0),
+    wandEdgeExpandRef: useRef(1),
     eyedropperSampleSourceRef: useRef<"canvas" | "layer">("canvas"),
     eyedropperSampleSizeRef: useRef<1 | 3 | 5>(1),
     eyedropperIsPressedRef: useRef(false),
@@ -937,6 +983,7 @@ export function PaintingApp({
     wandToleranceRef,
     wandContiguousRef,
     wandGrowShrinkRef,
+    wandEdgeExpandRef,
     eyedropperSampleSourceRef,
     eyedropperSampleSizeRef,
     eyedropperIsPressedRef,
@@ -953,7 +1000,9 @@ export function PaintingApp({
     lastPaintLayerIdRef: useRef<string>(activeLayerId),
     lastPaintToolRef2: useRef<Tool>("brush"),
     cancelInProgressSelectionRef: useRef<() => void>(() => {}),
-    commitInProgressLassoRef: useRef<() => void>(() => {}),
+    commitInProgressLassoRef: useRef<
+      (shiftKey?: boolean, altKey?: boolean) => void
+    >(() => {}),
     updateNavigatorCanvasRef: useRef<() => void>(() => {}),
     canvasWidthRef: useRef(CANVAS_WIDTH),
     canvasHeightRef: useRef(CANVAS_HEIGHT),
@@ -1294,14 +1343,9 @@ export function PaintingApp({
   });
 
   // Sync refs with state
-  // biome-ignore lint/correctness/useExhaustiveDependencies: liquifyHoldIntervalRef is a stable ref
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeToolRef is a stable ref
   useEffect(() => {
     activeToolRef.current = activeTool;
-    // Clear liquify hold interval when switching away from liquify
-    if (activeTool !== "liquify" && liquifyHoldIntervalRef.current) {
-      clearInterval(liquifyHoldIntervalRef.current);
-      liquifyHoldIntervalRef.current = null;
-    }
     // Crop tool activation — delegated to useCropSystem
     if (activeTool === "crop" && !isCropActiveRef.current) {
       activateCrop();
@@ -1389,13 +1433,19 @@ export function PaintingApp({
     // Keep module-level active layer ID in sync so getBitmapOrCanvas can bypass cache for it
     setActiveLayerIdForBitmap(activeLayerId);
   }, [activeLayerId]);
+  // FIX 1: Belt-and-suspenders safety reset — whenever the active layer changes,
+  // unconditionally clear the liquify stroke active guard. This ensures the
+  // compositing system is never permanently suppressed, even if a pointer-up
+  // cleanup path fails or is interrupted (e.g. fast tool switch or layer creation
+  // while a liquify stroke is in progress).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: webglBrushRef is stable
+  useEffect(() => {
+    setLiquifyStrokeActive(false);
+    liquifyFreeState();
+  }, [activeLayerId]);
   // biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable
   useEffect(() => {
     layersRef.current = layers;
-    console.log(
-      "[Reorder] layersRef updated, ids:",
-      layers.map((l) => l.id),
-    );
     const al = layers.find((l) => l.id === activeLayerIdRef.current);
     activeLayerAlphaLockRef.current = al?.alphaLock ?? false;
     // Invalidate below/above stroke canvas cache whenever layer stack changes
@@ -1433,6 +1483,10 @@ export function PaintingApp({
   useEffect(() => {
     wandGrowShrinkRef.current = wandGrowShrink;
   }, [wandGrowShrink]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: wandEdgeExpandRef is a stable ref
+  useEffect(() => {
+    wandEdgeExpandRef.current = wandEdgeExpand;
+  }, [wandEdgeExpand]);
   // fillMode/fillSettings sync effects are now inside useFillSystem
   // compositeRef is now in drawingRefs group (declared above); it allows the
   // selection hook to call composite() without a circular dep.
@@ -1756,6 +1810,92 @@ export function PaintingApp({
     undoLayerEntryRef,
   });
 
+  // ── Transform proportional toggle ─────────────────────────────────────────
+  // When ON: all scale handle drags maintain aspect ratio. Shift temporarily inverts.
+  // When OFF (default): free transform. Shift temporarily enables proportional.
+  const [transformProportional, setTransformProportional] = useState<boolean>(
+    () => {
+      try {
+        const other = localStorage.getItem("sk-other-settings");
+        if (other) {
+          const parsed = JSON.parse(other) as Record<string, unknown>;
+          return parsed.transformProportional === true;
+        }
+      } catch {}
+      return false;
+    },
+  );
+  const transformProportionalRef = useRef(transformProportional);
+  useEffect(() => {
+    transformProportionalRef.current = transformProportional;
+  }, [transformProportional]);
+
+  const handleTransformProportionalToggle = useCallback(() => {
+    setTransformProportional((prev) => {
+      const next = !prev;
+      // Persist immediately to localStorage (fast path) and to preferences
+      try {
+        const stored = localStorage.getItem("sk-other-settings");
+        const existing = stored
+          ? (JSON.parse(stored) as Record<string, unknown>)
+          : {};
+        localStorage.setItem(
+          "sk-other-settings",
+          JSON.stringify({ ...existing, transformProportional: next }),
+        );
+      } catch {}
+      if (preferences) {
+        try {
+          const other = preferences.settings?.otherSettings;
+          const existing = other
+            ? (JSON.parse(other) as Record<string, unknown>)
+            : {};
+          void preferences.updateSettings({
+            otherSettings: JSON.stringify({
+              ...existing,
+              transformProportional: next,
+            }),
+          });
+        } catch {}
+      }
+      return next;
+    });
+  }, [preferences]);
+
+  // ── Undo history cap: apply saved preference on mount ─────────────────────
+  // biome-ignore lint/correctness/useExhaustiveDependencies: run once on mount; preferences are loaded before PaintingApp renders
+  useEffect(() => {
+    try {
+      const other = preferences?.settings?.otherSettings;
+      if (other) {
+        const parsed = JSON.parse(other) as Record<string, unknown>;
+        const v = parsed.undoHistoryLimit;
+        if (typeof v === "number" && v >= 10 && v <= 50) {
+          setHistoryCap(v, undoStackRef);
+        }
+        // Also restore transformProportional from canister preferences if available
+        if (typeof parsed.transformProportional === "boolean") {
+          setTransformProportional(parsed.transformProportional);
+        }
+      }
+    } catch {}
+  }, []);
+
+  // ── Undo history cap: respond to live changes from SettingsPanel ──────────
+  // biome-ignore lint/correctness/useExhaustiveDependencies: undoStackRef and setUndoCount are stable refs/setters
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ limit: number }>).detail;
+      if (typeof detail?.limit === "number") {
+        setHistoryCap(detail.limit, undoStackRef);
+        setUndoCount(undoStackRef.current.length);
+      }
+    };
+    document.addEventListener("sl:undo-history-limit-changed", handler);
+    return () =>
+      document.removeEventListener("sl:undo-history-limit-changed", handler);
+  }, []);
+
   // Wire revertTransformRef to the current revertTransform from useTransformSystem
   useEffect(() => {
     revertTransformRef.current = transformActionsRef.current.revertTransform;
@@ -1769,6 +1909,7 @@ export function PaintingApp({
     fileLoadInputRef,
     handleSaveFile,
     handleSilentSave,
+    resetFileState,
   } = useFileIOSystem({
     layersRef,
     layerCanvasesRef,
@@ -1807,6 +1948,21 @@ export function PaintingApp({
     },
   });
 
+  // ── File I/O reset on document switch ─────────────────────────────────────
+  // When the active document changes to a brand-new untitled document, reset
+  // the file handle and suggested filename so Ctrl+S opens Save As (instead of
+  // silently overwriting the previously saved file) and the dialog pre-fills the
+  // new document's own name.
+  // Only fires for untitled documents — switching to an already-saved document
+  // leaves the file handle intact so silent overwrite keeps working there.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: resetFileState is stable; activeDocument is the reactive value we watch
+  useEffect(() => {
+    if (!activeDocument) return;
+    if (/^untitled/i.test(activeDocument.filename)) {
+      resetFileState(activeDocument.filename);
+    }
+  }, [activeDocumentId]);
+
   // ── Multi-document swap ref ────────────────────────────────────────────────
   // Stable ref holding the three-phase swap function.
   // The wrapper calls swapDocumentRef.current(fromDoc, toDoc) on tab switch.
@@ -1828,10 +1984,6 @@ export function PaintingApp({
   // biome-ignore lint/correctness/useExhaustiveDependencies: registerDiscardFlushFn is stable
   useEffect(() => {
     registerDiscardFlushFn((doc: DocumentState, isActiveDoc: boolean): void => {
-      console.warn(
-        `[Doc Flush] Flushing discarded document "${doc.filename}" (id=${doc.id}, isActive=${isActiveDoc})`,
-      );
-
       // 1. Clear and release all layer canvases owned by the discarded document.
       //    For file-loaded documents, handleLoadFile populates layerCanvasesRef.current
       //    (same Map object as doc.layerCanvases). To guarantee we clear ALL canvases
@@ -1900,16 +2052,74 @@ export function PaintingApp({
         webglBrushRef.current.clear();
       }
 
-      // 5. Reset the active layer ID ref so no stale layer ID from the discarded
+      // 4b. Release smear tool working buffers (FIX 4 — document discard path).
+      //     clearSmearBuffers() nulls _smearPaintData, _smearPatchData, and
+      //     _smearSoftnessWeights unconditionally. Safe to call even when they are
+      //     already null (buffers are between strokes).
+      clearSmearBuffers();
+
+      // 5. Flush the tip texture cache on document discard.
+      //    The cache is keyed by tip image data URL, not by document, so textures are
+      //    technically cross-document — but accumulate indefinitely across many open/close
+      //    cycles. Flushing here (discard only, NOT on every tab switch) lets the GPU
+      //    reclaim VRAM when the user is done with a document.
+      if (webglBrushRef.current) {
+        webglBrushRef.current.flushTexCache();
+      }
+
+      // 6. Reset the active layer ID ref so no stale layer ID from the discarded
       //    document persists into the next document's initialization.
       if (isActiveDoc) {
         activeLayerIdRef.current = "";
         invalidateAllLayerBitmaps();
       }
 
-      console.warn(
-        `[Doc Flush] Flush complete for "${doc.filename}" — doc.layerCanvases size: ${doc.layerCanvases.size}, layerCanvasesRef size: ${layerCanvasesRef.current.size}`,
-      );
+      // 7. Clear undo/redo stacks to release ImageData payloads immediately.
+      //    Without this, up to ~700 MB of pixel data can survive until the next document
+      //    initializes and overwrites the live refs (close-without-open issue), or until
+      //    JS GC eventually collects the discardedDoc object (merge-then-stroke issue).
+      //    drainUndoStack explicitly nulls all ImageData fields on every entry before
+      //    clearing so pixel buffers are released without waiting for GC to collect
+      //    the entry objects themselves.
+      drainUndoStack(doc.undoStack as UndoEntry[]);
+      drainUndoStack(doc.redoStack as UndoEntry[]);
+      if (isActiveDoc) {
+        drainUndoStack(undoStackRef.current);
+        drainUndoStack(redoStackRef.current);
+        undoStackRef.current = [];
+        redoStackRef.current = [];
+        setUndoCount(0);
+        setRedoCount(0);
+      }
+
+      // 8. Reset live refs for the active document so they contain no references
+      //    to layers, canvases, or pixel data from the discarded document.
+      //    Even after the flush above clears the data, the refs themselves point
+      //    to the (now-empty) arrays/maps — leaving them pointing at empty objects
+      //    is fine, but explicitly replacing them with fresh empties ensures no
+      //    closures can traverse back to the discarded DocumentState via these refs.
+      if (isActiveDoc) {
+        layersRef.current = [];
+        layerCanvasesRef.current = new Map();
+      }
+
+      // 9. Null out all large properties on the DocumentState object itself.
+      //    The discardFlushFnRef closure captures the `doc` parameter by reference.
+      //    Even after this function returns, the JS engine may retain the `doc`
+      //    binding. Nulling out its large properties here ensures the canvas elements,
+      //    ImageData arrays, and undo entries are eligible for GC regardless of
+      //    how long the closure's reference to `doc` lingers.
+      //    Double-cast via `unknown` is intentional — DocumentState has no index signature
+      //    and we're deliberately bypassing the type system to release memory.
+      const docAny = doc as unknown as Record<string, unknown>;
+      docAny.layers = null;
+      docAny.layerCanvases = null;
+      docAny.layerThumbnails = null;
+      docAny.undoStack = null;
+      docAny.redoStack = null;
+      docAny.brushSettings = null;
+      docAny.color = null;
+      docAny.recentColors = null;
     });
   }, [registerDiscardFlushFn]);
 
@@ -2129,13 +2339,6 @@ export function PaintingApp({
         }
         const TIP_SIZE = 256;
 
-        console.log(
-          "[BrushTipEditor] accepting — canvas:",
-          displayCanvas.width,
-          "x",
-          displayCanvas.height,
-        );
-
         // Copy the WebGL display canvas into a 2D canvas so we can call getImageData.
         // drawImage on a WebGL canvas into a 2D context composites the WebGL result correctly.
         const flatCanvas = document.createElement("canvas");
@@ -2145,11 +2348,6 @@ export function PaintingApp({
         flatCtx.drawImage(displayCanvas, 0, 0);
 
         const imageData = flatCtx.getImageData(0, 0, TIP_SIZE, TIP_SIZE);
-        console.log(
-          "[BrushTipEditor] imageData non-zero pixels:",
-          imageData.data.filter((v: number, i: number) => i % 4 === 3 && v > 0)
-            .length,
-        );
 
         // Grayscale conversion with luminance weights
         const { data } = imageData;
@@ -2517,7 +2715,7 @@ export function PaintingApp({
 
   // Commit an in-progress lasso (freehand/polygon) selection
   // commitInProgressLassoRef is in uiRefs group (declared above); just wire its .current:
-  commitInProgressLassoRef.current = () => {
+  commitInProgressLassoRef.current = (shiftKey = false, altKey = false) => {
     if (!isDrawingSelectionRef.current) return;
     const mode = lassoModeRef.current;
     if (mode === "rect" || mode === "ellipse") {
@@ -2565,13 +2763,47 @@ export function PaintingApp({
     // Free/polygon lasso
     const pts = selectionDraftPointsRef.current;
     if (pts.length >= 3) {
-      selectionGeometryRef.current = { type: "free", points: [...pts] };
-      selectionShapesRef.current = [
-        { type: "free" as LassoMode, points: [...pts] },
-      ];
-      selectionBoundaryPathRef.current.dirty = true;
-      rasterizeSelectionMask();
-      setSelectionActive(true);
+      if ((shiftKey || altKey) && selectionMaskRef.current) {
+        // Combination mode: draw the new lasso path into a temp canvas and
+        // composite it onto the existing selection mask (union / subtract / intersect)
+        const tempC = document.createElement("canvas");
+        tempC.width = canvasWidthRef.current;
+        tempC.height = canvasHeightRef.current;
+        const tCtx = tempC.getContext("2d")!;
+        tCtx.fillStyle = "white";
+        tCtx.beginPath();
+        tCtx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) tCtx.lineTo(pts[i].x, pts[i].y);
+        tCtx.closePath();
+        tCtx.fill();
+        const mc = selectionMaskRef.current;
+        const mCtx = mc.getContext("2d")!;
+        if (shiftKey && !altKey) {
+          mCtx.globalCompositeOperation = "source-over";
+          mCtx.drawImage(tempC, 0, 0);
+        } else if (altKey && !shiftKey) {
+          mCtx.globalCompositeOperation = "destination-out";
+          mCtx.drawImage(tempC, 0, 0);
+        } else if (shiftKey && altKey) {
+          mCtx.globalCompositeOperation = "destination-in";
+          mCtx.drawImage(tempC, 0, 0);
+        }
+        mCtx.globalCompositeOperation = "source-over";
+        selectionGeometryRef.current = { type: "mask" as LassoMode };
+        selectionShapesRef.current = [];
+        selectionBoundaryPathRef.current.dirty = true;
+        rebuildChainsNowRef.current(selectionMaskRef.current);
+        setSelectionActive(true);
+      } else {
+        // Replace mode: rasterize fresh from the lasso path
+        selectionGeometryRef.current = { type: "free", points: [...pts] };
+        selectionShapesRef.current = [
+          { type: "free" as LassoMode, points: [...pts] },
+        ];
+        selectionBoundaryPathRef.current.dirty = true;
+        rasterizeSelectionMask();
+        setSelectionActive(true);
+      }
       const afterSnap = snapshotSelection();
       pushHistory({
         type: "selection",
@@ -2579,7 +2811,7 @@ export function PaintingApp({
         after: afterSnap,
       });
       selectionBeforeRef.current = null;
-    } else {
+    } else if (!shiftKey && !altKey) {
       clearSelection();
     }
     selectionDraftPointsRef.current = [];
@@ -2630,7 +2862,48 @@ export function PaintingApp({
         });
       const ctx = _overlayCtxCached;
       if (!ctx) return;
+
+      // The overlay is position:fixed covering the full viewport (window.innerWidth × window.innerHeight).
+      // Resize to match the current viewport dimensions.
+      const container2 = containerRef.current;
+      {
+        const vw2 = window.innerWidth;
+        const vh2 = window.innerHeight;
+        if (overlay.width !== vw2 || overlay.height !== vh2) {
+          overlay.width = vw2;
+          overlay.height = vh2;
+          _overlayCtxCached = null;
+          return; // Will redraw on next RAF tick
+        }
+      }
+
       ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+      // Apply canvas-space → viewport-space transform so all drawing coordinates
+      // (which are in canvas pixels) map correctly to the fixed-position viewport overlay.
+      // The canvas center in viewport coordinates is: containerRect.left + containerW/2 + panX
+      // This lets handles appear anywhere in the viewport even outside the container bounds.
+      {
+        const vt2 = viewTransformRef.current;
+        const flip2 = isFlippedRef.current ? -1 : 1;
+        const rad2 = (vt2.rotation * Math.PI) / 180;
+        const W2 = canvasWidthRef.current;
+        const H2 = canvasHeightRef.current;
+        // Compute canvas center in viewport space via the container's bounding rect.
+        // Fall back to container.clientWidth/2 if container is not mounted yet.
+        let originX = overlay.width / 2;
+        let originY = overlay.height / 2;
+        if (container2) {
+          const cr2 = container2.getBoundingClientRect();
+          originX = cr2.left + cr2.width / 2;
+          originY = cr2.top + cr2.height / 2;
+        }
+        ctx.save();
+        ctx.translate(originX + vt2.panX, originY + vt2.panY);
+        ctx.rotate(rad2);
+        ctx.scale(vt2.zoom * flip2, vt2.zoom);
+        ctx.translate(-W2 / 2, -H2 / 2);
+      }
 
       marchingAntsOffsetRef.current =
         (marchingAntsOffsetRef.current + 0.5) % 16;
@@ -3097,6 +3370,8 @@ export function PaintingApp({
           }
         } // end else (not freeCorner mode)
       }
+      // Restore the canvas→container transform (Change 2)
+      ctx.restore();
     };
     // Store drawAnts in a ref so the selectionActive restart effect can start it
     drawAntsRef.current = drawAnts;
@@ -3384,6 +3659,16 @@ export function PaintingApp({
       fromDoc: DocumentState,
       toDoc: DocumentState,
     ): void => {
+      // ── FILE I/O RESET: If the incoming document is untitled, clear the file
+      // handle and suggested filename immediately and synchronously so that any
+      // subsequent Ctrl+S on the new document cannot silently overwrite the
+      // previously-saved file.  This is belt-and-suspenders alongside the
+      // useEffect below — the swap body always runs before any save keystroke
+      // can be processed, making this the authoritative reset point.
+      if (/^untitled/i.test(toDoc.filename)) {
+        resetFileState(toDoc.filename);
+      }
+
       // ── SAVE: Write all current non-pixel state into fromDoc ───────────────
       // Pixel data is NOT saved here — it's already live in fromDoc.layerCanvases.
       fromDoc.layers = [...layersRef.current];
@@ -3693,12 +3978,14 @@ export function PaintingApp({
   // biome-ignore lint/correctness/useExhaustiveDependencies: selectionOverlayCanvasRef is a stable ref
   useEffect(() => {
     const overlay = selectionOverlayCanvasRef.current;
-    if (
-      overlay &&
-      (overlay.width !== canvasWidth || overlay.height !== canvasHeight)
-    ) {
-      overlay.width = canvasWidth;
-      overlay.height = canvasHeight;
+    if (!overlay) return;
+    const container = containerRef.current;
+    const cw = container ? container.clientWidth : canvasWidth;
+    const ch = container ? container.clientHeight : canvasHeight;
+    if (overlay.width !== cw || overlay.height !== ch) {
+      overlay.width = cw;
+      overlay.height = ch;
+      _overlayCtxCached = null; // invalidate cached context on resize
     }
   }, [canvasWidth, canvasHeight]);
 
@@ -3801,6 +4088,10 @@ export function PaintingApp({
   // biome-ignore lint/correctness/useExhaustiveDependencies: selectionActiveRef and selectionMaskRef are stable refs
   const handleClear = useCallback(() => {
     const layerId = activeLayerIdRef.current;
+    // Do not clear locked layers
+    const activeLayerMeta = layersRef.current.find((l) => l.id === layerId);
+    if ((activeLayerMeta as { isLocked?: boolean } | undefined)?.isLocked)
+      return;
     const lc = layerCanvasesRef.current.get(layerId);
     if (!lc) return;
     const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
@@ -3814,8 +4105,69 @@ export function PaintingApp({
     } else {
       ctx.clearRect(0, 0, lc.width, lc.height);
     }
+    // Compute dirty rect: bounding box of the content that was erased (from before-snapshot).
+    // Clearing the whole layer touches every non-transparent pixel — find their bbox.
+    const _clearData = before.data;
+    const _cW = before.width;
+    const _cH = before.height;
+    let _cMinX = _cW;
+    let _cMinY = _cH;
+    let _cMaxX = 0;
+    let _cMaxY = 0;
+    let _cHasContent = false;
+    for (let _ci = 3; _ci < _clearData.length; _ci += 4) {
+      if (_clearData[_ci] > 0) {
+        const _cPx = ((_ci - 3) / 4) % _cW;
+        const _cPy = Math.floor((_ci - 3) / 4 / _cW);
+        if (_cPx < _cMinX) _cMinX = _cPx;
+        if (_cPx + 1 > _cMaxX) _cMaxX = _cPx + 1;
+        if (_cPy < _cMinY) _cMinY = _cPy;
+        if (_cPy + 1 > _cMaxY) _cMaxY = _cPy + 1;
+        _cHasContent = true;
+      }
+    }
+    if (_cHasContent && _cMaxX > _cMinX && _cMaxY > _cMinY) {
+      // Dirty rect covers only the region that had content (and was cleared)
+      const _cPad = 2;
+      const _cDrX = Math.max(0, _cMinX - _cPad);
+      const _cDrY = Math.max(0, _cMinY - _cPad);
+      const _cDrX2 = Math.min(_cW, _cMaxX + _cPad);
+      const _cDrY2 = Math.min(_cH, _cMaxY + _cPad);
+      const _cDrW = _cDrX2 - _cDrX;
+      const _cDrH = _cDrY2 - _cDrY;
+      if (_cDrW > 0 && _cDrH > 0 && _cDrW * _cDrH < _cW * _cH * 0.5) {
+        // Crop before-snapshot to the dirty region
+        const _cTmp = document.createElement("canvas");
+        _cTmp.width = _cDrW;
+        _cTmp.height = _cDrH;
+        const _cTmpCtx = _cTmp.getContext("2d", { willReadFrequently: true });
+        if (_cTmpCtx) {
+          _cTmpCtx.putImageData(before, -_cDrX, -_cDrY);
+          const _cCroppedBefore = _cTmpCtx.getImageData(0, 0, _cDrW, _cDrH);
+          const _cAfter = ctx.getImageData(_cDrX, _cDrY, _cDrW, _cDrH);
+          const _cDirtyRect = { x: _cDrX, y: _cDrY, w: _cDrW, h: _cDrH };
+          pushHistory({
+            type: "pixels",
+            layerId,
+            dirtyRect: _cDirtyRect,
+            before: _cCroppedBefore,
+            after: _cAfter,
+          });
+          markCanvasDirty(layerId);
+          scheduleComposite();
+          return;
+        }
+      }
+    }
+    // Fallback: full canvas (empty layer, or dirty rect is too large)
     const after = ctx.getImageData(0, 0, lc.width, lc.height);
-    pushHistory({ type: "pixels", layerId, before, after });
+    pushHistory({
+      type: "pixels",
+      layerId,
+      dirtyRect: { x: 0, y: 0, w: lc.width, h: lc.height },
+      before,
+      after,
+    });
     markCanvasDirty(layerId);
     scheduleComposite();
   }, [scheduleComposite, pushHistory]);
@@ -3881,8 +4233,12 @@ export function PaintingApp({
       exportCanvas.height = display.height;
       const ctx = exportCanvas.getContext("2d", {
         willReadFrequently: !isIPad,
+        alpha: true,
       });
       if (!ctx) return;
+      // FIX 5: clearRect ensures transparent pixels are not filled with an
+      // opaque background — required for correct PNG transparency export.
+      ctx.clearRect(0, 0, exportCanvas.width, exportCanvas.height);
       ctx.drawImage(display, 0, 0);
 
       // Use toBlob (async) for better memory handling and Blob API compatibility
@@ -4034,14 +4390,14 @@ export function PaintingApp({
       canvasWidthRef.current,
       canvasHeightRef.current,
     ).data;
-    const currentMask = new Uint8Array(
+    const floatMask = new Float32Array(
       canvasWidthRef.current * canvasHeightRef.current,
     );
     for (let i = 0; i < canvasWidthRef.current * canvasHeightRef.current; i++) {
-      currentMask[i] = mdata[i * 4 + 3] > 64 ? 1 : 0;
+      floatMask[i] = mdata[i * 4 + 3] / 255;
     }
-    const newMask = growShrinkMask(
-      currentMask,
+    growShrinkFloatMask(
+      floatMask,
       canvasWidthRef.current,
       canvasHeightRef.current,
       pixels,
@@ -4051,12 +4407,13 @@ export function PaintingApp({
       canvasHeightRef.current,
     );
     const nd = newImgData.data;
-    for (let i = 0; i < newMask.length; i++) {
-      if (newMask[i]) {
+    for (let i = 0; i < floatMask.length; i++) {
+      const a = Math.round(floatMask[i] * 255);
+      if (a > 0) {
         nd[i * 4] = 255;
         nd[i * 4 + 1] = 255;
         nd[i * 4 + 2] = 255;
-        nd[i * 4 + 3] = 255;
+        nd[i * 4 + 3] = a;
       }
     }
     mctx.putImageData(newImgData, 0, 0);
@@ -4094,10 +4451,10 @@ export function PaintingApp({
 
   // ── Cursor system hook ────────────────────────────────────────────────────
   const {
-    cursorType,
-    cursorCenter,
-    setCursorType,
-    setCursorCenter,
+    cursorType: _cursorType,
+    cursorCenter: _cursorCenter,
+    setCursorType: _setCursorType,
+    setCursorCenter: _setCursorCenter,
     softwareCursorRef,
     updateBrushCursorRef,
     updateEyedropperCursorRef,
@@ -4160,6 +4517,10 @@ export function PaintingApp({
     handleToggleVisible,
     handleRenameLayer,
     handleToggleAlphaLock,
+    handleToggleLockLayer,
+    handleDuplicateLayer,
+    handleCutToNewLayer,
+    handleCopyToNewLayer,
     handleSetOpacity,
     handleSetOpacityLive,
     handleSetOpacityCommit,
@@ -4227,6 +4588,18 @@ export function PaintingApp({
     undoLayerEntryRef.current = undoLayerEntry;
   }, [undoLayerEntry]);
 
+  // FIX 1: Safe add-layer wrapper — always clears the liquify stroke guard before
+  // adding a new layer. The JSX `onAddLayer` prop uses this instead of the raw
+  // handleAddLayer so button presses in the Layers panel reset the guard correctly.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: webglBrushRef is a stable ref
+  const handleAddLayerSafe = useCallback(() => {
+    setLiquifyStrokeActive(false);
+    liquifyFreeState();
+    webglBrushRef.current?.destroyLiquifyGPU?.();
+    webglBrushRef.current?.destroyAllLiquifyGPULayers?.();
+    handleAddLayer();
+  }, [handleAddLayer]);
+
   // ── usePaintingCanvasEvents: wires all keyboard/wheel/touch/pointer events ─
   // canvasEventCallbacksRef is updated every render so event handlers always
   // call the latest callbacks without stale-closure issues.
@@ -4257,6 +4630,7 @@ export function PaintingApp({
     setActiveLayerId,
     handleAdjustmentsToggle,
     collapseRulerHistory,
+    webglBrushRef,
   });
 
   const canvasEventCallbacksRef = useRef<PaintingCanvasEventsCallbacks>(
@@ -4325,9 +4699,70 @@ export function PaintingApp({
       composite();
       markCanvasDirty(layerId);
     },
+    pasteAsNewLayer: (img: HTMLImageElement) => {
+      const cw = canvasWidthRef.current;
+      const ch = canvasHeightRef.current;
+      // Determine draw dimensions — scale down if larger than canvas, maintaining aspect ratio
+      let drawW = img.naturalWidth;
+      let drawH = img.naturalHeight;
+      if (drawW > cw || drawH > ch) {
+        const scaleX = cw / drawW;
+        const scaleY = ch / drawH;
+        const scale = Math.min(scaleX, scaleY);
+        drawW = Math.floor(drawW * scale);
+        drawH = Math.floor(drawH * scale);
+      }
+      const drawX = Math.round((cw - drawW) / 2);
+      const drawY = Math.round((ch - drawH) / 2);
+      // Create the new layer object
+      const newLay = newLayer();
+      newLay.name = "Pasted Layer";
+      // Create its canvas and draw the image
+      const nc = document.createElement("canvas");
+      nc.width = cw;
+      nc.height = ch;
+      const nCtx = nc.getContext("2d", {
+        willReadFrequently: !_isIPadRef.current,
+      })!;
+      nCtx.drawImage(img, drawX, drawY, drawW, drawH);
+      layerCanvasesRef.current.set(newLay.id, nc);
+      // Insert new layer directly above the active layer in the flat array
+      const activeId = activeLayerIdRef.current;
+      const pixels = nCtx.getImageData(0, 0, cw, ch);
+      let insertIdx = 0;
+      setLayers((prev) => {
+        const ai = prev.findIndex((l) => l.id === activeId);
+        let ii = ai >= 0 ? ai : 0;
+        while (ii > 0 && prev[ii]?.type === "end_group") ii--;
+        insertIdx = ii;
+        const next = [...prev];
+        next.splice(ii, 0, newLay as unknown as Layer);
+        return next;
+      });
+      layersRef.current = (() => {
+        const ai = layersRef.current.findIndex((l) => l.id === activeId);
+        let ii = ai >= 0 ? ai : 0;
+        while (ii > 0 && layersRef.current[ii]?.type === "end_group") ii--;
+        const next = [...layersRef.current];
+        next.splice(ii, 0, newLay as unknown as Layer);
+        return next;
+      })();
+      setActiveLayerId(newLay.id);
+      activeLayerIdRef.current = newLay.id;
+      markLayerBitmapDirty(newLay.id);
+      markCanvasDirty(newLay.id);
+      pushHistory({
+        type: "layer-add-pixels",
+        layer: newLay,
+        index: insertIdx,
+        pixels,
+      });
+      composite();
+    },
     handleSaveFile,
     handleSilentSave,
-    handleAddLayer,
+    // FIX 1: Use handleAddLayerSafe so keyboard shortcut path also clears the guard.
+    handleAddLayer: handleAddLayerSafe,
     handleDeleteLayer,
     handleToggleVisible,
     handleToggleAlphaLock,
@@ -4339,6 +4774,7 @@ export function PaintingApp({
     collapseRulerHistory,
     scheduleRulerOverlay,
     composite,
+    scheduleComposite,
     drawBrushTipOverlay,
     setActiveTool,
     setActiveSubpanel,
@@ -4362,12 +4798,20 @@ export function PaintingApp({
     setCropRectVersion,
     handleToolChange,
     // Compositing / stroke helpers
-    scheduleComposite,
+    // Clear the stroke-active guard unconditionally — must be called from every
+    // liquify exit path (pointer-up, pointer-cancel, tool-switch) so the guard
+    // is never left stuck after a liquify stroke ends.
+    clearStrokeGuard: () => {
+      strokeActiveRef.current = false;
+    },
     compositeWithStrokePreview,
     // Wrap buildStrokeCanvases to set strokeActiveRef at stroke start.
     // This must fire before any stamp or compositeWithStrokePreview call so
     // the layer canvas write guard is active for the full duration of the stroke.
     buildStrokeCanvases: (layerId: string) => {
+      // Lock guard: skip stroke if active layer is locked
+      const _lockMeta = layersRef.current.find((l) => l.id === layerId);
+      if ((_lockMeta as { isLocked?: boolean } | undefined)?.isLocked) return;
       strokeActiveRef.current = true;
       buildStrokeCanvases(layerId);
     },
@@ -4544,6 +4988,7 @@ export function PaintingApp({
     wandToleranceRef,
     wandContiguousRef,
     wandGrowShrinkRef,
+    wandEdgeExpandRef,
     // Transform / float refs
     moveFloatCanvasRef,
     floatDragStartRef,
@@ -4596,8 +5041,9 @@ export function PaintingApp({
     // Liquify refs
     liquifyBeforeSnapshotRef,
     liquifyMultiBeforeSnapshotsRef,
-    liquifyHoldIntervalRef,
     liquifyScopeRef,
+    liquifyHardnessRef,
+    liquifyStretchRef,
     // Thumbnail debounce
     thumbDebounceRef,
     thumbDebounceLcRef,
@@ -4630,6 +5076,11 @@ export function PaintingApp({
     ctrlDragMoveActiveRef,
     ctrlDragOffsetRef,
     ctrlDragMovingLayerIdRef,
+    // UI mode toggle (Tab hotkey)
+    isMobileRef,
+    setUIModeOverrideRef,
+    // Transform proportional toggle
+    transformProportionalRef,
   });
 
   const handleZoomLockToggle = useCallback(() => {
@@ -4662,7 +5113,35 @@ export function PaintingApp({
     });
   }, []);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: viewTransformRef and isFlippedRef are stable refs
   const handleFlipToggle = useCallback(() => {
+    const vt = viewTransformRef.current;
+    const rot = (vt.rotation * Math.PI) / 180;
+    const cosR = Math.cos(rot);
+    const sinR = Math.sin(rot);
+    const flip = isFlippedRef.current ? -1 : 1;
+    const newFlip = -flip;
+    const A = flip * cosR;
+    const B = -flip * sinR;
+    const C = sinR;
+    const D = cosR;
+    const px2 = -vt.panX / vt.zoom;
+    const py2 = -vt.panY / vt.zoom;
+    const det = A * D - B * C;
+    const cxF = (D * px2 - B * py2) / det;
+    const cyF = (-C * px2 + A * py2) / det;
+    const newPanX = -newFlip * (cxF * cosR - cyF * sinR) * vt.zoom;
+    const newPanY = -(cxF * sinR + cyF * cosR) * vt.zoom;
+    setViewTransform((prev) => ({
+      ...prev,
+      panX: newPanX,
+      panY: newPanY,
+    }));
+    viewTransformRef.current = {
+      ...viewTransformRef.current,
+      panX: newPanX,
+      panY: newPanY,
+    };
     setIsFlipped((f) => !f);
   }, []);
 
@@ -4938,6 +5417,8 @@ export function PaintingApp({
             fileLoadInputRef={fileLoadInputRef}
             onFileLoad={openFileAsDocument}
             onNavigateToSplash={onNavigateToSplash}
+            transformProportional={transformProportional}
+            onTransformProportionalToggle={handleTransformProportionalToggle}
           />
           {/* Left sidebar: Color Panel + Tool Presets — desktop only; mobile uses floating panels */}
           {!isMobile && (
@@ -4969,9 +5450,11 @@ export function PaintingApp({
               wandTolerance={wandTolerance}
               wandContiguous={wandContiguous}
               wandGrowShrink={wandGrowShrink}
+              wandEdgeExpand={wandEdgeExpand}
               onWandToleranceChange={setWandTolerance}
               onWandContiguousChange={setWandContiguous}
               onWandGrowShrinkChange={setWandGrowShrink}
+              onWandEdgeExpandChange={setWandEdgeExpand}
               activeLayerId={activeLayerId}
               layers={layers}
               layerCanvasesRef={layerCanvasesRef}
@@ -5148,11 +5631,18 @@ export function PaintingApp({
               }}
               liquifySize={liquifySize}
               liquifyStrength={liquifyStrength}
+              liquifyHardness={liquifyHardness}
+              liquifyStretch={liquifyStretch}
               liquifyScope={liquifyScope}
               onLiquifySizeChange={setLiquifySize}
               onLiquifyStrengthChange={setLiquifyStrength}
+              onLiquifyHardnessChange={setLiquifyHardness}
+              onLiquifyStretchChange={setLiquifyStretch}
               onLiquifyScopeChange={setLiquifyScope}
-              isMobile={isMobile}
+              isMobile={isMobile && showFOBSliders}
+              isOnMobileDevice={isMobile}
+              transformProportional={transformProportional}
+              onTransformProportionalToggle={handleTransformProportionalToggle}
               brushTipEditorActive={brushTipEditorMode?.active === true}
             />
             {/* ── Brush Tip Editor strip ── */}
@@ -5252,10 +5742,12 @@ export function PaintingApp({
               showMobileColorPanel={showMobileColorPanel}
               showMobilePresetsPanel={showMobilePresetsPanel}
               showMobileLayersPanel={showMobileLayersPanel}
+              showFOBSliders={showFOBSliders}
               recentColors={recentColors}
               wandTolerance={wandTolerance}
               wandContiguous={wandContiguous}
               wandGrowShrink={wandGrowShrink}
+              wandEdgeExpand={wandEdgeExpand}
               cursor={getCursorStyle()}
               onSetActiveMobilePanel={setActiveMobilePanel}
               onRecentColorClick={handleRecentColorClick}
@@ -5279,6 +5771,7 @@ export function PaintingApp({
               onWandToleranceChange={setWandTolerance}
               onWandContiguousChange={setWandContiguous}
               onWandGrowShrinkChange={setWandGrowShrink}
+              onWandEdgeExpandChange={setWandEdgeExpand}
               onSelectFillMode={handleSelectFillMode}
               onFillSettingsChange={handleFillSettingsChange}
               onRulerPresetTypeChange={handleRulerPresetTypeChangeForCanvas}
@@ -5379,7 +5872,7 @@ export function PaintingApp({
               onSetOpacityLive={handleSetOpacityLive}
               onSetOpacityCommit={handleSetOpacityCommit}
               onSetBlendMode={handleSetLayerBlendMode}
-              onAddLayer={handleAddLayer}
+              onAddLayer={handleAddLayerSafe}
               onDeleteLayer={(id) => {
                 const isRuler = layersRef.current.find(
                   (l) => l.id === id,
@@ -5393,6 +5886,11 @@ export function PaintingApp({
               onMergeLayers={handleMergeLayers}
               onRenameLayer={handleRenameLayer}
               onToggleAlphaLock={handleToggleAlphaLock}
+              onToggleLockLayer={handleToggleLockLayer}
+              onDuplicateLayer={handleDuplicateLayer}
+              onCutToNewLayer={handleCutToNewLayer}
+              onCopyToNewLayer={handleCopyToNewLayer}
+              hasSelection={selectionActive}
               onCtrlClickLayer={handleCtrlClickLayer}
               onToggleRulerActive={(id) => {
                 const toggleFn = (l: Layer): Layer =>
@@ -5425,6 +5923,7 @@ export function PaintingApp({
                 setActiveMobilePanel(null);
                 enterBrushTipEditor(onAccept);
               }}
+              saveMobileLayoutRef={saveMobileLayoutRef}
               mobileAdjustmentsPanel={
                 <AdjustmentsPresetsPanel
                   activeLayerId={activeLayerId}
@@ -5505,12 +6004,8 @@ export function PaintingApp({
                   needsFullCompositeRef.current = true;
 
                   // 5. Update React state so the canvas wrapper CSS size matches
-                  console.log(
-                    "[ResizeCanvas] state setters firing: setCanvasWidth + setCanvasHeight",
-                  );
                   setCanvasWidth(newW);
                   setCanvasHeight(newH);
-                  console.log("[ResizeCanvas] returning");
                 }}
                 compositeAllLayers={composite}
                 commitActiveStroke={() => {
@@ -5751,7 +6246,7 @@ export function PaintingApp({
                 onSetOpacityLive={handleSetOpacityLive}
                 onSetOpacityCommit={handleSetOpacityCommit}
                 onSetBlendMode={handleSetLayerBlendMode}
-                onAddLayer={handleAddLayer}
+                onAddLayer={handleAddLayerSafe}
                 onDeleteLayer={(id) => {
                   const isRuler = layersRef.current.find(
                     (l) => l.id === id,
@@ -5765,6 +6260,11 @@ export function PaintingApp({
                 onMergeLayers={handleMergeLayers}
                 onRenameLayer={handleRenameLayer}
                 onToggleAlphaLock={handleToggleAlphaLock}
+                onToggleLockLayer={handleToggleLockLayer}
+                onDuplicateLayer={handleDuplicateLayer}
+                onCutToNewLayer={handleCutToNewLayer}
+                onCopyToNewLayer={handleCopyToNewLayer}
+                hasSelection={selectionActive}
                 onCtrlClickLayer={handleCtrlClickLayer}
                 onToggleRulerActive={(id) => {
                   const toggleFn = (l: Layer): Layer =>
@@ -5800,35 +6300,14 @@ export function PaintingApp({
           <SettingsPanel
             open={settingsOpen}
             onClose={() => setSettingsOpen(false)}
-            onExportBrushes={handleExportBrushes}
-            onImportBrushes={handleImportBrushes}
-            cursorType={cursorType}
-            cursorCenter={cursorCenter}
-            onCursorSettingsChange={(type, center) => {
-              setCursorType(type);
-              setCursorCenter(center);
-              localStorage.setItem("sk-cursor-type", type);
-              localStorage.setItem("sk-cursor-center", center);
-            }}
-            pressureCurve={universalPressureCurve}
-            onPressureCurveChange={(v) => {
-              setUniversalPressureCurve(v);
-              localStorage.setItem("sk-pressure-curve", JSON.stringify(v));
-            }}
-            isLoggedIn={isLoggedIn}
-            principalId={
-              isLoggedIn && identity ? identity.getPrincipal().toString() : null
-            }
-            onLogin={onLogin}
-            onLogout={onLogout}
-            isMobile={isMobile || forceDesktop}
-            forceDesktop={forceDesktop}
-            onForceDesktopChange={(v) => {
-              setForceDesktop(v);
-              if (v) setRightSidebarCollapsed(false);
-            }}
+            isMobile={isMobile}
             leftHanded={leftHanded}
             onLeftHandedChange={setLeftHanded}
+            uiModeOverride={uiModeOverride}
+            onUIModeOverrideChange={handleUIModeOverrideChange}
+            showFOBSliders={showFOBSliders}
+            onShowFOBSlidersChange={setShowFOBSliders}
+            containerRef={containerRef}
             preferences={preferences}
           />
           {/* Cloud Overwrite Confirmation Dialog */}

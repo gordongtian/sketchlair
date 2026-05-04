@@ -54,9 +54,11 @@ export interface LeftSidebarAreaProps {
   wandTolerance: number;
   wandContiguous: boolean;
   wandGrowShrink: number;
+  wandEdgeExpand: number;
   onWandToleranceChange: React.Dispatch<React.SetStateAction<number>>;
   onWandContiguousChange: React.Dispatch<React.SetStateAction<boolean>>;
   onWandGrowShrinkChange: React.Dispatch<React.SetStateAction<number>>;
+  onWandEdgeExpandChange: React.Dispatch<React.SetStateAction<number>>;
 
   // Adjustments panel
   activeLayerId: string | null;
@@ -149,9 +151,11 @@ export function LeftSidebarArea({
   wandTolerance,
   wandContiguous,
   wandGrowShrink,
+  wandEdgeExpand,
   onWandToleranceChange,
   onWandContiguousChange,
   onWandGrowShrinkChange,
+  onWandEdgeExpandChange,
   activeLayerId,
   layers,
   layerCanvasesRef,
@@ -354,6 +358,8 @@ export function LeftSidebarArea({
                 onWandContiguousChange={onWandContiguousChange}
                 wandGrowShrink={wandGrowShrink}
                 onWandGrowShrinkChange={onWandGrowShrinkChange}
+                wandEdgeExpand={wandEdgeExpand}
+                onWandEdgeExpandChange={onWandEdgeExpandChange}
               />
             ) : activeSubpanel === "adjustments" ? (
               <AdjustmentsPresetsPanel

@@ -1,34 +1,23 @@
 /**
- * useLiquifySystem — Krita-style displacement mesh liquify tool.
+ * useLiquifySystem — GPU single-pass backward-mapping warp.
  *
- * Owns all liquify state, refs, and the displacement field math.
- * The pointer down/move/up handlers live in PaintingApp but call the
- * functions exported here so the logic is co-located with the data.
+ * Holds UI state (size, strength, hardness, stretch) and exports the
+ * stroke lifecycle functions called by usePaintingCanvasEvents.
+ *
+ * The actual warp is computed in a fragment shader via WebGLBrushContext
+ * (initLiquifyGPU / renderLiquifyFrame / blitLiquifyPreview / commitLiquify).
+ * This module retains the CPU bilinear helper for use by the multi-layer
+ * CPU fallback path (_liquifyApplyWarpToLayer in usePaintingCanvasEvents.ts).
  */
 
 import { useEffect, useRef, useState } from "react";
 
-// ─── Module-level displacement field buffers ─────────────────────────────────
-// These must live at module scope so they survive re-renders without being
-// recreated. They are reset whenever the canvas is resized via resetField().
+// ─── Named constants ──────────────────────────────────────────────────────────
+/** Maximum displacement per frame as a fraction of radius. */
+export const LIQUIFY_MAX_DISP_SCALE = 1.5;
 
-let _liquifyDxDy: Float32Array | null = null;
-let _liquifySnapshot: ImageData | null = null;
-let _liquifySnapW = 0;
-let _liquifySnapH = 0;
-let _liquifyDirtyX0 = 0;
-let _liquifyDirtyY0 = 0;
-let _liquifyDirtyX1 = 0;
-let _liquifyDirtyY1 = 0;
-let _liquifyOutput: ImageData | null = null;
-
-// ─── Single liquify stroke active flag ───────────────────────────────────────
-// Set to true at liquify pointer-down, false at pointer-up.
-// Any code that would draw pre-warp layer state to the display canvas
-// (compositeWithStrokePreview, scheduleComposite) checks this flag and
-// skips the draw while a liquify stroke is in progress.
-// This is the single authoritative gate — all previous stacked RAF
-// cancellation fixes have been collapsed into this one flag.
+// ─── Stroke-active flag ───────────────────────────────────────────────────────
+// Checked by the compositing system to suppress pre-warp composites mid-stroke.
 let _liquifyStrokeActive = false;
 
 export function getLiquifyStrokeActive(): boolean {
@@ -38,318 +27,147 @@ export function setLiquifyStrokeActive(v: boolean): void {
   _liquifyStrokeActive = v;
 }
 
-// ─── Exported getters/setters for module-level state ─────────────────────────
-// PaintingApp's pointer handlers read/write these during the stroke.
+// ─── Module-level stroke state ────────────────────────────────────────────────
+// Frozen source snapshot captured at pointer-down — kept for undo "before" state.
+// Freed at pointer-up / cancel / tool-switch.
+let _liqSource: ImageData | null = null;
+let _liqW = 0;
+let _liqH = 0;
+let _liqPrevX = 0;
+let _liqPrevY = 0;
 
-export function getLiquifySnapshot(): ImageData | null {
-  return _liquifySnapshot;
-}
-export function setLiquifySnapshot(v: ImageData | null) {
-  _liquifySnapshot = v;
-}
-export function getLiquifySnapW(): number {
-  return _liquifySnapW;
-}
-export function getLiquifySnapH(): number {
-  return _liquifySnapH;
-}
-export function getLiquifyDxDy(): Float32Array | null {
-  return _liquifyDxDy;
-}
-
-/** Called at pen-down to initialise the displacement field for a new stroke. */
-export function initLiquifyField(
-  snapData: ImageData,
-  width: number,
-  height: number,
-): void {
-  _liquifySnapshot = snapData;
-  _liquifySnapW = width;
-  _liquifySnapH = height;
-  const needed = width * height * 2;
-  if (!_liquifyDxDy || _liquifyDxDy.length !== needed) {
-    _liquifyDxDy = new Float32Array(needed);
-  } else {
-    _liquifyDxDy.fill(0);
-  }
-  // Reset dirty rect to empty (nothing displaced yet)
-  _liquifyDirtyX0 = width;
-  _liquifyDirtyY0 = height;
-  _liquifyDirtyX1 = 0;
-  _liquifyDirtyY1 = 0;
-}
-
-/** Reset field after canvas resize so stale data is never used. */
-export function resetLiquifyField(): void {
-  _liquifyDxDy = null;
-  _liquifySnapshot = null;
-  _liquifyOutput = null;
-  _liquifySnapW = 0;
-  _liquifySnapH = 0;
-}
-
-// ─── Core displacement math ───────────────────────────────────────────────────
+// ─── Stroke lifecycle ─────────────────────────────────────────────────────────
 
 /**
- * Accumulate a push-mode displacement stamp at (cx, cy) with Gaussian-cosine
- * falloff. Strength is the raw slider value (0–1); the 0.6 rescale is applied
- * by the caller so this function stays pure.
+ * Capture the frozen source snapshot at pointer-down.
+ * Called once per stroke; the snapshot is used as the undo "before" state.
  */
-export function updateLiquifyDisplacementField(
+export function liquifyPointerDown(
+  ctx: CanvasRenderingContext2D,
   cx: number,
   cy: number,
-  radius: number,
-  strength: number,
-  dxDir: number,
-  dyDir: number,
+  _layerId = "",
 ): void {
-  if (!_liquifyDxDy || !_liquifySnapshot) return;
-  const W = _liquifySnapW;
-  const H = _liquifySnapH;
-  // Raised cosine falloff: exactly 1 at center, exactly 0 at boundary — no discontinuity ring.
-  // The old Gaussian at sigma=radius/2 still had ~13.5% amplitude at dist=radius, which caused
-  // a visible ring artifact for radially-symmetric modes like expand/pinch.
-  // Per-stamp displacement step. Increased from 0.08 to 0.15 so push/expand travel a
-  // visually convincing distance without needing many overlapping passes.
-  const stepAmt = radius * 0.15 * strength;
-  // Cap raised to radius*8 so content can travel far before hitting the hard limit.
-  // The old cap of radius*3 was too small — users felt pushes "dropping" after a short distance.
-  const maxDisp = radius * 8;
-  const maxDisp2 = maxDisp * maxDisp;
-  const x0 = Math.max(0, Math.floor(cx - radius));
-  const y0 = Math.max(0, Math.floor(cy - radius));
-  const x1 = Math.min(W, Math.ceil(cx + radius + 1));
-  const y1 = Math.min(H, Math.ceil(cy + radius + 1));
-
-  for (let py = y0; py < y1; py++) {
-    for (let px = x0; px < x1; px++) {
-      const offX = px - cx;
-      const offY = py - cy;
-      const dist = Math.sqrt(offX * offX + offY * offY);
-      if (dist >= radius) continue;
-      // cos²(dist/radius * π/2): exactly 1 at center, exactly 0 at boundary.
-      const t = dist / radius;
-      const cosVal = Math.cos(t * Math.PI * 0.5);
-      const lambda = cosVal * cosVal;
-      const i = (py * W + px) * 2;
-
-      // Push: source pixel is pulled backward along stroke direction.
-      // dxDir/dyDir are already normalised stroke direction components.
-      _liquifyDxDy[i] -= lambda * dxDir * stepAmt;
-      _liquifyDxDy[i + 1] -= lambda * dyDir * stepAmt;
-
-      // Clamp total displacement so we never fold content catastrophically.
-      // Skip sqrt unless cap actually triggers (avoid sqrt on most pixels).
-      const dx = _liquifyDxDy[i];
-      const dy = _liquifyDxDy[i + 1];
-      const totalDisp2 = dx * dx + dy * dy;
-      if (totalDisp2 > maxDisp2) {
-        const totalDisp = Math.sqrt(totalDisp2);
-        const s = maxDisp / totalDisp;
-        _liquifyDxDy[i] = dx * s;
-        _liquifyDxDy[i + 1] = dy * s;
-      }
-    }
-  }
-
-  // Expand dirty rect
-  _liquifyDirtyX0 = Math.min(_liquifyDirtyX0, x0);
-  _liquifyDirtyY0 = Math.min(_liquifyDirtyY0, y0);
-  _liquifyDirtyX1 = Math.max(_liquifyDirtyX1, x1);
-  _liquifyDirtyY1 = Math.max(_liquifyDirtyY1, y1);
+  const canvas = ctx.canvas;
+  _liqW = canvas.width;
+  _liqH = canvas.height;
+  _liqSource = ctx.getImageData(0, 0, _liqW, _liqH);
+  _liqPrevX = cx;
+  _liqPrevY = cy;
 }
 
-// ─── Per-frame dirty rect (resets each rAF cycle) ────────────────────────────
-// The cumulative dirty rect grows monotonically for undo/commit correctness.
-// The per-frame dirty rect is reset at the start of each rAF so we only
-// re-render pixels touched in the current frame — prevents pathological cost
-// on long strokes where the cumulative rect spans the full canvas.
-let _liqFrameDirtyX0 = 0;
-let _liqFrameDirtyY0 = 0;
-let _liqFrameDirtyX1 = 0;
-let _liqFrameDirtyY1 = 0;
-let _liqFrameDirtyEmpty = true;
-
-/** Call at the start of each rAF callback before processing events for the frame. */
-export function resetLiquifyFrameDirty(): void {
-  _liqFrameDirtyX0 = 0;
-  _liqFrameDirtyY0 = 0;
-  _liqFrameDirtyX1 = 0;
-  _liqFrameDirtyY1 = 0;
-  _liqFrameDirtyEmpty = true;
+/** Update previous cursor position. Called after each renderLiquifyFrame. */
+export function liquifyUpdatePrev(cx: number, cy: number): void {
+  _liqPrevX = cx;
+  _liqPrevY = cy;
 }
 
-/** Expand the per-frame dirty rect to include the stamp area just written. */
-export function expandLiquifyFrameDirty(
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
-): void {
-  if (_liqFrameDirtyEmpty) {
-    _liqFrameDirtyX0 = x0;
-    _liqFrameDirtyY0 = y0;
-    _liqFrameDirtyX1 = x1;
-    _liqFrameDirtyY1 = y1;
-    _liqFrameDirtyEmpty = false;
-  } else {
-    if (x0 < _liqFrameDirtyX0) _liqFrameDirtyX0 = x0;
-    if (y0 < _liqFrameDirtyY0) _liqFrameDirtyY0 = y0;
-    if (x1 > _liqFrameDirtyX1) _liqFrameDirtyX1 = x1;
-    if (y1 > _liqFrameDirtyY1) _liqFrameDirtyY1 = y1;
-  }
+/** Current previous cursor X. */
+export function liquifyPrevX(): number {
+  return _liqPrevX;
+}
+/** Current previous cursor Y. */
+export function liquifyPrevY(): number {
+  return _liqPrevY;
 }
 
 /**
- * Apply the current displacement field to the layer canvas using bilinear
- * interpolation. Renders the per-frame dirty rect (resets each rAF) rather
- * than the full cumulative rect — this prevents long-stroke cost explosion.
+ * Returns undo data at pointer-up (the frozen source as "before", the current
+ * canvas state as "after"), then frees all stroke state.
  *
- * stride > 1 uses nearest-neighbor fill for skipped pixels (acceptable
- * quality trade-off for multi-layer mode performance).
+ * The caller is responsible for writing the final warped result to the layer
+ * canvas BEFORE calling this (via webglBrushRef.current.commitLiquify).
  */
-export function renderLiquifyFromSnapshot(
-  ctx: CanvasRenderingContext2D,
-  snapshot?: ImageData,
-  stride = 1,
-): void {
-  if (!_liquifyDxDy) return;
-  const snap = snapshot ?? _liquifySnapshot;
-  if (!snap) return;
-  const W = _liquifySnapW;
-  const H = _liquifySnapH;
+export function liquifyPointerUp(ctx: CanvasRenderingContext2D): {
+  before: ImageData;
+  after: ImageData;
+  dirtyRect: { x: number; y: number; width: number; height: number };
+} | null {
+  if (!_liqSource) return null;
 
-  // Use per-frame dirty rect; fall back to cumulative if frame rect is empty.
-  const rx0 = _liqFrameDirtyEmpty ? _liquifyDirtyX0 : _liqFrameDirtyX0;
-  const ry0 = _liqFrameDirtyEmpty ? _liquifyDirtyY0 : _liqFrameDirtyY0;
-  const rx1 = _liqFrameDirtyEmpty ? _liquifyDirtyX1 : _liqFrameDirtyX1;
-  const ry1 = _liqFrameDirtyEmpty ? _liquifyDirtyY1 : _liqFrameDirtyY1;
-  const rw = rx1 - rx0;
-  const rh = ry1 - ry0;
-  if (rw <= 0 || rh <= 0) return;
+  const before = _liqSource;
+  const W = _liqW;
+  const H = _liqH;
 
-  if (
-    !_liquifyOutput ||
-    _liquifyOutput.width !== rw ||
-    _liquifyOutput.height !== rh
-  ) {
-    _liquifyOutput = new ImageData(rw, rh);
-  }
-  const out = _liquifyOutput.data;
-  const src = snap.data;
+  // after is read from the layer canvas — caller must have committed to it already
+  const after = ctx.getImageData(0, 0, W, H);
 
-  for (let py = ry0; py < ry1; py += stride) {
-    for (let px = rx0; px < rx1; px += stride) {
-      const di = (py * W + px) * 2;
-      const srcX = px + _liquifyDxDy[di];
-      const srcY = py + _liquifyDxDy[di + 1];
-      const oi = ((py - ry0) * rw + (px - rx0)) * 4;
+  _liqSource = null;
 
-      let r: number;
-      let g: number;
-      let b: number;
-      let a: number;
-
-      if (srcX < 0 || srcX >= W - 1 || srcY < 0 || srcY >= H - 1) {
-        const cx2 = Math.max(0, Math.min(W - 1, Math.round(srcX)));
-        const cy2 = Math.max(0, Math.min(H - 1, Math.round(srcY)));
-        const si = (cy2 * W + cx2) * 4;
-        r = src[si];
-        g = src[si + 1];
-        b = src[si + 2];
-        a = src[si + 3];
-      } else {
-        const sx = Math.floor(srcX);
-        const sy = Math.floor(srcY);
-        const fx = srcX - sx;
-        const fy = srcY - sy;
-        const i00 = (sy * W + sx) * 4;
-        const i10 = (sy * W + sx + 1) * 4;
-        const i01 = ((sy + 1) * W + sx) * 4;
-        const i11 = ((sy + 1) * W + sx + 1) * 4;
-        const w00 = (1 - fx) * (1 - fy);
-        const w10 = fx * (1 - fy);
-        const w01 = (1 - fx) * fy;
-        const w11 = fx * fy;
-        r = src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11;
-        g =
-          src[i00 + 1] * w00 +
-          src[i10 + 1] * w10 +
-          src[i01 + 1] * w01 +
-          src[i11 + 1] * w11;
-        b =
-          src[i00 + 2] * w00 +
-          src[i10 + 2] * w10 +
-          src[i01 + 2] * w01 +
-          src[i11 + 2] * w11;
-        a =
-          src[i00 + 3] * w00 +
-          src[i10 + 3] * w10 +
-          src[i01 + 3] * w01 +
-          src[i11 + 3] * w11;
-      }
-
-      out[oi] = r;
-      out[oi + 1] = g;
-      out[oi + 2] = b;
-      out[oi + 3] = a;
-
-      // Nearest-neighbor fill for skipped pixels when stride > 1
-      if (stride > 1) {
-        const pyMax = Math.min(py + stride, ry1);
-        const pxMax = Math.min(px + stride, rx1);
-        for (let sy2 = py; sy2 < pyMax; sy2++) {
-          for (let sx2 = px; sx2 < pxMax; sx2++) {
-            if (sy2 === py && sx2 === px) continue;
-            const oi2 = ((sy2 - ry0) * rw + (sx2 - rx0)) * 4;
-            out[oi2] = r;
-            out[oi2 + 1] = g;
-            out[oi2 + 2] = b;
-            out[oi2 + 3] = a;
-          }
-        }
-      }
-    }
-  }
-
-  ctx.putImageData(_liquifyOutput, rx0, ry0);
+  return {
+    before,
+    after,
+    dirtyRect: { x: 0, y: 0, width: W, height: H },
+  };
 }
 
 /**
- * Batch multi-layer liquify render — applies the SAME displacement field to
- * multiple layers in a single pass. Caller provides an array of
- * (ctx, snapshot) pairs. One composite fires after this returns.
- *
- * stride reduces processed pixel count for large layer counts (stride 2 = 4×
- * fewer pixels processed, stride 3 = 9×).
- *
- * Ruler layers are silently skipped — the displacement field is never written
- * to a layer canvas whose corresponding layer has isRuler === true.
+ * Free all liquify stroke state without committing.
+ * Call on pointer-cancel and tool-switch away from liquify mid-stroke.
  */
-export function renderLiquifyMultiLayer(
-  layers: Array<{
-    ctx: CanvasRenderingContext2D;
-    snapshot: ImageData;
-    isRuler?: boolean;
-  }>,
-  stride = 1,
-): void {
-  for (const { ctx, snapshot, isRuler } of layers) {
-    // Ruler layer guard — silently skip; displacement is never written to ruler layers
-    if (isRuler) continue;
-    renderLiquifyFromSnapshot(ctx, snapshot, stride);
-  }
+export function liquifyFreeState(): void {
+  _liqSource = null;
+}
+
+/** Returns true if a liquify stroke is currently in progress. */
+export function liquifyIsActive(): boolean {
+  return _liqSource !== null;
+}
+
+// ─── Internal helpers (CPU path for multi-layer fallback) ─────────────────────
+
+export function _bilinearSample(
+  src: ImageData,
+  sxRaw: number,
+  syRaw: number,
+  w: number,
+  h: number,
+): { r: number; g: number; b: number; a: number } {
+  const sx = Math.max(0, Math.min(w - 1, sxRaw));
+  const sy = Math.max(0, Math.min(h - 1, syRaw));
+
+  const x0 = Math.floor(sx);
+  const x1 = Math.min(x0 + 1, w - 1);
+  const y0 = Math.floor(sy);
+  const y1 = Math.min(y0 + 1, h - 1);
+  const fx = sx - x0;
+  const fy = sy - y0;
+
+  const d = src.data;
+  const i00 = (y0 * w + x0) * 4;
+  const i10 = (y0 * w + x1) * 4;
+  const i01 = (y1 * w + x0) * 4;
+  const i11 = (y1 * w + x1) * 4;
+
+  const w00 = (1 - fx) * (1 - fy);
+  const w10 = fx * (1 - fy);
+  const w01 = (1 - fx) * fy;
+  const w11 = fx * fy;
+
+  return {
+    r: d[i00] * w00 + d[i10] * w10 + d[i01] * w01 + d[i11] * w11,
+    g:
+      d[i00 + 1] * w00 + d[i10 + 1] * w10 + d[i01 + 1] * w01 + d[i11 + 1] * w11,
+    b:
+      d[i00 + 2] * w00 + d[i10 + 2] * w10 + d[i01 + 2] * w01 + d[i11 + 2] * w11,
+    a:
+      d[i00 + 3] * w00 + d[i10 + 3] * w10 + d[i01 + 3] * w01 + d[i11 + 3] * w11,
+  };
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
 export interface LiquifySystemReturn {
-  // React state (for UI)
+  // React state (for UI sliders)
   liquifySize: number;
   liquifyStrength: number;
+  liquifyHardness: number;
+  liquifyStretch: number;
   liquifyScope: "active" | "all-visible";
   setLiquifySize: React.Dispatch<React.SetStateAction<number>>;
   setLiquifyStrength: React.Dispatch<React.SetStateAction<number>>;
+  setLiquifyHardness: React.Dispatch<React.SetStateAction<number>>;
+  setLiquifyStretch: React.Dispatch<React.SetStateAction<number>>;
   setLiquifyScope: React.Dispatch<
     React.SetStateAction<"active" | "all-visible">
   >;
@@ -357,36 +175,38 @@ export interface LiquifySystemReturn {
   // Refs (for hot-path pointer handlers)
   liquifySizeRef: React.MutableRefObject<number>;
   liquifyStrengthRef: React.MutableRefObject<number>;
+  liquifyHardnessRef: React.MutableRefObject<number>;
+  liquifyStretchRef: React.MutableRefObject<number>;
   liquifyScopeRef: React.MutableRefObject<"active" | "all-visible">;
+
+  // Legacy refs retained so usePaintingCanvasEvents destructuring still works
   liquifyBeforeSnapshotRef: React.MutableRefObject<ImageData | null>;
   liquifyMultiBeforeSnapshotsRef: React.MutableRefObject<
     Map<string, ImageData>
   >;
-  liquifyHoldIntervalRef: React.MutableRefObject<ReturnType<
-    typeof setInterval
-  > | null>;
 }
 
 export function useLiquifySystem(): LiquifySystemReturn {
   const [liquifySize, setLiquifySize] = useState(80);
   const [liquifyStrength, setLiquifyStrength] = useState(1.0);
+  const [liquifyHardness, setLiquifyHardness] = useState(0);
+  const [liquifyStretch, setLiquifyStretch] = useState(1.0);
   const [liquifyScope, setLiquifyScope] = useState<"active" | "all-visible">(
     "active",
   );
 
   const liquifySizeRef = useRef(80);
   const liquifyStrengthRef = useRef(1.0);
+  const liquifyHardnessRef = useRef(0);
+  const liquifyStretchRef = useRef(1.0);
   const liquifyScopeRef = useRef<"active" | "all-visible">("active");
+
+  // Legacy refs — kept so the destructuring in usePaintingCanvasEvents compiles
   const liquifyBeforeSnapshotRef = useRef<ImageData | null>(null);
-  /** Multi-layer liquify: per-layer before-snapshots for undo. */
   const liquifyMultiBeforeSnapshotsRef = useRef<Map<string, ImageData>>(
     new Map(),
   );
-  const liquifyHoldIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
-    null,
-  );
 
-  // Keep refs in sync with state
   useEffect(() => {
     liquifySizeRef.current = liquifySize;
   }, [liquifySize]);
@@ -394,21 +214,32 @@ export function useLiquifySystem(): LiquifySystemReturn {
     liquifyStrengthRef.current = liquifyStrength;
   }, [liquifyStrength]);
   useEffect(() => {
+    liquifyHardnessRef.current = liquifyHardness;
+  }, [liquifyHardness]);
+  useEffect(() => {
+    liquifyStretchRef.current = liquifyStretch;
+  }, [liquifyStretch]);
+  useEffect(() => {
     liquifyScopeRef.current = liquifyScope;
   }, [liquifyScope]);
 
   return {
     liquifySize,
     liquifyStrength,
+    liquifyHardness,
+    liquifyStretch,
     liquifyScope,
     setLiquifySize,
     setLiquifyStrength,
+    setLiquifyHardness,
+    setLiquifyStretch,
     setLiquifyScope,
     liquifySizeRef,
     liquifyStrengthRef,
+    liquifyHardnessRef,
+    liquifyStretchRef,
     liquifyScopeRef,
     liquifyBeforeSnapshotRef,
     liquifyMultiBeforeSnapshotsRef,
-    liquifyHoldIntervalRef,
   };
 }

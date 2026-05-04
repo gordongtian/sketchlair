@@ -11,9 +11,11 @@ interface LassoPresetsPanelProps {
   wandTolerance?: number;
   wandContiguous?: boolean;
   wandGrowShrink?: number;
+  wandEdgeExpand?: number;
   onWandToleranceChange?: (v: number) => void;
   onWandContiguousChange?: (v: boolean) => void;
   onWandGrowShrinkChange?: (v: number) => void;
+  onWandEdgeExpandChange?: (v: number) => void;
 }
 
 const LASSO_TOOLS: { mode: LassoMode; label: string; icon: React.ReactNode }[] =
@@ -60,9 +62,11 @@ export function LassoPresetsPanel({
   wandTolerance = 32,
   wandContiguous = true,
   wandGrowShrink = 0,
+  wandEdgeExpand = 1,
   onWandToleranceChange,
   onWandContiguousChange,
   onWandGrowShrinkChange,
+  onWandEdgeExpandChange,
 }: LassoPresetsPanelProps) {
   return (
     <div
@@ -154,6 +158,44 @@ export function LassoPresetsPanel({
                   }
                   className="w-full"
                   data-ocid="lasso_presets.wand_tolerance_slider.input"
+                />
+              </div>
+
+              {/* Edge Expand */}
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-muted-foreground font-medium">
+                    Edge Expand
+                  </span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={5}
+                    value={wandEdgeExpand}
+                    onChange={(e) =>
+                      onWandEdgeExpandChange?.(
+                        Math.max(0, Math.min(5, Number(e.target.value))),
+                      )
+                    }
+                    className="w-12 text-[11px] text-right bg-muted border border-border rounded px-1 py-0.5"
+                    data-ocid="lasso_presets.wand_edge_expand.input"
+                  />
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={5}
+                  value={wandEdgeExpand}
+                  onChange={(e) =>
+                    onWandEdgeExpandChange?.(Number(e.target.value))
+                  }
+                  style={
+                    {
+                      "--fill-pct": `${(wandEdgeExpand / 5) * 100}%`,
+                    } as React.CSSProperties
+                  }
+                  className="w-full"
+                  data-ocid="lasso_presets.wand_edge_expand_slider.input"
                 />
               </div>
 

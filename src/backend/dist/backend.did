@@ -26,6 +26,11 @@ type UserPreferences =
    schemaVersion: nat;
    settings: AppSettings;
  };
+type SubscriptionStatus = 
+ record {
+   active: bool;
+   expiryDateMs: opt nat64;
+ };
 type SettingsSave = text;
 type PublicImageSet = 
  record {
@@ -38,14 +43,18 @@ type PublicImageSet =
  };
 type ImageSet = 
  record {
+   contentType: ContentType;
+   description: text;
    id: text;
    imageCount: nat;
    images: vec ImageReference;
    isDefault: bool;
    isFree: bool;
+   isSubscriberContent: bool;
    name: text;
    previewThumbnail: text;
    priceICP: opt text;
+   priceUsdCents: opt nat;
    tags: vec text;
  };
 type ImageReference = 
@@ -59,6 +68,23 @@ type HotkeyAssignments =
  record {
    assignments: text;
    modifiedAt: int;
+ };
+type ContentType = 
+ variant {
+   learningmodule;
+   referencepack;
+ };
+type CatalogItem = 
+ record {
+   contentType: ContentType;
+   description: text;
+   id: text;
+   imageCount: nat;
+   isFree: bool;
+   isSubscriberContent: bool;
+   name: text;
+   previewThumbnail: text;
+   priceUsdCents: opt nat;
  };
 type CanvasSave = text;
 type BrushPreset = 
@@ -110,6 +136,14 @@ service : {
   /// Cannot delete default sets (isDefault == true).
   /// Returns false if caller is not admin, setId doesn't exist, or set is a default.
   deleteImageSet: (setId: text) -> (bool);
+  /// Admin only — remove an animation from the mascot registry.
+  /// If the deleted animation was the default idle, clears defaultIdleAnimationName.
+  /// Returns true on success, false if caller is not admin or name not found.
+  deleteMascotAnimation: (name: text) -> (bool);
+  /// Admin only — remove an expression from the mascot registry.
+  /// If the deleted expression was the default, clears defaultExpressionName.
+  /// Returns true on success, false if caller is not admin or name not found.
+  deleteMascotExpression: (name: text) -> (bool);
   /// Admin only — get all image sets including paid ones, for admin management UI.
   /// Returns an empty array if caller is not admin.
   /// Uses an update call (not query) so it can run ensureStarterSetsCleared()
@@ -120,15 +154,44 @@ service : {
   /// packs they do not yet own. Diff against getAvailableImageSets() for owned state.
   getAllPublicImageSets: () -> (vec PublicImageSet) query;
   /// Public query — returns all free sets plus sets the caller has purchased entitlements for.
+  /// Also includes subscriber-tagged sets if the caller has an active subscription.
   getAvailableImageSets: () -> (vec ImageSet) query;
   getBrushPresets: () -> (opt text) query;
   getCallerUserProfile: () -> (opt UserProfile) query;
   getCallerUserRole: () -> (UserRole) query;
   getCanvasHash: () -> (opt CanvasSave) query;
+  getFullCatalog: () ->
+   (record {
+      modules: vec CatalogItem;
+      packs: vec CatalogItem;
+    }) query;
+  /// Public query — returns the in-app guide script, or null if not yet set.
+  /// Equivalent to getModuleScript("guide").
+  getGuideScript: () -> (opt text) query;
+  /// Public query — returns all mascot registry data: expressions, animations, and defaults.
+  /// Returns empty arrays and null defaults if nothing has been uploaded yet.
+  getMascotAssets: () ->
+   (record {
+      animations: vec record {
+                        text;
+                        text;
+                      };
+      defaultExpressionName: opt text;
+      defaultIdleAnimationName: opt text;
+      expressions: vec record {
+                         text;
+                         text;
+                       };
+    }) query;
+  /// Public query — returns the script text for a module, or null if not stored.
+  getModuleScript: (moduleId: text) -> (opt text) query;
   /// Returns the username for the caller's principal, or null if none registered.
   getMyUsername: () -> (opt text) query;
   getPreferences: () -> (opt UserPreferences);
   getSchemaVersion: () -> (nat) query;
+  /// Adds a new admin. Only an existing admin may call this.
+  /// Returns false if the caller is not an admin.
+  getSubscriptionStatus: () -> (SubscriptionStatus) query;
   /// Returns the set IDs the caller has been explicitly granted.
   getUserEntitlements: () -> (vec text) query;
   /// Returns all default image sets plus any sets the caller has been granted.
@@ -146,10 +209,13 @@ service : {
   /// if no payments canister principal has been configured, or if the
   /// pack does not exist in the image set registry.
   grantPackEntitlement: (userPrincipal: principal, packId: text) -> (bool);
+  grantSubscription: (userPrincipal: principal, stripeSubId: text,
+   expiryDateMs: nat64) -> (bool);
   /// Returns true if the given principal is in the admin set.
   /// Safe as a query because isAdminPrincipal() never mutates state.
   isAdmin: (p: principal) -> (bool) query;
   isCallerAdmin: () -> (bool) query;
+  isEntitledTo: (userPrincipal: principal, packId: text) -> (bool) query;
   /// Registers a username for the caller's principal.
   /// Returns true on success, false if the caller already has a username
   /// or if the username is already taken (race condition guard).
@@ -167,12 +233,30 @@ service : {
   renameSet: (setId: text, newName: text) -> (bool);
   /// Admin: revoke a set from a principal. Returns false if the set does not exist.
   revokeEntitlement: ("principal": principal, setId: text) -> (bool);
+  revokeSubscription: (userPrincipal: principal) -> (bool);
   saveBrush: (brush: BrushPreset) -> ();
   saveBrushPresets: (data: text) -> ();
   saveCallerUserProfile: (profile: UserProfile) -> ();
   saveCanvasHash: (canvasHash: CanvasSave) -> ();
+  /// Admin only — save or overwrite the in-app guide dialogue script.
+  /// Equivalent to saveModuleScript("guide", scriptText).
+  /// Returns true on success, false if caller is not admin.
+  saveGuideScript: (scriptText: text) -> (bool);
+  /// Admin only — save or overwrite the dialogue script for a module.
+  /// Module IDs are simple strings like "figure-drawing" or "still-life".
+  /// Use moduleId = "guide" to set the in-app guide script.
+  /// Returns true on success, false if caller is not admin.
+  saveModuleScript: (moduleId: text, scriptText: text) -> (bool);
   savePreferences: (prefs: UserPreferences) -> ();
   saveUserSettings: (settings: SettingsSave) -> ();
+  setContentType: (setId: text, contentType: ContentType) -> (bool);
+  /// Admin only — set the default expression name.
+  /// Returns false if no expression with that name exists or caller is not admin.
+  setDefaultExpression: (name: text) -> (bool);
+  /// Admin only — set the default idle animation name.
+  /// Returns false if no animation with that name exists or caller is not admin.
+  setDefaultIdleAnimation: (name: text) -> (bool);
+  setDescription: (setId: text, description: text) -> (bool);
   /// Admin only — mark a set as the sole default set.
   /// Unsets isDefault on all other sets. Returns false if caller is not admin
   /// or the setId does not exist.
@@ -185,8 +269,20 @@ service : {
   /// grantPackEntitlement will only accept calls from this principal.
   /// Returns false if the caller is not an admin.
   setPaymentsCanisterPrincipal: (p: principal) -> (bool);
+  setPriceUsdCents: (setId: text, priceUsdCents: opt nat) -> (bool);
+  setSubscriberContent: (setId: text, isSubscriberContent: bool) -> (bool);
   /// Admin only — update the tags for an image set.
   /// All tags are normalized to lowercase before storing.
   /// Returns false if caller is not admin or setId doesn't exist.
   updateSetTags: (setId: text, tags: vec text) -> (bool);
+  updateSubscriptionExpiry: (userPrincipal: principal, newExpiryMs: nat64) ->
+   (bool);
+  /// Admin only — add or replace an animation (Lottie JSON) in the mascot registry.
+  /// If an animation with the same name already exists, its blobUrl is replaced.
+  /// Returns true on success, false if caller is not admin.
+  uploadMascotAnimation: (name: text, blobUrl: text) -> (bool);
+  /// Admin only — add or replace an expression (PNG) in the mascot registry.
+  /// If an expression with the same name already exists, its blobUrl is replaced.
+  /// Returns true on success, false if caller is not admin.
+  uploadMascotExpression: (name: text, blobUrl: text) -> (bool);
 }

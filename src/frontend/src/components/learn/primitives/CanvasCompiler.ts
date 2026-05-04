@@ -125,10 +125,15 @@ export async function compileCollage(
   const collage = ctx.getImageData(0, 0, totalW, totalH);
 
   const blob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((b) => {
-      if (b) resolve(b);
-      else reject(new Error("CanvasCompiler: toBlob returned null"));
-    }, "image/png");
+    // FIX 6: snap collage as JPEG (was PNG) — matches SessionEndScreen download format
+    canvas.toBlob(
+      (b) => {
+        if (b) resolve(b);
+        else reject(new Error("CanvasCompiler: toBlob returned null"));
+      },
+      "image/jpeg",
+      0.92,
+    );
   });
 
   return { collage, blob };

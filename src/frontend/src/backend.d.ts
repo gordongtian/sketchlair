@@ -49,19 +49,42 @@ export interface BrushPreset {
     settings: string;
     isDefault: boolean;
 }
+export interface CatalogItem {
+    id: string;
+    contentType: ContentType;
+    name: string;
+    imageCount: bigint;
+    description: string;
+    isFree: boolean;
+    previewThumbnail: string;
+    isSubscriberContent: boolean;
+    priceUsdCents?: bigint;
+}
+export interface SubscriptionStatus {
+    active: boolean;
+    expiryDateMs?: bigint;
+}
 export interface UserProfile {
     name: string;
 }
 export interface ImageSet {
     id: string;
+    contentType: ContentType;
     name: string;
     tags: Array<string>;
     imageCount: bigint;
+    description: string;
     isFree: boolean;
     previewThumbnail: string;
     isDefault: boolean;
+    isSubscriberContent: boolean;
+    priceUsdCents?: bigint;
     priceICP?: string;
     images: Array<ImageReference>;
+}
+export enum ContentType {
+    learningmodule = "learningmodule",
+    referencepack = "referencepack"
 }
 export enum UserRole {
     admin = "admin",
@@ -100,6 +123,18 @@ export interface backendInterface {
      */
     deleteImageSet(setId: string): Promise<boolean>;
     /**
+     * / Admin only — remove an animation from the mascot registry.
+     * / If the deleted animation was the default idle, clears defaultIdleAnimationName.
+     * / Returns true on success, false if caller is not admin or name not found.
+     */
+    deleteMascotAnimation(name: string): Promise<boolean>;
+    /**
+     * / Admin only — remove an expression from the mascot registry.
+     * / If the deleted expression was the default, clears defaultExpressionName.
+     * / Returns true on success, false if caller is not admin or name not found.
+     */
+    deleteMascotExpression(name: string): Promise<boolean>;
+    /**
      * / Admin only — get all image sets including paid ones, for admin management UI.
      * / Returns an empty array if caller is not admin.
      * / Uses an update call (not query) so it can run ensureStarterSetsCleared()
@@ -114,18 +149,47 @@ export interface backendInterface {
     getAllPublicImageSets(): Promise<Array<PublicImageSet>>;
     /**
      * / Public query — returns all free sets plus sets the caller has purchased entitlements for.
+     * / Also includes subscriber-tagged sets if the caller has an active subscription.
      */
     getAvailableImageSets(): Promise<Array<ImageSet>>;
     getBrushPresets(): Promise<string | null>;
     getCallerUserProfile(): Promise<UserProfile | null>;
     getCallerUserRole(): Promise<UserRole>;
     getCanvasHash(): Promise<CanvasSave | null>;
+    getFullCatalog(): Promise<{
+        packs: Array<CatalogItem>;
+        modules: Array<CatalogItem>;
+    }>;
+    /**
+     * / Public query — returns the in-app guide script, or null if not yet set.
+     * / Equivalent to getModuleScript("guide").
+     */
+    getGuideScript(): Promise<string | null>;
+    /**
+     * / Public query — returns all mascot registry data: expressions, animations, and defaults.
+     * / Returns empty arrays and null defaults if nothing has been uploaded yet.
+     */
+    getMascotAssets(): Promise<{
+        defaultIdleAnimationName?: string;
+        animations: Array<[string, string]>;
+        expressions: Array<[string, string]>;
+        defaultExpressionName?: string;
+    }>;
+    /**
+     * / Public query — returns the script text for a module, or null if not stored.
+     */
+    getModuleScript(moduleId: string): Promise<string | null>;
     /**
      * / Returns the username for the caller's principal, or null if none registered.
      */
     getMyUsername(): Promise<string | null>;
     getPreferences(): Promise<UserPreferences | null>;
     getSchemaVersion(): Promise<bigint>;
+    /**
+     * / Adds a new admin. Only an existing admin may call this.
+     * / Returns false if the caller is not an admin.
+     */
+    getSubscriptionStatus(): Promise<SubscriptionStatus>;
     /**
      * / Returns the set IDs the caller has been explicitly granted.
      */
@@ -153,12 +217,14 @@ export interface backendInterface {
      * / pack does not exist in the image set registry.
      */
     grantPackEntitlement(userPrincipal: Principal, packId: string): Promise<boolean>;
+    grantSubscription(userPrincipal: Principal, stripeSubId: string, expiryDateMs: bigint): Promise<boolean>;
     /**
      * / Returns true if the given principal is in the admin set.
      * / Safe as a query because isAdminPrincipal() never mutates state.
      */
     isAdmin(p: Principal): Promise<boolean>;
     isCallerAdmin(): Promise<boolean>;
+    isEntitledTo(userPrincipal: Principal, packId: string): Promise<boolean>;
     /**
      * / Registers a username for the caller's principal.
      * / Returns true on success, false if the caller already has a username
@@ -186,12 +252,38 @@ export interface backendInterface {
      * / Admin: revoke a set from a principal. Returns false if the set does not exist.
      */
     revokeEntitlement(principal: Principal, setId: string): Promise<boolean>;
+    revokeSubscription(userPrincipal: Principal): Promise<boolean>;
     saveBrush(brush: BrushPreset): Promise<void>;
     saveBrushPresets(data: string): Promise<void>;
     saveCallerUserProfile(profile: UserProfile): Promise<void>;
     saveCanvasHash(canvasHash: CanvasSave): Promise<void>;
+    /**
+     * / Admin only — save or overwrite the in-app guide dialogue script.
+     * / Equivalent to saveModuleScript("guide", scriptText).
+     * / Returns true on success, false if caller is not admin.
+     */
+    saveGuideScript(scriptText: string): Promise<boolean>;
+    /**
+     * / Admin only — save or overwrite the dialogue script for a module.
+     * / Module IDs are simple strings like "figure-drawing" or "still-life".
+     * / Use moduleId = "guide" to set the in-app guide script.
+     * / Returns true on success, false if caller is not admin.
+     */
+    saveModuleScript(moduleId: string, scriptText: string): Promise<boolean>;
     savePreferences(prefs: UserPreferences): Promise<void>;
     saveUserSettings(settings: SettingsSave): Promise<void>;
+    setContentType(setId: string, contentType: ContentType): Promise<boolean>;
+    /**
+     * / Admin only — set the default expression name.
+     * / Returns false if no expression with that name exists or caller is not admin.
+     */
+    setDefaultExpression(name: string): Promise<boolean>;
+    /**
+     * / Admin only — set the default idle animation name.
+     * / Returns false if no animation with that name exists or caller is not admin.
+     */
+    setDefaultIdleAnimation(name: string): Promise<boolean>;
+    setDescription(setId: string, description: string): Promise<boolean>;
     /**
      * / Admin only — mark a set as the sole default set.
      * / Unsets isDefault on all other sets. Returns false if caller is not admin
@@ -210,10 +302,25 @@ export interface backendInterface {
      * / Returns false if the caller is not an admin.
      */
     setPaymentsCanisterPrincipal(p: Principal): Promise<boolean>;
+    setPriceUsdCents(setId: string, priceUsdCents: bigint | null): Promise<boolean>;
+    setSubscriberContent(setId: string, isSubscriberContent: boolean): Promise<boolean>;
     /**
      * / Admin only — update the tags for an image set.
      * / All tags are normalized to lowercase before storing.
      * / Returns false if caller is not admin or setId doesn't exist.
      */
     updateSetTags(setId: string, tags: Array<string>): Promise<boolean>;
+    updateSubscriptionExpiry(userPrincipal: Principal, newExpiryMs: bigint): Promise<boolean>;
+    /**
+     * / Admin only — add or replace an animation (Lottie JSON) in the mascot registry.
+     * / If an animation with the same name already exists, its blobUrl is replaced.
+     * / Returns true on success, false if caller is not admin.
+     */
+    uploadMascotAnimation(name: string, blobUrl: string): Promise<boolean>;
+    /**
+     * / Admin only — add or replace an expression (PNG) in the mascot registry.
+     * / If an expression with the same name already exists, its blobUrl is replaced.
+     * / Returns true on success, false if caller is not admin.
+     */
+    uploadMascotExpression(name: string, blobUrl: string): Promise<boolean>;
 }

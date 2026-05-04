@@ -9,6 +9,12 @@ import Text "mo:core/Text";
 import MixinAuthorization "mo:caffeineai-authorization/MixinAuthorization";
 import MixinObjectStorage "mo:caffeineai-object-storage/Mixin";
 import AccessControl "mo:caffeineai-authorization/access-control";
+import Int "mo:core/Int";
+import Nat64 "mo:core/Nat64";
+import MarketplaceTypes "./types/marketplace";
+import MarketplaceMixin "./mixins/marketplace-api";
+
+
 
 
 
@@ -23,9 +29,9 @@ actor {
   // upgrade compatibility checker does not reject the upgrade with M0169.
   // They hold no data of interest and will never be written to again.
   // ─────────────────────────────────────────────────────────────────────────
-  stable var ADMIN_PRINCIPAL_GEN : Text = "";
-  stable var ADMIN_PRINCIPAL_DRAFT : Text = "";
-  stable var adminSeedApplied : Bool = false;
+  var ADMIN_PRINCIPAL_GEN : Text = "l4bkr-kc7sl-rwtfp-35m3x-tehtd-ncdll-3lkn3-6im7y-uabuj-wci4d-tae";
+  var ADMIN_PRINCIPAL_DRAFT : Text = "4oonm-seqtd-whea7-bwcol-elxvd-dlik6-lha53-v6irf-oq6ao-ygjes-eqe";
+  var adminSeedApplied : Bool = false;
 
   // ─────────────────────────────────────────────────────────────────────────
   // Admin Principal Registry
@@ -331,6 +337,11 @@ actor {
     images : [ImageReference];
     priceICP : ?Text;   // null for free sets; "0.5" = 0.5 ICP for paid sets
     tags : [Text];
+    // Marketplace additions
+    contentType         : MarketplaceTypes.ContentType;
+    isSubscriberContent : Bool;
+    description         : Text;
+    priceUsdCents       : ?Nat;
   };
 
   // Counter for generating unique IDs for user-created image sets
@@ -347,11 +358,16 @@ actor {
       images = [];
       priceICP = null;
       tags = [];
+      contentType         = #referencepack;
+      isSubscriberContent = false;
+      description         = "";
+      priceUsdCents       = null;
     }
   };
 
   let imageSetRegistry = Map.empty<Text, ImageSet>();
   let entitlementsMap = Map.empty<Principal, [Text]>();
+  let userSubscriptions = Map.empty<Principal, MarketplaceTypes.Subscription>();
 
   // Seed default sets only when the registry is empty (first canister start)
   do {
@@ -381,6 +397,10 @@ actor {
               previewThumbnail = "";
               priceICP = null;
               tags = [];
+              contentType         = #referencepack;
+              isSubscriberContent = false;
+              description         = "";
+              priceUsdCents       = null;
             };
             imageSetRegistry.add(setId, cleared);
           };
@@ -439,13 +459,22 @@ actor {
   };
 
   /// Public query — returns all free sets plus sets the caller has purchased entitlements for.
+  /// Also includes subscriber-tagged sets if the caller has an active subscription.
   public query ({ caller }) func getAvailableImageSets() : async [ImageSet] {
     let entitlements : [Text] = switch (entitlementsMap.get(caller)) {
       case (?ids) ids;
       case null [];
     };
+    // Check if caller has an active subscription
+    let nowMs : Nat64 = Nat64.fromNat(Int.abs(Time.now() / 1_000_000));
+    let hasActiveSub : Bool = switch (userSubscriptions.get(caller)) {
+      case null false;
+      case (?sub) sub.expiryDateMs > nowMs;
+    };
     imageSetRegistry.foldLeft([], func(acc : [ImageSet], _id : Text, s : ImageSet) : [ImageSet] {
       if (s.isFree) {
+        acc.concat([s])
+      } else if (s.isSubscriberContent and hasActiveSub) {
         acc.concat([s])
       } else {
         let hasEntitlement = entitlements.find(func(eid : Text) : Bool { eid == s.id }) != null;
@@ -543,6 +572,10 @@ actor {
       images = [];
       priceICP = resolvedPrice;
       tags = [];
+      contentType         = #referencepack;
+      isSubscriberContent = false;
+      description         = "";
+      priceUsdCents       = null;
     };
     imageSetRegistry.add(newId, newSet);
     ?newId
@@ -809,6 +842,209 @@ actor {
     }
   };
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Mascot Registry — expressions and animations for the dialogue system
+  // Expressions: uploaded PNG files stored as (name, blobUrl) pairs
+  // Animations: uploaded Lottie JSON files stored as (name, blobUrl) pairs
+  // defaultExpressionName: the expression shown when none is declared in a script
+  // defaultIdleAnimationName: the animation playing when no emote is active
+  // Enhanced orthogonal persistence: state survives upgrades automatically.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // Mascot expressions: name → blobUrl
+  let mascotExpressions = Map.empty<Text, Text>();
+  // Mascot animations: name → blobUrl
+  let mascotAnimations = Map.empty<Text, Text>();
+  // Default expression name (null if none set)
+  var mascotDefaultExpressionName : ?Text = null;
+  // Default idle animation name (null if none set)
+  var mascotDefaultIdleAnimationName : ?Text = null;
+
+  /// Admin only — add or replace an expression (PNG) in the mascot registry.
+  /// If an expression with the same name already exists, its blobUrl is replaced.
+  /// Returns true on success, false if caller is not admin.
+  public shared ({ caller }) func uploadMascotExpression(name : Text, blobUrl : Text) : async Bool {
+    if (not isAdminPrincipal(caller)) {
+      return false;
+    };
+    mascotExpressions.add(name, blobUrl);
+    true
+  };
+
+  /// Admin only — remove an expression from the mascot registry.
+  /// If the deleted expression was the default, clears defaultExpressionName.
+  /// Returns true on success, false if caller is not admin or name not found.
+  public shared ({ caller }) func deleteMascotExpression(name : Text) : async Bool {
+    if (not isAdminPrincipal(caller)) {
+      return false;
+    };
+    if (mascotExpressions.get(name) == null) {
+      return false;
+    };
+    mascotExpressions.remove(name);
+    switch (mascotDefaultExpressionName) {
+      case (?defaultName) {
+        if (defaultName == name) {
+          mascotDefaultExpressionName := null;
+        };
+      };
+      case null {};
+    };
+    true
+  };
+
+  /// Admin only — set the default expression name.
+  /// Returns false if no expression with that name exists or caller is not admin.
+  public shared ({ caller }) func setDefaultExpression(name : Text) : async Bool {
+    if (not isAdminPrincipal(caller)) {
+      return false;
+    };
+    if (mascotExpressions.get(name) == null) {
+      return false;
+    };
+    mascotDefaultExpressionName := ?name;
+    true
+  };
+
+  /// Admin only — add or replace an animation (Lottie JSON) in the mascot registry.
+  /// If an animation with the same name already exists, its blobUrl is replaced.
+  /// Returns true on success, false if caller is not admin.
+  public shared ({ caller }) func uploadMascotAnimation(name : Text, blobUrl : Text) : async Bool {
+    if (not isAdminPrincipal(caller)) {
+      return false;
+    };
+    mascotAnimations.add(name, blobUrl);
+    true
+  };
+
+  /// Admin only — remove an animation from the mascot registry.
+  /// If the deleted animation was the default idle, clears defaultIdleAnimationName.
+  /// Returns true on success, false if caller is not admin or name not found.
+  public shared ({ caller }) func deleteMascotAnimation(name : Text) : async Bool {
+    if (not isAdminPrincipal(caller)) {
+      return false;
+    };
+    if (mascotAnimations.get(name) == null) {
+      return false;
+    };
+    mascotAnimations.remove(name);
+    switch (mascotDefaultIdleAnimationName) {
+      case (?defaultName) {
+        if (defaultName == name) {
+          mascotDefaultIdleAnimationName := null;
+        };
+      };
+      case null {};
+    };
+    true
+  };
+
+  /// Admin only — set the default idle animation name.
+  /// Returns false if no animation with that name exists or caller is not admin.
+  public shared ({ caller }) func setDefaultIdleAnimation(name : Text) : async Bool {
+    if (not isAdminPrincipal(caller)) {
+      return false;
+    };
+    if (mascotAnimations.get(name) == null) {
+      return false;
+    };
+    mascotDefaultIdleAnimationName := ?name;
+    true
+  };
+
+  /// Public query — returns all mascot registry data: expressions, animations, and defaults.
+  /// Returns empty arrays and null defaults if nothing has been uploaded yet.
+  public query func getMascotAssets() : async {
+    expressions : [(Text, Text)];
+    animations : [(Text, Text)];
+    defaultExpressionName : ?Text;
+    defaultIdleAnimationName : ?Text;
+  } {
+    {
+      expressions = mascotExpressions.toArray();
+      animations = mascotAnimations.toArray();
+      defaultExpressionName = mascotDefaultExpressionName;
+      defaultIdleAnimationName = mascotDefaultIdleAnimationName;
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Educational Module Script Storage
+  // Stores dialogue scripts per module ID (e.g. "figure-drawing", "still-life").
+  // Admin-only writes; public reads.
+  // Enhanced orthogonal persistence: state survives upgrades automatically.
+  //
+  // Reserved module IDs:
+  //   "figure-drawing" — Figure Drawing session dialogue script
+  //   "guide"          — In-app guide script (see saveGuideScript / getGuideScript)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // moduleId → scriptText
+  let moduleScripts = Map.empty<Text, Text>();
+
+  /// Admin only — save or overwrite the dialogue script for a module.
+  /// Module IDs are simple strings like "figure-drawing" or "still-life".
+  /// Use moduleId = "guide" to set the in-app guide script.
+  /// Returns true on success, false if caller is not admin.
+  public shared ({ caller }) func saveModuleScript(moduleId : Text, scriptText : Text) : async Bool {
+    if (not isAdminPrincipal(caller)) {
+      return false;
+    };
+    moduleScripts.add(moduleId, scriptText);
+    true
+  };
+
+  /// Public query — returns the script text for a module, or null if not stored.
+  public query func getModuleScript(moduleId : Text) : async ?Text {
+    moduleScripts.get(moduleId)
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // In-App Guide Script — convenience wrappers for moduleId = "guide"
+  // The guide is just a module script stored under the reserved key "guide".
+  // saveGuideScript delegates to saveModuleScript("guide", ...); getGuideScript
+  // delegates to getModuleScript("guide"). The underlying storage is shared.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// Admin only — save or overwrite the in-app guide dialogue script.
+  /// Equivalent to saveModuleScript("guide", scriptText).
+  /// Returns true on success, false if caller is not admin.
+  public shared ({ caller }) func saveGuideScript(scriptText : Text) : async Bool {
+    if (not isAdminPrincipal(caller)) {
+      return false;
+    };
+    moduleScripts.add("guide", scriptText);
+    true
+  };
+
+  /// Public query — returns the in-app guide script, or null if not yet set.
+  /// Equivalent to getModuleScript("guide").
+  public query func getGuideScript() : async ?Text {
+    moduleScripts.get("guide")
+  };
+
   // INSTANT COMPONENT BLOB STORAGE
   include MixinObjectStorage();
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Marketplace — subscription management and catalog
+  // imageSetRegistry is shared with the marketplace mixin for content metadata
+  // updates (contentType, isSubscriberContent, description, priceUsdCents).
+  // isPaymentsCaller checks the stored payments canister principal.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  func isPaymentsCaller(p : Principal) : Bool {
+    switch (paymentsCanisterPrincipal) {
+      case null false;
+      case (?trusted) Principal.equal(p, trusted);
+    }
+  };
+
+  include MarketplaceMixin(
+    userSubscriptions,
+    entitlementsMap,
+    imageSetRegistry,
+    isAdminPrincipal,
+    isPaymentsCaller,
+  );
 };

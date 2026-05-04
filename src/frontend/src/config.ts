@@ -31,6 +31,10 @@ interface Config {
 
 let configCache: Config | null = null;
 
+export function clearConfigCache(): void {
+  configCache = null;
+}
+
 export async function loadConfig(): Promise<Config> {
   if (configCache) {
     return configCache;
@@ -46,12 +50,37 @@ export async function loadConfig(): Promise<Config> {
       throw new Error("CANISTER_ID_BACKEND is not set");
     }
 
-    const paymentsCanisterId = process.env.CANISTER_ID_PAYMENTS;
-    const resolvedPaymentsCanisterId = (
-      config.payments_canister_id !== "undefined"
-        ? config.payments_canister_id
-        : (paymentsCanisterId ?? "")
-    ) as string;
+    // Resolve payments canister ID from multiple sources in priority order:
+    //   1. env.json (runtime-fetched) — skip if empty, "undefined", "null", or shell placeholder
+    //   2. process.env.PAYMENTS_CANISTER_ID — Caffeine platform env var (most likely name)
+    //   3. process.env.CANISTER_ID_PAYMENTS — alternative Vite build-time injection
+    //   4. import.meta.env.PAYMENTS_CANISTER_ID — Vite env var (PAYMENTS_CANISTER_ID)
+    //   5. import.meta.env.CANISTER_ID_PAYMENTS — Vite env var alternative
+    // The env.json placeholder ships as "" (empty) — never trust the literal strings
+    // "undefined", "null", or "$…" (un-expanded shell variable) from any source.
+    function resolveCanisterId(value: string | undefined): string | null {
+      if (!value || value === "undefined" || value === "null") return null;
+      // Reject un-expanded shell variable placeholders like "$CANISTER_ID_PAYMENTS"
+      if (value.startsWith("$")) return null;
+      return value;
+    }
+    const resolvedPaymentsCanisterId =
+      resolveCanisterId(config.payments_canister_id) ??
+      resolveCanisterId(process.env.PAYMENTS_CANISTER_ID) ??
+      resolveCanisterId(process.env.CANISTER_ID_PAYMENTS) ??
+      resolveCanisterId(
+        (import.meta.env as Record<string, string>).PAYMENTS_CANISTER_ID,
+      ) ??
+      resolveCanisterId(
+        (import.meta.env as Record<string, string>).CANISTER_ID_PAYMENTS,
+      ) ??
+      "";
+    if (!resolvedPaymentsCanisterId) {
+      console.warn(
+        "[Config] payments_canister_id is not set — payments features will be unavailable. " +
+          "Deploy the payments canister and ensure CANISTER_ID_PAYMENTS is set in env.json or build environment.",
+      );
+    }
 
     const fullConfig = {
       backend_host:
@@ -159,7 +188,7 @@ export async function createActorWithConfig(
     processError,
   };
 
-  agent.getPrincipal().then(p => console.log('[ActorIdentity] constructed actor principal:', p.toString())).catch(() => {});
+
 
   const storageClient = new StorageClient(
     config.bucket_name,

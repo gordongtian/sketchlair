@@ -8,7 +8,8 @@ export interface FillSettings {
   tolerance: number;
   gradientMode: GradientMode;
   contiguous: boolean;
-  gapClosing: number;
+  /** Phase 2 destination-over expansion for anti-aliased edge fill. Default: true */
+  featherEdges: boolean;
 }
 
 interface FillPresetsPanelProps {
@@ -167,16 +168,6 @@ export function FillPresetsPanel({
                     onSettingsChange({ ...fillSettings, tolerance: v })
                   }
                 />
-                <SliderRow
-                  label={`Gap Closing: ${fillSettings.gapClosing}`}
-                  value={fillSettings.gapClosing}
-                  min={0}
-                  max={30}
-                  ocid="fill_presets.gap_closing.input"
-                  onChange={(v) =>
-                    onSettingsChange({ ...fillSettings, gapClosing: v })
-                  }
-                />
                 <div className="flex items-center justify-between">
                   <span className="text-[11px] text-muted-foreground font-medium">
                     Contiguous
@@ -186,6 +177,18 @@ export function FillPresetsPanel({
                     ocid="fill_presets.contiguous.toggle"
                     onChange={(v) =>
                       onSettingsChange({ ...fillSettings, contiguous: v })
+                    }
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-muted-foreground font-medium">
+                    Feather edges
+                  </span>
+                  <Toggle
+                    checked={fillSettings.featherEdges ?? true}
+                    ocid="fill_presets.feather_edges.toggle"
+                    onChange={(v) =>
+                      onSettingsChange({ ...fillSettings, featherEdges: v })
                     }
                   />
                 </div>

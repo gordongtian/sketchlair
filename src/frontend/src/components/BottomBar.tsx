@@ -17,10 +17,12 @@ import {
   Download,
   FileImage,
   Loader2,
+  Lock,
   Redo2,
   Save,
   Trash2,
   Undo2,
+  Unlock,
 } from "lucide-react";
 import React, { useState } from "react";
 import { toast } from "sonner";
@@ -85,12 +87,22 @@ interface BottomBarProps {
   // Liquify
   liquifySize: number;
   liquifyStrength: number;
+  liquifyHardness: number;
+  liquifyStretch: number;
   liquifyScope: "active" | "all-visible";
   onLiquifySizeChange: (v: number) => void;
   onLiquifyStrengthChange: (v: number) => void;
+  onLiquifyHardnessChange: (v: number) => void;
+  onLiquifyStretchChange: (v: number) => void;
   onLiquifyScopeChange: (s: "active" | "all-visible") => void;
   // Mobile
   isMobile?: boolean;
+  /** True when the actual device is mobile — used for transform toggle regardless of showFOBSliders */
+  isOnMobileDevice?: boolean;
+  /** Whether proportional transform is toggled on (shown on mobile when transform tool is active) */
+  transformProportional?: boolean;
+  /** Called when the user clicks the proportional toggle */
+  onTransformProportionalToggle?: () => void;
   // Brush tip editor mode — hides save/export
   brushTipEditorActive?: boolean;
 }
@@ -243,11 +255,18 @@ export function BottomBar({
   onSetLastSingle3ptFamily,
   liquifySize,
   liquifyStrength,
+  liquifyHardness: _liquifyHardness,
+  liquifyStretch: _liquifyStretch,
   liquifyScope,
   onLiquifySizeChange,
   onLiquifyStrengthChange,
+  onLiquifyHardnessChange: _onLiquifyHardnessChange,
+  onLiquifyStretchChange: _onLiquifyStretchChange,
   onLiquifyScopeChange,
   isMobile = false,
+  isOnMobileDevice = false,
+  transformProportional = false,
+  onTransformProportionalToggle,
   brushTipEditorActive = false,
 }: BottomBarProps) {
   const [showMobileSaveMenu, setShowMobileSaveMenu] = useState(false);
@@ -260,7 +279,11 @@ export function BottomBar({
             type="button"
             data-ocid="crop.confirm_button"
             onClick={onCropConfirm}
-            className="flex items-center gap-1.5 px-3 h-7 rounded bg-green-600 text-white text-xs font-semibold hover:bg-green-500 transition-colors"
+            className="flex items-center gap-1.5 px-3 h-7 rounded text-xs font-semibold transition-colors"
+            style={{
+              backgroundColor: "oklch(var(--accent))",
+              color: "oklch(var(--accent-text))",
+            }}
           >
             ✓ Confirm
           </button>
@@ -268,7 +291,7 @@ export function BottomBar({
             type="button"
             data-ocid="crop.cancel_button"
             onClick={onCropCancel}
-            className="flex items-center gap-1.5 px-3 h-7 rounded bg-destructive text-destructive-foreground text-xs font-semibold hover:opacity-90 transition-opacity"
+            className="flex items-center gap-1.5 px-3 h-7 rounded bg-secondary text-secondary-foreground text-xs font-semibold hover:opacity-90 transition-opacity border border-border"
           >
             ✕ Cancel
           </button>
@@ -284,7 +307,11 @@ export function BottomBar({
             type="button"
             data-ocid="transform.commit_button"
             onClick={onTransformCommit}
-            className="flex items-center gap-1.5 px-3 h-7 rounded bg-green-600 text-white text-xs font-semibold hover:bg-green-500 transition-colors"
+            className="flex items-center gap-1.5 px-3 h-7 rounded text-xs font-semibold transition-colors"
+            style={{
+              backgroundColor: "oklch(var(--accent))",
+              color: "oklch(var(--accent-text))",
+            }}
           >
             ✓ Commit
           </button>
@@ -292,7 +319,7 @@ export function BottomBar({
             type="button"
             data-ocid="transform.cancel_button"
             onClick={onTransformCancel}
-            className="flex items-center gap-1.5 px-3 h-7 rounded bg-destructive text-destructive-foreground text-xs font-semibold hover:opacity-90 transition-opacity"
+            className="flex items-center gap-1.5 px-3 h-7 rounded bg-secondary text-secondary-foreground text-xs font-semibold hover:opacity-90 transition-opacity border border-border"
           >
             ✕ Cancel
           </button>
@@ -302,6 +329,53 @@ export function BottomBar({
           >
             Reset
           </BarButton>
+          {isOnMobileDevice && (
+            <button
+              type="button"
+              data-ocid="transform.proportional_toggle"
+              onClick={onTransformProportionalToggle}
+              title={
+                transformProportional
+                  ? "Proportional transform ON — Shift to free transform"
+                  : "Proportional transform OFF — Shift to constrain"
+              }
+              style={{
+                display: "flex",
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 5,
+                height: 30,
+                padding: "0 10px",
+                borderRadius: 6,
+                border: "1px solid",
+                borderColor: transformProportional
+                  ? "var(--color-primary)"
+                  : "oklch(var(--border))",
+                background: transformProportional
+                  ? "oklch(var(--accent))"
+                  : "transparent",
+                color: transformProportional
+                  ? "oklch(var(--accent-text))"
+                  : "oklch(var(--muted-foreground))",
+                cursor: "pointer",
+                transition: "all 0.15s ease",
+                outline: "none",
+                fontSize: 11,
+                fontWeight: 600,
+                letterSpacing: "0.02em",
+                textTransform: "uppercase",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {transformProportional ? (
+                <Lock size={13} strokeWidth={2} />
+              ) : (
+                <Unlock size={13} strokeWidth={2} />
+              )}
+              {transformProportional ? "Lock" : "Free"}
+            </button>
+          )}
         </div>
       );
     }
@@ -495,6 +569,15 @@ export function BottomBar({
             data-ocid="bottombar.blend_select"
             value={brushBlendMode}
             onChange={(e) => onBrushBlendModeChange(e.target.value)}
+            onBlur={() => {
+              requestAnimationFrame(() => {
+                document
+                  .querySelector<HTMLCanvasElement>(
+                    '[data-ocid="canvas.canvas_target"]',
+                  )
+                  ?.focus();
+              });
+            }}
             className="text-xs bg-muted border border-border rounded px-1 h-6 text-foreground cursor-pointer"
             style={{ maxWidth: 80 }}
           >
@@ -796,6 +879,15 @@ export function BottomBar({
             data-ocid="bottombar.blend_select"
             value={brushBlendMode}
             onChange={(e) => onBrushBlendModeChange(e.target.value)}
+            onBlur={() => {
+              requestAnimationFrame(() => {
+                document
+                  .querySelector<HTMLCanvasElement>(
+                    '[data-ocid="canvas.canvas_target"]',
+                  )
+                  ?.focus();
+              });
+            }}
             className="text-xs bg-muted border border-border rounded px-1 h-6 text-foreground cursor-pointer"
             style={{ maxWidth: 80 }}
           >
@@ -919,25 +1011,82 @@ export function BottomBar({
               <Divider />
             </>
           )}
-          {/* Strength */}
-          <span className="text-xs text-muted-foreground whitespace-nowrap">
-            Strength
-          </span>
-          <Slider
-            value={[Math.round(liquifyStrength * 100)]}
-            min={1}
-            max={100}
-            step={1}
-            onValueChange={([v]) => onLiquifyStrengthChange(v / 100)}
-            className="w-20"
-          />
-          <SyncedNumberInput
-            value={Math.round(liquifyStrength * 100)}
-            min={1}
-            max={100}
-            onChange={(v) => onLiquifyStrengthChange(v / 100)}
-            suffix="%"
-          />
+          {/* Strength — hidden on mobile when FOS sliders are active (canvas sliders handle it) */}
+          {!isMobile && (
+            <>
+              <span className="text-xs text-muted-foreground whitespace-nowrap">
+                Strength
+              </span>
+              <Slider
+                value={[Math.round(liquifyStrength * 100)]}
+                min={1}
+                max={100}
+                step={1}
+                onValueChange={([v]) => onLiquifyStrengthChange(v / 100)}
+                className="w-20"
+              />
+              <SyncedNumberInput
+                value={Math.round(liquifyStrength * 100)}
+                min={1}
+                max={100}
+                onChange={(v) => onLiquifyStrengthChange(v / 100)}
+                suffix="%"
+              />
+            </>
+          )}
+        </div>
+      );
+    }
+
+    // Transform tool — on mobile, show proportional toggle
+    if (activeTool === "transform" && isOnMobileDevice) {
+      return (
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            data-ocid="transform.proportional_toggle"
+            onClick={onTransformProportionalToggle}
+            title={
+              transformProportional
+                ? "Proportional transform ON — Shift to free transform"
+                : "Proportional transform OFF — Shift to constrain"
+            }
+            style={{
+              display: "flex",
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 5,
+              height: 30,
+              padding: "0 10px",
+              borderRadius: 6,
+              border: "1px solid",
+              borderColor: transformProportional
+                ? "var(--color-primary)"
+                : "oklch(var(--border))",
+              background: transformProportional
+                ? "oklch(var(--accent))"
+                : "transparent",
+              color: transformProportional
+                ? "oklch(var(--accent-text))"
+                : "oklch(var(--muted-foreground))",
+              cursor: "pointer",
+              transition: "all 0.15s ease",
+              outline: "none",
+              fontSize: 11,
+              fontWeight: 600,
+              letterSpacing: "0.02em",
+              textTransform: "uppercase",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {transformProportional ? (
+              <Lock size={13} strokeWidth={2} />
+            ) : (
+              <Unlock size={13} strokeWidth={2} />
+            )}
+            {transformProportional ? "Lock" : "Free"}
+          </button>
         </div>
       );
     }

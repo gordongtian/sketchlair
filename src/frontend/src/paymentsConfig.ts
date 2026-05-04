@@ -31,11 +31,30 @@ export async function createPaymentsActor(
   identity?: Identity,
 ): Promise<paymentsInterface> {
   const config = await loadConfig();
-  const paymentsCanisterId = config.payments_canister_id;
+  // Resolve payments canister ID — same multi-tier chain as config.ts.
+  // loadConfig() already handles the resolution, but we re-check here as a
+  // safety net in case env.json was fetched with stale data.
+  function resolveId(value: string | undefined): string | null {
+    if (!value || value === "undefined" || value === "null") return null;
+    // Reject un-expanded shell variable placeholders like "$CANISTER_ID_PAYMENTS"
+    if (value.startsWith("$")) return null;
+    return value;
+  }
+  const paymentsCanisterId =
+    resolveId(config.payments_canister_id) ??
+    resolveId(process.env.PAYMENTS_CANISTER_ID) ??
+    resolveId(process.env.CANISTER_ID_PAYMENTS) ??
+    resolveId(
+      (import.meta.env as Record<string, string>).PAYMENTS_CANISTER_ID,
+    ) ??
+    resolveId(
+      (import.meta.env as Record<string, string>).CANISTER_ID_PAYMENTS,
+    ) ??
+    "";
   if (!paymentsCanisterId) {
     console.warn(
       "[PaymentsActor] payments_canister_id is not configured — payments features will be unavailable. " +
-        "Ensure the payments canister is deployed and CANISTER_ID_PAYMENTS is set in env.json.",
+        "Deploy the payments canister and ensure CANISTER_ID_PAYMENTS is set in env.json or build environment.",
     );
     throw new Error("CANISTER_ID_PAYMENTS is not set");
   }

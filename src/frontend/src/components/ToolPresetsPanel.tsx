@@ -54,6 +54,8 @@ interface ToolPresetsPanelProps {
   currentOpacity?: number;
   /** Called when the user clicks "Draw New" — opens the inline workspace brush tip editor */
   onEnterBrushTipEditor?: (onAccept: (dataUrl: string) => void) => void;
+  /** Called when user selects a preset — used by mobile to bring the panel to front */
+  onInteract?: () => void;
 }
 
 const TOOL_LABELS: Record<"brush" | "smudge" | "eraser", string> = {
@@ -214,6 +216,7 @@ export function ToolPresetsPanel({
   onDeletePreset,
   onReorderPresets,
   onEnterBrushTipEditor,
+  onInteract,
 }: ToolPresetsPanelProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
@@ -586,6 +589,7 @@ export function ToolPresetsPanel({
                           setEditingId(null);
                         }
                         onActivate();
+                        onInteract?.();
                         onSelectPreset(preset);
                       }}
                     >

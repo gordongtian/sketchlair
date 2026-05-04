@@ -48,38 +48,304 @@ import {
   getEffectivelySelectedLayers,
 } from "../utils/groupUtils";
 import {
-  bfsFloodFill,
-  blurEdgesOnly,
+  MAX_PRESSURE_DELTA,
+  MEDIAN_WINDOW,
+  OneEuroFilter,
+  PRESSURE_FILTER_BETA,
+  PRESSURE_FILTER_MIN_CUTOFF,
+} from "../utils/oneEuroFilter";
+import {
   computeMaskBounds,
-  floatMaskToCanvas,
-  growShrinkMask,
-  perceptualColorDistance,
+  expandFloatMask,
+  growShrinkFloatMask,
+  magicWandFloodFill,
 } from "../utils/selectionUtils";
 import type { WebGLBrushContext } from "../utils/webglBrush";
-import { markCanvasDirty, markLayerBitmapDirty } from "./useCompositing";
+import {
+  cancelScheduledComposite,
+  forceResetCompositeSchedule,
+  markCanvasDirty,
+  markLayerBitmapDirty,
+} from "./useCompositing";
 import type { UndoEntry } from "./useLayerSystem";
 import {
-  expandLiquifyFrameDirty,
-  getLiquifySnapH,
-  getLiquifySnapW,
-  getLiquifySnapshot,
-  initLiquifyField,
-  renderLiquifyFromSnapshot,
-  renderLiquifyMultiLayer,
-  resetLiquifyFrameDirty,
-  setLiquifySnapshot,
+  LIQUIFY_MAX_DISP_SCALE,
+  getLiquifyStrokeActive,
+  liquifyFreeState,
+  liquifyIsActive,
+  liquifyPointerDown,
+  liquifyPointerUp,
+  liquifyPrevX,
+  liquifyPrevY,
+  liquifyUpdatePrev,
   setLiquifyStrokeActive,
-  updateLiquifyDisplacementField,
 } from "./useLiquifySystem";
 import {
   PRESSURE_SMOOTHING,
   type PathPoint,
   applyColorJitter,
+  clearSmearBuffers,
   clearSmudgeBuffer,
   evalPressureCurve,
+  initSmearBuffers,
   resetSmudgeInitialized,
 } from "./useStrokeEngine";
 import { getTransformCornersWorld } from "./useTransformSystem";
+
+// ─── Arrow nudge constants ────────────────────────────────────────────────────
+/** Base nudge amount in canvas pixels per arrow key press */
+export const ARROW_NUDGE_BASE_PX = 1;
+/** Multiplier applied when Shift is held with an arrow key */
+export const ARROW_NUDGE_SHIFT_MULTIPLIER = 10;
+
+// ─── Line tool angle snap constant ───────────────────────────────────────────
+/** Snap increment in degrees when Shift is held with the line tool */
+export const LINE_SNAP_DEGREES = 7.5;
+
+// ─── Dirty-rect snapshot helper ──────────────────────────────────────────────
+/**
+ * Given a full-canvas before-snapshot and a dirty rect, crops both the before
+ * snapshot and a fresh after-snapshot from the layer canvas to the dirty rect.
+ * Returns { before, after, dirtyRect } ready to push into history, or null if
+ * the dirty rect is invalid or the context is unavailable.
+ *
+ * If the dirty rect covers more than 50% of the canvas area, falls back to
+ * full-canvas snapshots (not worth the extra copy overhead).
+ *
+ * The fullBefore ImageData is nulled out (set to null via the ref) immediately
+ * after cropping — callers must not use it after this call.
+ */
+function _makeDirtyRectEntry(
+  fullBefore: ImageData,
+  lc: HTMLCanvasElement,
+  rawDr: { minX: number; minY: number; maxX: number; maxY: number } | null,
+  canvasWidth: number,
+  canvasHeight: number,
+  isIPad: boolean,
+): {
+  before: ImageData;
+  after: ImageData;
+  // dirtyRect is only present on the return object when a valid rect was computed.
+  // Omitting the key entirely (rather than setting it to undefined) avoids V8 adding
+  // a "Hole" slot in the hidden class — which would otherwise appear in heap snapshots
+  // as a property key with an uninitialized value even when the field was intentionally absent.
+  dirtyRect?: { x: number; y: number; w: number; h: number };
+} | null {
+  const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
+  if (!ctx) return null;
+
+  // Compute and validate dirty rect
+  let drEntry: { x: number; y: number; w: number; h: number } | undefined;
+  if (
+    rawDr &&
+    Number.isFinite(rawDr.minX) &&
+    Number.isFinite(rawDr.minY) &&
+    rawDr.maxX > rawDr.minX &&
+    rawDr.maxY > rawDr.minY
+  ) {
+    const pad = 2;
+    const x = Math.max(0, Math.floor(rawDr.minX) - pad);
+    const y = Math.max(0, Math.floor(rawDr.minY) - pad);
+    const x2 = Math.min(canvasWidth, Math.ceil(rawDr.maxX) + pad);
+    const y2 = Math.min(canvasHeight, Math.ceil(rawDr.maxY) + pad);
+    const w = x2 - x;
+    const h = y2 - y;
+    if (w > 0 && h > 0 && w * h < canvasWidth * canvasHeight * 0.5) {
+      drEntry = { x, y, w, h };
+    }
+  }
+
+  if (drEntry) {
+    // Take after-snapshot of only the dirty region
+    const after = ctx.getImageData(drEntry.x, drEntry.y, drEntry.w, drEntry.h);
+
+    // Crop the full-canvas before-snapshot to the same dirty region using a
+    // temporary canvas — avoids keeping the large full-canvas buffer alive
+    const tmpCanvas = document.createElement("canvas");
+    tmpCanvas.width = drEntry.w;
+    tmpCanvas.height = drEntry.h;
+    const tmpCtx = tmpCanvas.getContext("2d", { willReadFrequently: true });
+    if (!tmpCtx) {
+      // Fallback: full canvas — dirtyRect covers entire canvas so putImageData writes to (0,0)
+      const afterFull = ctx.getImageData(0, 0, lc.width, lc.height);
+      return {
+        before: fullBefore,
+        after: afterFull,
+        dirtyRect: { x: 0, y: 0, w: lc.width, h: lc.height },
+      };
+    }
+    tmpCtx.putImageData(fullBefore, -drEntry.x, -drEntry.y);
+    const croppedBefore = tmpCtx.getImageData(0, 0, drEntry.w, drEntry.h);
+    // fullBefore (the large full-canvas ImageData) is no longer referenced after
+    // this point — the caller passes ownership and must discard it. GC can reclaim it.
+
+    // dirtyRect is a fully-assigned {x,y,w,h} object — never undefined at this point
+    return { before: croppedBefore, after, dirtyRect: drEntry };
+  }
+
+  // Fallback: full-canvas after — dirtyRect covers entire canvas so putImageData writes to (0,0)
+  const after = ctx.getImageData(0, 0, lc.width, lc.height);
+  return {
+    before: fullBefore,
+    after,
+    dirtyRect: { x: 0, y: 0, w: lc.width, h: lc.height },
+  };
+}
+
+/**
+ * Overload for liquify/line tool dirty rect format: { x, y, w, h }.
+ * Delegates to _makeDirtyRectEntry after converting the format.
+ */
+function _makeDirtyRectEntryXYWH(
+  fullBefore: ImageData,
+  lc: HTMLCanvasElement,
+  dr: { x: number; y: number; w: number; h: number } | null,
+  canvasWidth: number,
+  canvasHeight: number,
+  isIPad: boolean,
+): {
+  before: ImageData;
+  after: ImageData;
+  dirtyRect?: { x: number; y: number; w: number; h: number };
+} | null {
+  if (!dr) {
+    return _makeDirtyRectEntry(
+      fullBefore,
+      lc,
+      null,
+      canvasWidth,
+      canvasHeight,
+      isIPad,
+    );
+  }
+  return _makeDirtyRectEntry(
+    fullBefore,
+    lc,
+    {
+      minX: dr.x,
+      minY: dr.y,
+      maxX: dr.x + dr.w,
+      maxY: dr.y + dr.h,
+    },
+    canvasWidth,
+    canvasHeight,
+    isIPad,
+  );
+}
+
+// ─── Multi-layer liquify warp helper ─────────────────────────────────────────
+/**
+ * Apply one backward-mapping warp stamp to a layer canvas using its own frozen
+ * snapshot as the source. Used for multi-layer liquify where each layer has an
+ * independent snapshot captured at pointer-down.
+ *
+ * Mirrors the inner loop of liquifyPointerMove but operates on an explicit
+ * snapshot rather than the module-level _liqSource.
+ */
+function _liquifyApplyWarpToLayer(
+  ctx: CanvasRenderingContext2D,
+  snapshot: ImageData,
+  cx: number,
+  cy: number,
+  prevX: number,
+  prevY: number,
+  radius: number,
+  strength: number,
+  stretch: number,
+  hardness: number,
+): void {
+  const moveDx = cx - prevX;
+  const moveDy = cy - prevY;
+  const moveLen = Math.sqrt(moveDx * moveDx + moveDy * moveDy);
+  if (moveLen < 0.5) return;
+
+  const normDx = moveDx / moveLen;
+  const normDy = moveDy / moveLen;
+  // Fix 3: fixed per-frame displacement based on radius and strength only
+  const LIQUIFY_BASE_SCALE = 0.35;
+  const LIQUIFY_MAX_DISP_SCALE = 1.5;
+  const maxDisp = Math.min(
+    radius * strength * stretch * LIQUIFY_BASE_SCALE,
+    radius * LIQUIFY_MAX_DISP_SCALE,
+  );
+
+  const W = snapshot.width;
+  const H = snapshot.height;
+  const x0 = Math.max(0, Math.floor(cx - radius));
+  const x1 = Math.min(W - 1, Math.ceil(cx + radius));
+  const y0 = Math.max(0, Math.floor(cy - radius));
+  const y1 = Math.min(H - 1, Math.ceil(cy + radius));
+
+  const src = snapshot.data;
+  // We write into a temporary output that mirrors the full canvas
+  // but we only allocate for the dirty bounding box.
+  const rw = x1 - x0 + 1;
+  const rh = y1 - y0 + 1;
+  const region = new Uint8ClampedArray(rw * rh * 4);
+
+  // Seed the region with the current canvas pixels (not the snapshot) so that
+  // pixels outside the brush radius retain the already-warped state.
+  const existingRegion = ctx.getImageData(x0, y0, rw, rh);
+  region.set(existingRegion.data);
+
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dx = x - cx;
+      const dy = y - cy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > radius) continue;
+
+      const t = dist / radius;
+      let weight: number;
+      if (t <= hardness) {
+        weight = 1.0;
+      } else {
+        const s = (t - hardness) / (1.0 - hardness + 0.0001);
+        weight = 1.0 - s * s;
+      }
+
+      // Fix 1: backward mapping — ADD displacement (correct direction)
+      const srcX = Math.max(0, Math.min(W - 1, x + normDx * weight * maxDisp));
+      const srcY = Math.max(0, Math.min(H - 1, y + normDy * weight * maxDisp));
+
+      const sx0 = Math.floor(srcX);
+      const sx1 = Math.min(sx0 + 1, W - 1);
+      const sy0 = Math.floor(srcY);
+      const sy1 = Math.min(sy0 + 1, H - 1);
+      const fx = srcX - sx0;
+      const fy = srcY - sy0;
+      const i00 = (sy0 * W + sx0) * 4;
+      const i10 = (sy0 * W + sx1) * 4;
+      const i01 = (sy1 * W + sx0) * 4;
+      const i11 = (sy1 * W + sx1) * 4;
+      const w00 = (1 - fx) * (1 - fy);
+      const w10 = fx * (1 - fy);
+      const w01 = (1 - fx) * fy;
+      const w11 = fx * fy;
+
+      const oi = ((y - y0) * rw + (x - x0)) * 4;
+      region[oi] =
+        src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11;
+      region[oi + 1] =
+        src[i00 + 1] * w00 +
+        src[i10 + 1] * w10 +
+        src[i01 + 1] * w01 +
+        src[i11 + 1] * w11;
+      region[oi + 2] =
+        src[i00 + 2] * w00 +
+        src[i10 + 2] * w10 +
+        src[i01 + 2] * w01 +
+        src[i11 + 2] * w11;
+      region[oi + 3] =
+        src[i00 + 3] * w00 +
+        src[i10 + 3] * w10 +
+        src[i01 + 3] * w01 +
+        src[i11 + 3] * w11;
+    }
+  }
+
+  ctx.putImageData(new ImageData(region, rw, rh), x0, y0);
+}
 
 // ─── Helper types (local, not exported) ──────────────────────────────────────
 type Point = { x: number; y: number };
@@ -171,9 +437,6 @@ function _getCanvasPosTransformed(
   // canvas's actual screen center including pan. We must NOT subtract
   // transform.panX/panY again; doing so would double-count the translation.
   const cr = canvas.getBoundingClientRect();
-  console.log(
-    `[CoordMap] getBoundingClientRect — left: ${cr.left} top: ${cr.top} width: ${cr.width} height: ${cr.height}`,
-  );
   const centerX = cr.left + cr.width / 2;
   const centerY = cr.top + cr.height / 2;
   // ox/oy: pointer offset from the canvas's screen-space center.
@@ -228,6 +491,8 @@ export interface PaintingCanvasEventsCallbacks {
   handleRedo: () => void;
   // Paste as floating selection (delegates to PaintingApp where all refs live)
   pasteFloat: (img: HTMLImageElement) => void;
+  // Paste image data as a new layer directly above the active layer
+  pasteAsNewLayer: (img: HTMLImageElement) => void;
   // File save
   handleSaveFile: () => Promise<void>;
   handleSilentSave: () => Promise<void>;
@@ -288,6 +553,12 @@ export interface PaintingCanvasEventsCallbacks {
   // Tool change — full handleToolChange from PaintingApp (includes rotate cleanup)
   handleToolChange: (tool: Tool) => void;
   // Compositing / stroke helpers
+  /**
+   * Clear the stroke-active guard (strokeActiveRef). Must be called from the
+   * liquify pointer-up finally block, pointercancel, and tool-switch paths so
+   * the guard is never left stuck after a liquify stroke ends.
+   */
+  clearStrokeGuard: () => void;
   compositeWithStrokePreview: (
     opacity: number,
     tool: Tool,
@@ -428,7 +699,9 @@ export interface PaintingCanvasEventsParams {
   isDrawingSelectionRef: React.MutableRefObject<boolean>;
   selectionPolyClosingRef: React.MutableRefObject<boolean>;
   cancelInProgressSelectionRef: React.MutableRefObject<() => void>;
-  commitInProgressLassoRef: React.MutableRefObject<() => void>;
+  commitInProgressLassoRef: React.MutableRefObject<
+    (shiftKey?: boolean, altKey?: boolean) => void
+  >;
   rebuildChainsNowRef: React.MutableRefObject<
     (mask: HTMLCanvasElement) => void
   >;
@@ -556,6 +829,7 @@ export interface PaintingCanvasEventsParams {
   wandToleranceRef: React.MutableRefObject<number>;
   wandContiguousRef: React.MutableRefObject<boolean>;
   wandGrowShrinkRef: React.MutableRefObject<number>;
+  wandEdgeExpandRef: React.MutableRefObject<number>;
 
   // Transform / float
   moveFloatCanvasRef: React.MutableRefObject<HTMLCanvasElement | null>;
@@ -677,10 +951,9 @@ export interface PaintingCanvasEventsParams {
   liquifyMultiBeforeSnapshotsRef: React.MutableRefObject<
     Map<string, ImageData>
   >;
-  liquifyHoldIntervalRef: React.MutableRefObject<ReturnType<
-    typeof setInterval
-  > | null>;
   liquifyScopeRef: React.MutableRefObject<string>;
+  liquifyHardnessRef?: React.MutableRefObject<number>;
+  liquifyStretchRef?: React.MutableRefObject<number>;
 
   // Thumbnail debounce
   thumbDebounceRef: React.MutableRefObject<ReturnType<
@@ -742,9 +1015,38 @@ export interface PaintingCanvasEventsParams {
   ctrlDragOffsetRef: React.MutableRefObject<{ x: number; y: number }>;
   /** The layer ID that is being moved by Ctrl+drag (may differ from activeLayerIdRef for Ctrl+Shift). */
   ctrlDragMovingLayerIdRef: React.MutableRefObject<string>;
+
+  // ---- UI mode toggle (Tab hotkey) ----
+  /** Stable ref to the current isMobile flag — read by the Tab hotkey handler. */
+  isMobileRef: React.MutableRefObject<boolean>;
+  /** Stable ref to setUIModeOverride — called by the Tab hotkey handler. */
+  setUIModeOverrideRef: React.MutableRefObject<
+    (override: "mobile" | "desktop" | null) => void
+  >;
+  /** Stable ref to the transform proportional toggle state. */
+  transformProportionalRef: React.MutableRefObject<boolean>;
 }
 
 // ─── The hook ─────────────────────────────────────────────────────────────────
+
+// ─── Module-level smear undo tracking ────────────────────────────────────────
+// These are allocated at smear pointer-down and nulled at smear pointer-up.
+// They live at module scope (not in a ref) so they are accessible from the
+// pointer-up closure without needing extra ref indirection.
+let _smearUndoBefore: ImageData | null = null;
+let _smearUndoDirtyRect: { x: number; y: number; w: number; h: number } | null =
+  null;
+
+// ─── Module-level helper ─────────────────────────────────────────────────────
+/** Convert ImageData to a data URL via an offscreen canvas. Used by nudge undo entries. */
+function _imageDataToUrl(data: ImageData, w: number, h: number): string {
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext("2d")!;
+  ctx.putImageData(data, 0, 0);
+  return c.toDataURL();
+}
 
 export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
   // Destructure only the refs that are directly referenced by name
@@ -810,12 +1112,27 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
   >([]);
   // Whether the current liquify stroke is operating in multi-layer mode.
   const _liqIsMultiRef = useRef(false);
-  // Stride chosen at stroke start based on layer count.
-  const _liqStrideRef = useRef(1);
   // NOTE: The liquify stroke active flag lives in useLiquifySystem as
   // _liquifyStrokeActive (accessed via getLiquifyStrokeActive / setLiquifyStrokeActive).
   // scheduleComposite in useCompositing gates on that flag — this is the single
   // authoritative suppression point for all pre-warp renders (A4 fix).
+
+  // Pre-baked layer buffers for liquify preview compositing.
+  // bgBuffer: all layers below the active layer composited together (baked once at stroke start).
+  // fgBuffer: all layers above the active layer composited together (baked once at stroke start).
+  // Both are freed at pointer-up, pointer-cancel, and tool-switch.
+  const _liqBgBufferRef = useRef<OffscreenCanvas | null>(null);
+  const _liqFgBufferRef = useRef<OffscreenCanvas | null>(null);
+
+  // ── 1€ Filter for pen pressure ───────────────────────────────────────────
+  // Instantiated fresh at every pen pointerdown, discarded at pointerup.
+  // null for non-pen (mouse/touch) strokes — those use the EMA path unchanged.
+  const pressureFilterRef = useRef<OneEuroFilter | null>(null);
+
+  // ── Line tool 1€ Filter for pen pressure (Fix A) ─────────────────────────
+  // Separate from pressureFilterRef so it never interferes with brush tool state.
+  // Instantiated fresh at line tool pen pointerdown; null for mouse/touch.
+  const linePressureFilterRef = useRef<OneEuroFilter | null>(null);
 
   // ── Line tool refs ────────────────────────────────────────────────────────
   // Set true between pointerdown and pointerup when line tool is active.
@@ -903,6 +1220,170 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     return samples[samples.length - 1].pressure;
   }
 
+  // ── Line tool: Fix D — rolling median smoothing at commit time ───────────
+  // Returns a new array with each sample's pressure replaced by the median of
+  // itself and its MEDIAN_WINDOW nearest neighbours on each side.
+  // The original array is never modified — only the copy returned here is used.
+  function smoothLinePressureSamples(
+    samples: Array<{ dist: number; pressure: number }>,
+  ): Array<{ dist: number; pressure: number }> {
+    if (samples.length === 0) return samples;
+    return samples.map((s, i) => {
+      const windowStart = Math.max(0, i - MEDIAN_WINDOW);
+      const windowEnd = Math.min(samples.length - 1, i + MEDIAN_WINDOW);
+      const window = samples
+        .slice(windowStart, windowEnd + 1)
+        .map((w) => w.pressure);
+      window.sort((a, b) => a - b);
+      const mid = Math.floor(window.length / 2);
+      const median =
+        window.length % 2 !== 0
+          ? window[mid]
+          : (window[mid - 1] + window[mid]) / 2;
+      return { ...s, pressure: median };
+    });
+  }
+
+  // ── 0b. Document-level focus redirect ────────────────────────────────────
+  // When any key (except Tab) is pressed while a non-input, non-select UI
+  // element has focus, redirect focus back to the canvas so shortcuts fire.
+  // This means pressing B, E, Ctrl+Z etc while a button or slider has focus
+  // will immediately process the shortcut without requiring a canvas click.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: displayCanvasRef is a stable ref
+  useEffect(() => {
+    const onDocKeyDown = (e: KeyboardEvent) => {
+      const active = document.activeElement as HTMLElement | null;
+      const tag = active?.tagName.toUpperCase() ?? "";
+
+      // ── toggle_ui_mode hotkey (default: Tab) ──────────────────────────────
+      // Handle this BEFORE the focus-redirect logic so Tab always toggles UI
+      // mode regardless of which element has focus. Skip text inputs, textareas,
+      // contentEditable, and native <select> elements — those need Tab behavior.
+      if (
+        tag !== "INPUT" &&
+        tag !== "TEXTAREA" &&
+        tag !== "SELECT" &&
+        !active?.isContentEditable
+      ) {
+        const hk = hotkeysRef.current.toggle_ui_mode;
+        if (
+          hk &&
+          (matchesBinding(e, hk.primary) || matchesBinding(e, hk.secondary))
+        ) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          const currentIsMobile = p.isMobileRef.current;
+          p.setUIModeOverrideRef.current(
+            currentIsMobile ? "desktop" : "mobile",
+          );
+          return;
+        }
+      }
+
+      // Never redirect Tab for other purposes — handled above or leave to browser
+      if (e.key === "Tab") return;
+
+      if (!active) return;
+
+      const canvas = displayCanvasRef.current;
+      if (!canvas) return;
+
+      // Already focused on canvas or its wrapper — nothing to do
+      if (active === canvas || active === canvas.parentElement) return;
+
+      // Never steal focus from text inputs or contentEditable
+      if (tag === "INPUT" || tag === "TEXTAREA" || active.isContentEditable)
+        return;
+
+      // Native <select> gets special treatment:
+      // Arrow keys navigate its options — never intercept those.
+      // All other keys: redirect to canvas (so shortcuts like B, E, Ctrl+Z work).
+      if (tag === "SELECT") {
+        if (
+          e.key === "ArrowUp" ||
+          e.key === "ArrowDown" ||
+          e.key === "ArrowLeft" ||
+          e.key === "ArrowRight" ||
+          e.key === "Enter" ||
+          e.key === "Escape"
+        ) {
+          // Let the select handle these natively; on Enter/Escape the select
+          // will lose focus naturally and the window blurHandler will clean up.
+          // Schedule canvas focus after select interaction completes.
+          if (e.key === "Enter" || e.key === "Escape") {
+            requestAnimationFrame(() => {
+              displayCanvasRef.current?.focus();
+            });
+          }
+          return;
+        }
+        // Any other key (e.g. B for brush) — redirect to canvas
+      }
+
+      // Redirect: focus canvas and re-dispatch so the shortcut fires
+      canvas.focus();
+      const redirected = new KeyboardEvent("keydown", {
+        key: e.key,
+        code: e.code,
+        keyCode: e.keyCode,
+        charCode: e.charCode,
+        shiftKey: e.shiftKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        metaKey: e.metaKey,
+        repeat: e.repeat,
+        bubbles: true,
+        cancelable: true,
+      });
+      // Prevent the original from being processed as a shortcut
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      // Dispatch the cloned event on the canvas — window listeners will pick it up
+      window.dispatchEvent(redirected);
+    };
+
+    // Capture phase so we intercept before window listeners
+    document.addEventListener("keydown", onDocKeyDown, { capture: true });
+
+    // After any pointer-up on a non-canvas, non-input UI element (buttons, sliders,
+    // panel controls), return focus to the canvas after one RAF tick so the click
+    // handler fires first. This ensures hotkeys work immediately after e.g. clicking
+    // Undo, toggling a layer, or adjusting a slider.
+    const onDocPointerUp = (e: PointerEvent) => {
+      const canvas = displayCanvasRef.current;
+      if (!canvas) return;
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      // Don't interfere with canvas pointer events
+      if (target === canvas || canvas.contains(target)) return;
+      const tag = target.tagName.toUpperCase();
+      // Don't steal focus from text inputs
+      if (tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable)
+        return;
+      // Schedule canvas focus after the click handler has a chance to run
+      requestAnimationFrame(() => {
+        // Only refocus if nothing else grabbed focus during the RAF
+        const nowActive = document.activeElement as HTMLElement | null;
+        const nowTag = nowActive?.tagName.toUpperCase() ?? "";
+        if (
+          nowTag !== "INPUT" &&
+          nowTag !== "TEXTAREA" &&
+          !nowActive?.isContentEditable
+        ) {
+          canvas.focus();
+        }
+      });
+    };
+    document.addEventListener("pointerup", onDocPointerUp, { capture: true });
+
+    return () => {
+      document.removeEventListener("keydown", onDocKeyDown, { capture: true });
+      document.removeEventListener("pointerup", onDocPointerUp, {
+        capture: true,
+      });
+    };
+  }, []);
+
   // ── 1. Global hotkey handler ─────────────────────────────────────────────
   // biome-ignore lint/correctness/useExhaustiveDependencies: all mutable state accessed via stable refs / callbacksRef
   useEffect(() => {
@@ -941,6 +1422,24 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           altEyedropperActiveRef.current = true;
           cb.setActiveTool("eyedropper");
         }
+        return;
+      }
+
+      // ── Undo (Ctrl+Z / Cmd+Z) — checked FIRST, before redo and before any
+      // other Ctrl-chord handling. On Linux/Chrome, Ctrl keydown fires and sets
+      // ctrlHeldRef, but the subsequent Z keydown must still reach this handler.
+      // We use a direct e.ctrlKey check as a reliable fallback in addition to
+      // matchesBinding, so undo fires even if matchesBinding misses the event
+      // for any platform-specific reason.
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "z"
+      ) {
+        e.preventDefault();
+        if (isDrawingRef.current || isCommittingRef.current) return;
+        if (transformActiveRef.current) return; // toast handled in PaintingApp
+        cb.handleUndo();
         return;
       }
 
@@ -988,7 +1487,254 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         cb.handleRedo();
         return;
       }
-      // Ctrl+V: paste clipboard image as floating selection
+      // Ctrl+C: copy active layer (or selection) to clipboard as PNG
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "c"
+      ) {
+        const focused = document.activeElement;
+        const isTextFocused =
+          focused instanceof HTMLInputElement ||
+          focused instanceof HTMLTextAreaElement ||
+          (focused instanceof HTMLElement && focused.isContentEditable);
+        if (!isTextFocused) {
+          e.preventDefault();
+          (async () => {
+            const layerId = p.activeLayerIdRef.current;
+            const lc = p.layerCanvasesRef.current.get(layerId);
+            if (!lc) return;
+            try {
+              let srcCanvas: HTMLCanvasElement;
+              if (p.selectionActiveRef.current && p.selectionMaskRef.current) {
+                const mask = p.selectionMaskRef.current;
+                const bounds = computeMaskBounds(mask);
+                if (!bounds || bounds.w <= 0 || bounds.h <= 0) return;
+                const { x: bx, y: by, w: bw, h: bh } = bounds;
+                const tmp = document.createElement("canvas");
+                tmp.width = bw;
+                tmp.height = bh;
+                const tctx = tmp.getContext("2d", {
+                  willReadFrequently: true,
+                })!;
+                const lcCtx = lc.getContext("2d", {
+                  willReadFrequently: true,
+                })!;
+                const layerData = lcCtx.getImageData(bx, by, bw, bh);
+                const maskCtx = mask.getContext("2d", {
+                  willReadFrequently: true,
+                })!;
+                const maskData = maskCtx.getImageData(bx, by, bw, bh);
+                const outData = tctx.createImageData(bw, bh);
+                for (let i = 0; i < bw * bh; i++) {
+                  const maskAlpha = maskData.data[i * 4 + 3] / 255;
+                  outData.data[i * 4] = layerData.data[i * 4];
+                  outData.data[i * 4 + 1] = layerData.data[i * 4 + 1];
+                  outData.data[i * 4 + 2] = layerData.data[i * 4 + 2];
+                  outData.data[i * 4 + 3] = Math.round(
+                    layerData.data[i * 4 + 3] * maskAlpha,
+                  );
+                }
+                tctx.putImageData(outData, 0, 0);
+                srcCanvas = tmp;
+              } else {
+                srcCanvas = lc;
+              }
+              await new Promise<void>((resolve, reject) => {
+                srcCanvas.toBlob(async (blob) => {
+                  if (!blob) {
+                    reject(new Error("toBlob failed"));
+                    return;
+                  }
+                  try {
+                    await navigator.clipboard.write([
+                      new ClipboardItem({ "image/png": blob }),
+                    ]);
+                    resolve();
+                  } catch (err) {
+                    reject(err);
+                  }
+                }, "image/png");
+              });
+            } catch {
+              toast("Copy failed — clipboard access denied.", {
+                duration: 3000,
+              });
+            }
+          })();
+          return;
+        }
+      }
+      // Ctrl+X: copy then clear active layer (or selection) — undoable
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "x"
+      ) {
+        const focused = document.activeElement;
+        const isTextFocused =
+          focused instanceof HTMLInputElement ||
+          focused instanceof HTMLTextAreaElement ||
+          (focused instanceof HTMLElement && focused.isContentEditable);
+        if (!isTextFocused) {
+          e.preventDefault();
+          (async () => {
+            const layerId = p.activeLayerIdRef.current;
+            const lc = p.layerCanvasesRef.current.get(layerId);
+            if (!lc) return;
+            const cw = p.canvasWidthRef.current;
+            const ch = p.canvasHeightRef.current;
+            const lcCtx = lc.getContext("2d", { willReadFrequently: true })!;
+            const before = lcCtx.getImageData(0, 0, cw, ch);
+            try {
+              let srcCanvas: HTMLCanvasElement;
+              let clearFn: (ctx: CanvasRenderingContext2D) => void;
+              if (p.selectionActiveRef.current && p.selectionMaskRef.current) {
+                const mask = p.selectionMaskRef.current;
+                const bounds = computeMaskBounds(mask);
+                if (!bounds || bounds.w <= 0 || bounds.h <= 0) return;
+                const { x: bx, y: by, w: bw, h: bh } = bounds;
+                const tmp = document.createElement("canvas");
+                tmp.width = bw;
+                tmp.height = bh;
+                const tctx = tmp.getContext("2d", {
+                  willReadFrequently: true,
+                })!;
+                const layerData = lcCtx.getImageData(bx, by, bw, bh);
+                const maskCtx = mask.getContext("2d", {
+                  willReadFrequently: true,
+                })!;
+                const maskData = maskCtx.getImageData(bx, by, bw, bh);
+                const outData = tctx.createImageData(bw, bh);
+                for (let i = 0; i < bw * bh; i++) {
+                  const maskAlpha = maskData.data[i * 4 + 3] / 255;
+                  outData.data[i * 4] = layerData.data[i * 4];
+                  outData.data[i * 4 + 1] = layerData.data[i * 4 + 1];
+                  outData.data[i * 4 + 2] = layerData.data[i * 4 + 2];
+                  outData.data[i * 4 + 3] = Math.round(
+                    layerData.data[i * 4 + 3] * maskAlpha,
+                  );
+                }
+                tctx.putImageData(outData, 0, 0);
+                srcCanvas = tmp;
+                clearFn = (ctx) => {
+                  const fullMaskData = maskCtx.getImageData(0, 0, cw, ch);
+                  const layerFull = ctx.getImageData(0, 0, cw, ch);
+                  for (let i = 0; i < cw * ch; i++) {
+                    if (fullMaskData.data[i * 4 + 3] > 0) {
+                      layerFull.data[i * 4 + 3] = 0;
+                    }
+                  }
+                  ctx.putImageData(layerFull, 0, 0);
+                };
+              } else {
+                srcCanvas = lc;
+                clearFn = (ctx) => ctx.clearRect(0, 0, cw, ch);
+              }
+              await new Promise<void>((resolve, reject) => {
+                srcCanvas.toBlob(async (blob) => {
+                  if (!blob) {
+                    reject(new Error("toBlob failed"));
+                    return;
+                  }
+                  try {
+                    await navigator.clipboard.write([
+                      new ClipboardItem({ "image/png": blob }),
+                    ]);
+                    resolve();
+                  } catch (err) {
+                    reject(err);
+                  }
+                }, "image/png");
+              });
+              // Clear succeeds — apply destructive edit and push undo
+              clearFn(lcCtx);
+              markCanvasDirty(layerId);
+              markLayerBitmapDirty(layerId);
+              // Use the selection bounding box as the dirty rect when a
+              // selection is active — only those pixels changed. Fall back to
+              // full canvas (no dirtyRect) when clearing the whole layer.
+              if (p.selectionActiveRef.current && p.selectionMaskRef.current) {
+                const _cutBounds = computeMaskBounds(
+                  p.selectionMaskRef.current,
+                );
+                if (_cutBounds && _cutBounds.w > 0 && _cutBounds.h > 0) {
+                  const _cutDr = {
+                    x: _cutBounds.x,
+                    y: _cutBounds.y,
+                    w: _cutBounds.w,
+                    h: _cutBounds.h,
+                  };
+                  // Crop before-snapshot to the dirty rect
+                  const _cutTmp = document.createElement("canvas");
+                  _cutTmp.width = _cutDr.w;
+                  _cutTmp.height = _cutDr.h;
+                  const _cutTmpCtx = _cutTmp.getContext("2d", {
+                    willReadFrequently: true,
+                  });
+                  if (_cutTmpCtx) {
+                    _cutTmpCtx.putImageData(before, -_cutDr.x, -_cutDr.y);
+                    const croppedBefore = _cutTmpCtx.getImageData(
+                      0,
+                      0,
+                      _cutDr.w,
+                      _cutDr.h,
+                    );
+                    const after = lcCtx.getImageData(
+                      _cutDr.x,
+                      _cutDr.y,
+                      _cutDr.w,
+                      _cutDr.h,
+                    );
+                    callbacksRef.current.pushHistory({
+                      type: "pixels",
+                      layerId,
+                      dirtyRect: _cutDr,
+                      before: croppedBefore,
+                      after,
+                    });
+                  } else {
+                    const after = lcCtx.getImageData(0, 0, cw, ch);
+                    callbacksRef.current.pushHistory({
+                      type: "pixels",
+                      layerId,
+                      dirtyRect: { x: 0, y: 0, w: cw, h: ch },
+                      before,
+                      after,
+                    });
+                  }
+                } else {
+                  const after = lcCtx.getImageData(0, 0, cw, ch);
+                  callbacksRef.current.pushHistory({
+                    type: "pixels",
+                    layerId,
+                    dirtyRect: { x: 0, y: 0, w: cw, h: ch },
+                    before,
+                    after,
+                  });
+                }
+              } else {
+                // No selection — whole layer was cleared; full canvas snapshot
+                const after = lcCtx.getImageData(0, 0, cw, ch);
+                callbacksRef.current.pushHistory({
+                  type: "pixels",
+                  layerId,
+                  dirtyRect: { x: 0, y: 0, w: cw, h: ch },
+                  before,
+                  after,
+                });
+              }
+              callbacksRef.current.composite();
+            } catch {
+              toast("Cut failed — clipboard access denied.", {
+                duration: 3000,
+              });
+            }
+          })();
+          return;
+        }
+      }
+      // Ctrl+V: paste clipboard image onto a new layer
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v") {
         e.preventDefault();
         (async () => {
@@ -1002,10 +1748,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               const img = new Image();
               img.onload = () => {
                 URL.revokeObjectURL(url);
-                // Delegate to PaintingApp — it has access to all float refs.
-                // The layer is NOT cleared here; the pasted image floats OVER
-                // the existing content and is composited onto the layer only on commit.
-                callbacksRef.current.pasteFloat(img);
+                // Create a new layer above the active layer and draw the pasted image onto it.
+                callbacksRef.current.pasteAsNewLayer(img);
               };
               img.src = url;
               break;
@@ -1164,7 +1908,219 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         return;
       }
 
+      // Plain Tab (no Shift): toggle_ui_mode hotkey (user-rebindable)
+      // Guard: Shift is already taken by cycleRulerMode above.
+      if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+        if (
+          matchesBinding(e, hotkeysRef.current.toggle_ui_mode?.primary) ||
+          matchesBinding(e, hotkeysRef.current.toggle_ui_mode?.secondary)
+        ) {
+          e.preventDefault();
+          const currentIsMobile = p.isMobileRef.current;
+          p.setUIModeOverrideRef.current(
+            currentIsMobile ? "desktop" : "mobile",
+          );
+          return;
+        }
+      }
+
       if (!e.ctrlKey && !e.metaKey) {
+        // ── Arrow key nudge ───────────────────────────────────────────────────
+        // Nudge transform box, selection mask, or active layer by 1px (or 10px
+        // with Shift). Only fires when the canvas has focus and no text input or
+        // dropdown is active. Each nudge step is a separate undo entry.
+        if (
+          (e.key === "ArrowUp" ||
+            e.key === "ArrowDown" ||
+            e.key === "ArrowLeft" ||
+            e.key === "ArrowRight") &&
+          !e.altKey &&
+          !isDrawingRef.current
+        ) {
+          const canvas = displayCanvasRef.current;
+          const activeEl = document.activeElement;
+          const isCanvasFocused =
+            activeEl === canvas || activeEl === canvas?.parentElement;
+          if (isCanvasFocused) {
+            e.preventDefault();
+            const amount = e.shiftKey
+              ? ARROW_NUDGE_BASE_PX * ARROW_NUDGE_SHIFT_MULTIPLIER
+              : ARROW_NUDGE_BASE_PX;
+            const dx =
+              e.key === "ArrowLeft"
+                ? -amount
+                : e.key === "ArrowRight"
+                  ? amount
+                  : 0;
+            const dy =
+              e.key === "ArrowUp"
+                ? -amount
+                : e.key === "ArrowDown"
+                  ? amount
+                  : 0;
+
+            const _doNudge = () => {
+              // ── Priority 1: Transform bounding box ──────────────────────
+              if (p.transformActiveRef.current && p.xfStateRef.current) {
+                const xf = p.xfStateRef.current;
+                p.xfStateRef.current = { ...xf, x: xf.x + dx, y: xf.y + dy };
+                // Trigger re-composite so the transform preview updates
+                callbacksRef.current.scheduleComposite();
+                return;
+              }
+
+              // ── Priority 2: Active selection mask ────────────────────────
+              if (p.selectionActiveRef.current && p.selectionMaskRef.current) {
+                const mc = p.selectionMaskRef.current;
+                const cw = p.canvasWidthRef.current;
+                const ch = p.canvasHeightRef.current;
+                // Snapshot before for undo
+                const mctx = mc.getContext("2d", { willReadFrequently: true });
+                if (!mctx) return;
+                const before = mctx.getImageData(0, 0, cw, ch);
+                // Shift the mask: draw to a temp canvas then back offset
+                const tmp = document.createElement("canvas");
+                tmp.width = cw;
+                tmp.height = ch;
+                const tctx = tmp.getContext("2d")!;
+                tctx.drawImage(mc, 0, 0);
+                mctx.clearRect(0, 0, cw, ch);
+                mctx.drawImage(tmp, dx, dy);
+                const after = mctx.getImageData(0, 0, cw, ch);
+                // Recompute boundary
+                p.selectionBoundaryPathRef.current.dirty = true;
+                p.selectionBoundaryPathRef.current.chains = [];
+                p.selectionBoundaryPathRef.current.segments = [];
+                if (p.rebuildChainsNowRef.current)
+                  p.rebuildChainsNowRef.current(mc);
+                callbacksRef.current.pushHistory({
+                  type: "selection",
+                  before: {
+                    geometry: null,
+                    maskDataURL: _imageDataToUrl(before, cw, ch),
+                    active: true,
+                    shapes: [],
+                  },
+                  after: {
+                    geometry: null,
+                    maskDataURL: _imageDataToUrl(after, cw, ch),
+                    active: true,
+                    shapes: [],
+                  },
+                });
+                markCanvasDirty(p.activeLayerIdRef.current);
+                callbacksRef.current.scheduleComposite();
+                return;
+              }
+
+              // ── Priority 3: Active layer pixel shift ─────────────────────
+              const layerId = p.activeLayerIdRef.current;
+              const lc = p.layerCanvasesRef.current.get(layerId);
+              if (!lc) return;
+              const lctx = lc.getContext("2d");
+              if (!lctx) return;
+              const w = lc.width;
+              const h = lc.height;
+              const before = lctx.getImageData(0, 0, w, h);
+              // Shift layer contents by (dx, dy); pixels shifted off-canvas are discarded
+              const tmp2 = document.createElement("canvas");
+              tmp2.width = w;
+              tmp2.height = h;
+              const t2ctx = tmp2.getContext("2d")!;
+              t2ctx.drawImage(lc, 0, 0);
+              lctx.clearRect(0, 0, w, h);
+              lctx.drawImage(tmp2, dx, dy);
+              // Compute dirty rect: union of before-content bbox and after-content bbox
+              const _nudgeData = before.data;
+              let _nMinX = w;
+              let _nMinY = h;
+              let _nMaxX = 0;
+              let _nMaxY = 0;
+              let _nHasContent = false;
+              for (let _ni = 3; _ni < _nudgeData.length; _ni += 4) {
+                if (_nudgeData[_ni] > 0) {
+                  const _nPx = ((_ni - 3) / 4) % w;
+                  const _nPy = Math.floor((_ni - 3) / 4 / w);
+                  if (_nPx < _nMinX) _nMinX = _nPx;
+                  if (_nPx + 1 > _nMaxX) _nMaxX = _nPx + 1;
+                  if (_nPy < _nMinY) _nMinY = _nPy;
+                  if (_nPy + 1 > _nMaxY) _nMaxY = _nPy + 1;
+                  _nHasContent = true;
+                }
+              }
+              const _nudgeDr =
+                _nHasContent && _nMaxX > _nMinX && _nMaxY > _nMinY
+                  ? (() => {
+                      const _nx = Math.max(0, Math.min(_nMinX, _nMinX + dx));
+                      const _ny = Math.max(0, Math.min(_nMinY, _nMinY + dy));
+                      const _nx2 = Math.min(w, Math.max(_nMaxX, _nMaxX + dx));
+                      const _ny2 = Math.min(h, Math.max(_nMaxY, _nMaxY + dy));
+                      const _nw = _nx2 - _nx;
+                      const _nh = _ny2 - _ny;
+                      return _nw > 0 && _nh > 0
+                        ? { x: _nx, y: _ny, w: _nw, h: _nh }
+                        : null;
+                    })()
+                  : null;
+              if (_nudgeDr) {
+                const _nTmp = document.createElement("canvas");
+                _nTmp.width = _nudgeDr.w;
+                _nTmp.height = _nudgeDr.h;
+                const _nTmpCtx = _nTmp.getContext("2d", {
+                  willReadFrequently: true,
+                });
+                if (_nTmpCtx) {
+                  _nTmpCtx.putImageData(before, -_nudgeDr.x, -_nudgeDr.y);
+                  const _nCroppedBefore = _nTmpCtx.getImageData(
+                    0,
+                    0,
+                    _nudgeDr.w,
+                    _nudgeDr.h,
+                  );
+                  const _nCroppedAfter = lctx.getImageData(
+                    _nudgeDr.x,
+                    _nudgeDr.y,
+                    _nudgeDr.w,
+                    _nudgeDr.h,
+                  );
+                  callbacksRef.current.pushHistory({
+                    type: "pixels",
+                    layerId,
+                    dirtyRect: _nudgeDr,
+                    before: _nCroppedBefore,
+                    after: _nCroppedAfter,
+                  });
+                } else {
+                  const after = lctx.getImageData(0, 0, w, h);
+                  callbacksRef.current.pushHistory({
+                    type: "pixels",
+                    layerId,
+                    dirtyRect: { x: 0, y: 0, w, h },
+                    before,
+                    after,
+                  });
+                }
+              } else {
+                const after = lctx.getImageData(0, 0, w, h);
+                callbacksRef.current.pushHistory({
+                  type: "pixels",
+                  layerId,
+                  dirtyRect: { x: 0, y: 0, w, h },
+                  before,
+                  after,
+                });
+              }
+              markLayerBitmapDirty(layerId);
+              markCanvasDirty(layerId);
+              callbacksRef.current.scheduleComposite();
+            };
+
+            _doNudge();
+            return;
+          }
+        }
+        // ── End arrow key nudge ───────────────────────────────────────────────
+
         // ── Spring-loadable tools: brush, eraser, smudge, liquify, fill, lasso, move/transform, ruler ──
         // On keydown: if the hotkey maps to a tool that is NOT currently active,
         // start a 500ms hold timer. If the key is released before the timer fires
@@ -1434,7 +2390,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         } else if (e.key.toLowerCase() === "enter") {
           if (isDrawingSelectionRef.current) {
             e.preventDefault();
-            commitInProgressLassoRef.current();
+            commitInProgressLassoRef.current(e.shiftKey, e.altKey);
           } else if (isDraggingFloatRef.current || transformActiveRef.current) {
             e.preventDefault();
             p.selectionActionsRef.current.commitFloat({ keepSelection: true });
@@ -1795,7 +2751,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       if (e.code === "Space") {
         e.preventDefault();
         if (isDrawingSelectionRef.current) {
-          commitInProgressLassoRef.current();
+          commitInProgressLassoRef.current(e.shiftKey, e.altKey);
           return;
         }
         spaceDownRef.current = true;
@@ -1929,6 +2885,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       //  before snapshot rather than committing the partial move)
       // In practice the pointer-up path handles commit; we only restore cursor here.
       if (!p.ctrlDragMoveActiveRef.current) {
+        // No active move — just restore cursor
         // Re-apply cursor if pointer is currently over a transform handle
         const hovHandle = hoveredTransformHandleRef.current;
         if (hovHandle) {
@@ -2149,15 +3106,11 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     if (e.pointerType !== "pen") return;
     p.penDownCountRef.current = Math.max(0, p.penDownCountRef.current - 1);
     penActiveRef.current = false;
-    console.log("[PalmRejection] pen lift — grace period started (500ms)");
     if (penLiftTimerRef.current) {
       clearTimeout(penLiftTimerRef.current);
     }
     penLiftTimerRef.current = setTimeout(() => {
       penLiftTimerRef.current = null;
-      console.log(
-        "[PalmRejection] grace period elapsed — touch gestures re-enabled",
-      );
     }, PEN_GRACE_PERIOD_MS);
   }
 
@@ -2181,20 +3134,12 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         clearTimeout(penLiftTimerRef.current);
         penLiftTimerRef.current = null;
       }
-      console.log("[PalmRejection] pen down — lock active");
       // Keep penDownCountRef for compatibility with touch gesture guards
       p.penDownCountRef.current += 1;
     } else if (e.pointerType === "touch") {
       // Only gate if a pen has ever been seen (degrade gracefully on non-pen devices)
       if (penEverSeenRef.current) {
         if (penActiveRef.current || penLiftTimerRef.current !== null) {
-          const reason = penActiveRef.current
-            ? "pen-active lock"
-            : "grace period";
-          console.log(
-            `[PalmRejection] touch rejected during ${reason}: pointerId`,
-            e.pointerId,
-          );
           return;
         }
         // pen-active lock fully inactive — touch gestures use touchstart/touchmove (separate path)
@@ -2206,6 +3151,10 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       }
     }
     // ── End palm rejection gate ───────────────────────────────────────────────
+
+    // Reclaim keyboard focus on every pointer-down on the canvas so hotkeys
+    // work immediately after clicking to draw (no manual re-click required).
+    display.focus();
 
     // Track this pointer for Layer 3 rollback
     activePointersRef.current.set(e.pointerId, {
@@ -2392,17 +3341,6 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     const layerId = p.activeLayerIdRef.current;
     const lc = p.layerCanvasesRef.current.get(layerId);
     const cb = callbacksRef.current;
-
-    console.log(
-      "[Paint] pointerdown received — tool:",
-      tool,
-      "layer:",
-      layerId,
-      "canvas:",
-      lc?.width,
-      "x",
-      lc?.height,
-    );
 
     // ── Ctrl+drag / Ctrl+Shift+drag layer move ────────────────────────────
     // Intercept before any tool dispatch. Guards:
@@ -2811,6 +3749,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         p.lassoFreeLastPtRef.current = null;
       } else if (mode === "wand") {
         p.selectionBeforeRef.current = cb.snapshotSelection();
+        // Improvement 1: sample from active layer only (not display canvas)
         const layerCanvas = p.layerCanvasesRef.current.get(
           p.activeLayerIdRef.current,
         );
@@ -2821,223 +3760,111 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         if (!lCtx) return;
         const wx = Math.round(pos.x);
         const wy = Math.round(pos.y);
-        if (
-          wx < 0 ||
-          wx >= p.canvasWidthRef.current ||
-          wy < 0 ||
-          wy >= p.canvasHeightRef.current
-        )
-          return;
-        const imgData = lCtx.getImageData(
-          0,
-          0,
-          p.canvasWidthRef.current,
-          p.canvasHeightRef.current,
-        );
+        const cw = p.canvasWidthRef.current;
+        const ch = p.canvasHeightRef.current;
+        if (wx < 0 || wx >= cw || wy < 0 || wy >= ch) return;
+
+        const imgData = lCtx.getImageData(0, 0, cw, ch);
         const srcData = imgData.data;
-        const maskCanvas = document.createElement("canvas");
-        maskCanvas.width = p.canvasWidthRef.current;
-        maskCanvas.height = p.canvasHeightRef.current;
-        const mCtx = maskCanvas.getContext("2d", {
-          willReadFrequently: !isIPad,
-        })!;
-        const maskImgData = mCtx.createImageData(
-          p.canvasWidthRef.current,
-          p.canvasHeightRef.current,
+
+        // Improvements 2–5: scanline flood fill with perceptual distance,
+        // float weights, edge post-processing
+        const rawFloatMask = magicWandFloodFill(
+          srcData,
+          cw,
+          ch,
+          wx,
+          wy,
+          p.wandToleranceRef.current,
+          p.wandContiguousRef.current,
         );
-        const md = maskImgData.data;
-        // ── Soft flood fill ────────────────────────────────────────────────
-        // Tolerance maps directly to perceptual distance threshold (0–255).
-        const W = p.canvasWidthRef.current;
-        const H = p.canvasHeightRef.current;
-        const tol = p.wandToleranceRef.current; // direct 0–255 scale
-        const contiguous = p.wandContiguousRef.current;
 
-        // Unpremultiply seed pixel color
-        const sidx = (wy * W + wx) * 4;
-        const sa = srcData[sidx + 3];
-        const seedR = sa > 0 ? Math.round((srcData[sidx] * 255) / sa) : 0;
-        const seedG = sa > 0 ? Math.round((srcData[sidx + 1] * 255) / sa) : 0;
-        const seedB = sa > 0 ? Math.round((srcData[sidx + 2] * 255) / sa) : 0;
+        // Apply edge expansion (pushes selection into anti-aliased line edges)
+        const expandedFloatMask = expandFloatMask(
+          rawFloatMask,
+          cw,
+          ch,
+          p.wandEdgeExpandRef.current,
+        );
 
-        const transitionZone = tol * 0.12;
-        const lowerBound = tol - transitionZone;
-        const upperBound = tol + transitionZone;
+        // Apply grow/shrink (on float mask)
+        const grownFloatMask = growShrinkFloatMask(
+          expandedFloatMask,
+          cw,
+          ch,
+          p.wandGrowShrinkRef.current,
+        );
 
-        // Helper: compute weight (0.0–1.0) for a pixel at flat index i
-        const pixelWeight = (i: number): number => {
-          const pi = i * 4;
-          const a = srcData[pi + 3];
-          if (a === 0) return 0;
-          const r = Math.round((srcData[pi] * 255) / a);
-          const g = Math.round((srcData[pi + 1] * 255) / a);
-          const b = Math.round((srcData[pi + 2] * 255) / a);
-          const dist = perceptualColorDistance(r, g, b, seedR, seedG, seedB);
-          if (dist <= lowerBound) return 1.0;
-          if (dist >= upperBound) return 0.0;
-          return 1.0 - (dist - lowerBound) / (2 * transitionZone);
-        };
-
-        const floatMask = new Float32Array(W * H);
-
-        if (contiguous) {
-          // BFS from tap position
-          const visited = new Uint8Array(W * H);
-          const queue: number[] = [wy * W + wx];
-          let head = 0;
-          while (head < queue.length) {
-            const pos = queue[head++];
-            if (visited[pos]) continue;
-            visited[pos] = 1;
-            const x = pos % W;
-            const y = Math.floor(pos / W);
-            const w = pixelWeight(pos);
-            if (w <= 0) continue;
-            floatMask[pos] = w;
-            const neighbors = [
-              x > 0 ? pos - 1 : -1,
-              x < W - 1 ? pos + 1 : -1,
-              y > 0 ? pos - W : -1,
-              y < H - 1 ? pos + W : -1,
-            ];
-            for (const nb of neighbors) {
-              if (nb >= 0 && !visited[nb]) queue.push(nb);
-            }
-          }
-        } else {
-          // Non-contiguous: scan entire canvas
-          for (let i = 0; i < W * H; i++) {
-            floatMask[i] = pixelWeight(i);
-          }
-        }
-
-        // ── Hard boundary penalty (Fix 2d) ─────────────────────────────────
-        // Reduce weight at anti-aliased pixels near hard color boundaries
-        const penalized = new Float32Array(floatMask);
-        for (let y = 0; y < H; y++) {
-          for (let x = 0; x < W; x++) {
-            const pos = y * W + x;
-            if (floatMask[pos] <= 0) continue;
-            const pi = pos * 4;
-            const pa = srcData[pi + 3];
-            if (pa === 0) continue;
-            const pr = Math.round((srcData[pi] * 255) / pa);
-            const pg = Math.round((srcData[pi + 1] * 255) / pa);
-            const pb = Math.round((srcData[pi + 2] * 255) / pa);
-
-            let nearHardBoundary = false;
-            const ns = [
-              x > 0 ? pos - 1 : -1,
-              x < W - 1 ? pos + 1 : -1,
-              y > 0 ? pos - W : -1,
-              y < H - 1 ? pos + W : -1,
-            ];
-            for (const nb of ns) {
-              if (nb < 0) continue;
-              const npi = nb * 4;
-              const na = srcData[npi + 3];
-              if (na === 0) continue;
-              const nr = Math.round((srcData[npi] * 255) / na);
-              const ng = Math.round((srcData[npi + 1] * 255) / na);
-              const nbCol = Math.round((srcData[npi + 2] * 255) / na);
-              const distToSeed = perceptualColorDistance(
-                nr,
-                ng,
-                nbCol,
-                seedR,
-                seedG,
-                seedB,
-              );
-              const distToPixel = perceptualColorDistance(
-                nr,
-                ng,
-                nbCol,
-                pr,
-                pg,
-                pb,
-              );
-              if (distToSeed > tol * 2.0 && distToPixel > 50) {
-                nearHardBoundary = true;
-                break;
-              }
-            }
-            if (nearHardBoundary) penalized[pos] *= 0.5;
-          }
-        }
-
-        // ── Erosion pass (Fix 2d continued) — 1px edge shrink ─────────────
-        const eroded = new Float32Array(penalized);
-        for (let y = 0; y < H; y++) {
-          for (let x = 0; x < W; x++) {
-            const pos = y * W + x;
-            if (penalized[pos] <= 0) continue;
-            const ns2 = [
-              x > 0 ? pos - 1 : -1,
-              x < W - 1 ? pos + 1 : -1,
-              y > 0 ? pos - W : -1,
-              y < H - 1 ? pos + W : -1,
-            ];
-            for (const nb of ns2) {
-              if (nb < 0 || penalized[nb] <= 0.05) {
-                eroded[pos] *= 0.4;
-                break;
-              }
-            }
-          }
-        }
-
-        // ── Edge blur (Fix 2c) ─────────────────────────────────────────────
-        const blurred = blurEdgesOnly(eroded, W, H, 1);
-
-        // ── Grow/Shrink on binary representation then convert back ─────────
-        const growShrinkPx = p.wandGrowShrinkRef.current;
-        let finalMaskCanvas: HTMLCanvasElement;
-        if (growShrinkPx !== 0) {
-          // Convert float mask to binary Uint8Array for growShrinkMask
-          const binaryMask = new Uint8Array(W * H);
-          for (let i = 0; i < W * H; i++) {
-            binaryMask[i] = blurred[i] >= 0.5 ? 1 : 0;
-          }
-          const grown = growShrinkMask(binaryMask, W, H, growShrinkPx);
-          // Convert grown binary back to float for floatMaskToCanvas
-          const grownFloat = new Float32Array(W * H);
-          for (let i = 0; i < W * H; i++) {
-            // Blend: if a pixel was grown into, give it weight 0.8; if already selected, keep its weight
-            if (grown[i]) {
-              grownFloat[i] = binaryMask[i] ? blurred[i] : 0.8;
-            }
-          }
-          finalMaskCanvas = floatMaskToCanvas(grownFloat, W, H);
-        } else {
-          finalMaskCanvas = floatMaskToCanvas(blurred, W, H);
-        }
-
-        // Copy finalMaskCanvas pixel data into maskImgData for shift-key union below
-        const finalCtx = finalMaskCanvas.getContext("2d", {
-          willReadFrequently: !isIPad,
-        });
-        if (finalCtx) {
-          const fd = finalCtx.getImageData(0, 0, W, H).data;
-          for (let i = 0; i < fd.length; i++) {
-            md[i] = fd[i];
-          }
-        }
-        if (e.shiftKey && p.selectionMaskRef.current) {
+        // Read existing float mask for modifier key combinations
+        const existingFloatMask = new Float32Array(cw * ch);
+        if (p.selectionMaskRef.current && p.selectionActiveRef.current) {
           const existCtx = p.selectionMaskRef.current.getContext("2d", {
             willReadFrequently: !isIPad,
           });
           if (existCtx) {
-            const existData = existCtx.getImageData(
-              0,
-              0,
-              p.canvasWidthRef.current,
-              p.canvasHeightRef.current,
-            ).data;
-            for (let i = 3; i < md.length; i += 4) {
-              if (existData[i] > 128) md[i] = 255;
+            const existData = existCtx.getImageData(0, 0, cw, ch).data;
+            for (let i = 0; i < cw * ch; i++) {
+              existingFloatMask[i] = existData[i * 4 + 3] / 255;
             }
           }
         }
+
+        // Combine masks based on modifier keys (at Float32Array level)
+        const finalFloatMask = new Float32Array(cw * ch);
+        const shiftHeld = e.shiftKey;
+        const altHeld = e.altKey;
+        if (shiftHeld && altHeld) {
+          // Intersect: min of existing and new
+          for (let i = 0; i < cw * ch; i++) {
+            finalFloatMask[i] = Math.min(
+              existingFloatMask[i],
+              grownFloatMask[i],
+            );
+          }
+        } else if (shiftHeld) {
+          // Union: max of existing and new
+          for (let i = 0; i < cw * ch; i++) {
+            finalFloatMask[i] = Math.max(
+              existingFloatMask[i],
+              grownFloatMask[i],
+            );
+          }
+        } else if (altHeld) {
+          // Subtract: existing minus new, clamped to 0
+          for (let i = 0; i < cw * ch; i++) {
+            finalFloatMask[i] = Math.max(
+              0,
+              existingFloatMask[i] - grownFloatMask[i],
+            );
+          }
+        } else {
+          // Replace
+          for (let i = 0; i < cw * ch; i++) {
+            finalFloatMask[i] = grownFloatMask[i];
+          }
+        }
+
+        // Rasterize Float32Array to selection mask canvas
+        // alpha channel = weight × 255 (preserves float precision in selection system)
+        const maskCanvas = document.createElement("canvas");
+        maskCanvas.width = cw;
+        maskCanvas.height = ch;
+        const mCtx = maskCanvas.getContext("2d", {
+          willReadFrequently: !isIPad,
+        })!;
+        const maskImgData = mCtx.createImageData(cw, ch);
+        const md = maskImgData.data;
+        for (let i = 0; i < cw * ch; i++) {
+          const alpha = Math.round(finalFloatMask[i] * 255);
+          if (alpha > 0) {
+            const pi = i * 4;
+            md[pi] = 255; // R
+            md[pi + 1] = 255; // G
+            md[pi + 2] = 255; // B
+            md[pi + 3] = alpha;
+          }
+        }
+
         mCtx.putImageData(maskImgData, 0, 0);
         p.selectionMaskRef.current = maskCanvas;
         const wandBounds = computeMaskBounds(maskCanvas);
@@ -3059,6 +3886,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           p.selectionBeforeRef.current = null;
         }
       }
+      // Restore keyboard focus to canvas so hotkeys (e.g. V) work immediately
+      p.displayCanvasRef.current?.focus();
       return;
     }
 
@@ -3217,15 +4046,32 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         );
         if (_lineActiveLayer?.isRuler) return;
       }
+      // Fix A — instantiate a fresh 1€ Filter for this line stroke (pen only)
+      if (e.pointerType === "pen") {
+        linePressureFilterRef.current = new OneEuroFilter(
+          PRESSURE_FILTER_MIN_CUTOFF,
+          PRESSURE_FILTER_BETA,
+        );
+      } else {
+        linePressureFilterRef.current = null;
+      }
+      // Normalize pressure by pointer type (same logic as brush pointer-down).
       const rawPressureLine =
-        e.pointerType === "mouse"
-          ? 1.0
-          : Math.max(0, Math.min(1, e.pressure || 1.0));
+        e.pointerType === "pen"
+          ? Math.max(0, Math.min(1.0, e.pressure))
+          : e.pointerType === "touch"
+            ? Math.min(e.pressure / 0.5, 1.0)
+            : 1.0; // mouse
+      // Fix A + Bug 1: seed the filter with the real first pressure value.
+      const startPressure =
+        e.pointerType === "pen" && linePressureFilterRef.current
+          ? linePressureFilterRef.current.filter(rawPressureLine, e.timeStamp)
+          : rawPressureLine;
       lineIsDrawingRef.current = true;
       lineStartPosRef.current = pos;
-      lineStartPressureRef.current = rawPressureLine;
-      // Initialize continuous pressure sampling — record initial pressure at dist=0
-      linePressureSamplesRef.current = [{ dist: 0, pressure: rawPressureLine }];
+      lineStartPressureRef.current = startPressure;
+      // Initialize continuous pressure sampling — record filtered initial pressure at dist=0
+      linePressureSamplesRef.current = [{ dist: 0, pressure: startPressure }];
       lineFarthestDistanceRef.current = 0;
       // Snapshot for undo
       const _lineCtx = lc.getContext("2d", { willReadFrequently: !isIPad });
@@ -3278,9 +4124,21 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           x: 0,
           y: 0,
         };
+        // FIX 1: Allocate per-stroke working buffers now (not permanently).
+        // initSmearBuffers reads the canvas once to populate _smearPaintData,
+        // then all three buffers are kept alive only for this stroke and
+        // nulled at pointer-up via clearSmearBuffers().
+        initSmearBuffers(lc, _smearSnapCtx);
       }
       p.strokeSnapshotPendingRef.current = false;
       p.strokeDirtyRectRef.current = null;
+
+      // FIX 2: Capture the before-snapshot for single-layer smear undo.
+      // We capture the full canvas now so we can crop it to the dirty rect at pointer-up.
+      // _smearUndoBefore is nulled at pointer-up after the undo entry is pushed.
+      _smearUndoBefore = p.strokeStartSnapshotRef.current?.pixels ?? null;
+      _smearUndoDirtyRect = null;
+
       // For multi-layer smudge: capture per-layer before-snapshots so pen_up can push
       // a history entry for each affected layer (same pattern as multi-layer liquify).
       const _smudgeSelDown = getEffectivelySelectedLayers(
@@ -3302,6 +4160,10 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           }
         }
         p.liquifyMultiBeforeSnapshotsRef.current = newSmudgeSnaps;
+        // Multi-layer path uses the multi-snapshots map, not _smearUndoBefore.
+        // Still reset the dirty rect so pointer-move tracking is fresh for this stroke.
+        _smearUndoBefore = null;
+        _smearUndoDirtyRect = null;
       } else {
         p.liquifyMultiBeforeSnapshotsRef.current.clear();
       }
@@ -3327,18 +4189,18 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     })();
 
     if (tool === "liquify" && liqLcResolved) {
-      // Set the single authoritative stroke-active flag (A4 fix).
-      // scheduleComposite in useCompositing checks this flag and skips any
-      // trailing RAF from the previous stroke — no RAF cancellation needed here.
+      // Cancel any pending composite RAF from the previous stroke before
+      // setting the stroke-active flag, so the trailing RAF cannot overwrite
+      // the first blitLiquifyPreview frame with pre-warp layer content.
+      cancelScheduledComposite();
+      // Set the stroke-active flag so compositing suppresses pre-warp renders.
       setLiquifyStrokeActive(true);
 
-      const _liqSnapCtx = liqLcResolved.getContext("2d", {
+      const _liqCtx = liqLcResolved.getContext("2d", {
         willReadFrequently: !isIPad,
       });
-      if (_liqSnapCtx) {
-        // Determine the working layer set based on scope:
-        //   "all-visible" → every visible layer in the tree (regardless of selection)
-        //   "active"       → only the effectively selected layers
+      if (_liqCtx) {
+        // Determine working layers based on scope
         const _liqScope = p.liquifyScopeRef.current;
         const _liqWorkingLayers =
           _liqScope === "all-visible"
@@ -3352,6 +4214,12 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
 
         const _liqIsMulti = _liqWorkingLayers.length > 1;
         if (_liqIsMulti) {
+          // All Visible multi-layer: per-layer independent GPU pipeline
+          const canvasPosDown = p.lastPosRef.current ?? { x: 0, y: 0 };
+          const _brushRadius = p.liquifySizeRef.current / 2;
+          const _cx = canvasPosDown.x;
+          const _cy = canvasPosDown.y;
+
           const newSnapshots = new Map<string, ImageData>();
           const newBatchLayers: Array<{
             ctx: CanvasRenderingContext2D;
@@ -3359,49 +4227,226 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             layerId: string;
             isRuler?: boolean;
           }> = [];
+
           for (const layerItem of _liqWorkingLayers) {
+            if ((layerItem as { isRuler?: boolean }).isRuler === true) continue;
             const lid2 = layerItem.id;
             const lc2 = p.layerCanvasesRef.current.get(lid2);
             if (!lc2) continue;
             const ctx2 = lc2.getContext("2d", { willReadFrequently: !isIPad });
             if (!ctx2) continue;
+
+            // Alpha check: skip layers with no visible pixels under the brush cursor
+            const _acX0 = Math.max(0, Math.floor(_cx - _brushRadius));
+            const _acY0 = Math.max(0, Math.floor(_cy - _brushRadius));
+            const _acW = Math.min(
+              lc2.width - _acX0,
+              Math.ceil(_brushRadius * 2),
+            );
+            const _acH = Math.min(
+              lc2.height - _acY0,
+              Math.ceil(_brushRadius * 2),
+            );
+            if (_acW > 0 && _acH > 0) {
+              const _acData = ctx2.getImageData(_acX0, _acY0, _acW, _acH);
+              let _hasAlpha = false;
+              for (let _ai = 3; _ai < _acData.data.length; _ai += 4) {
+                if (_acData.data[_ai] > 0) {
+                  _hasAlpha = true;
+                  break;
+                }
+              }
+              if (!_hasAlpha) continue;
+            }
+
             const snap2 = ctx2.getImageData(0, 0, lc2.width, lc2.height);
             newSnapshots.set(lid2, snap2);
             newBatchLayers.push({
               ctx: ctx2,
               snapshot: snap2,
               layerId: lid2,
-              isRuler: (layerItem as { isRuler?: boolean }).isRuler === true,
+              isRuler: false,
             });
+            // Init independent GPU pipeline for this layer
+            if (p.webglBrushRef.current) {
+              p.webglBrushRef.current.initLiquifyGPUForLayer(
+                lid2,
+                lc2.width,
+                lc2.height,
+                snap2,
+              );
+            }
           }
+
           p.liquifyMultiBeforeSnapshotsRef.current = newSnapshots;
           p.liquifyBeforeSnapshotRef.current = null;
-          // Store batch at stroke-start so pointer-move can reuse without rebuilding
           _liqBatchLayersRef.current = newBatchLayers;
+
+          // Pre-bake background and foreground buffers for composite preview.
+          // For multi-layer: bg = all layers below topmost affected layer,
+          // fg = all layers above topmost affected layer (topmost = lowest index).
+          // This is used purely for the live preview — not for per-layer warping.
+          if (newBatchLayers.length > 0 && p.webglBrushRef.current) {
+            const _mlCw = p.canvasWidthRef.current;
+            const _mlCh = p.canvasHeightRef.current;
+            const _mlAllLayers = p.layersRef.current;
+            const _mlAffectedIds = new Set(
+              newBatchLayers.map((b) => b.layerId),
+            );
+            // Find the topmost (lowest index) affected layer index
+            let _mlTopmostIdx = _mlAllLayers.length - 1;
+            for (let _ii = 0; _ii < _mlAllLayers.length; _ii++) {
+              if (_mlAffectedIds.has(_mlAllLayers[_ii].id)) {
+                _mlTopmostIdx = _ii;
+                break;
+              }
+            }
+            // Find the bottommost (highest index) affected layer index
+            let _mlBottommostIdx = 0;
+            for (let _ii = _mlAllLayers.length - 1; _ii >= 0; _ii--) {
+              if (_mlAffectedIds.has(_mlAllLayers[_ii].id)) {
+                _mlBottommostIdx = _ii;
+                break;
+              }
+            }
+
+            // Background: all layers below the bottommost affected layer (higher index)
+            const _mlBgCanvas = new OffscreenCanvas(_mlCw, _mlCh);
+            const _mlBgCtx = _mlBgCanvas.getContext(
+              "2d",
+            ) as OffscreenCanvasRenderingContext2D;
+            _mlBgCtx.clearRect(0, 0, _mlCw, _mlCh);
+            for (
+              let _ii = _mlAllLayers.length - 1;
+              _ii > _mlBottommostIdx;
+              _ii--
+            ) {
+              const _mlLyr = _mlAllLayers[_ii];
+              if (!_mlLyr.visible) continue;
+              if (_mlLyr.type === "group" || _mlLyr.type === "end_group")
+                continue;
+              const _mlLyrC = p.layerCanvasesRef.current.get(_mlLyr.id);
+              if (!_mlLyrC) continue;
+              _mlBgCtx.globalAlpha =
+                (_mlLyr as { opacity?: number }).opacity ?? 1;
+              _mlBgCtx.globalCompositeOperation =
+                ((_mlLyr as { blendMode?: string })
+                  .blendMode as GlobalCompositeOperation) || "source-over";
+              _mlBgCtx.drawImage(_mlLyrC, 0, 0);
+            }
+            _mlBgCtx.globalAlpha = 1;
+            _mlBgCtx.globalCompositeOperation = "source-over";
+            _liqBgBufferRef.current = _mlBgCanvas;
+
+            // Foreground: all layers above the topmost affected layer (lower index)
+            const _mlFgCanvas = new OffscreenCanvas(_mlCw, _mlCh);
+            const _mlFgCtx = _mlFgCanvas.getContext(
+              "2d",
+            ) as OffscreenCanvasRenderingContext2D;
+            _mlFgCtx.clearRect(0, 0, _mlCw, _mlCh);
+            for (let _ii = _mlTopmostIdx - 1; _ii >= 0; _ii--) {
+              const _mlLyr = _mlAllLayers[_ii];
+              if (!_mlLyr.visible) continue;
+              if (_mlLyr.type === "group" || _mlLyr.type === "end_group")
+                continue;
+              const _mlLyrC = p.layerCanvasesRef.current.get(_mlLyr.id);
+              if (!_mlLyrC) continue;
+              _mlFgCtx.globalAlpha =
+                (_mlLyr as { opacity?: number }).opacity ?? 1;
+              _mlFgCtx.globalCompositeOperation =
+                ((_mlLyr as { blendMode?: string })
+                  .blendMode as GlobalCompositeOperation) || "source-over";
+              _mlFgCtx.drawImage(_mlLyrC, 0, 0);
+            }
+            _mlFgCtx.globalAlpha = 1;
+            _mlFgCtx.globalCompositeOperation = "source-over";
+            _liqFgBufferRef.current = _mlFgCanvas;
+          }
         } else {
-          p.liquifyBeforeSnapshotRef.current = _liqSnapCtx.getImageData(
-            0,
-            0,
-            liqLcResolved.width,
-            liqLcResolved.height,
+          // Single-layer GPU path: capture frozen source, init GPU pipeline
+          const canvasPosDown = p.lastPosRef.current ?? { x: 0, y: 0 };
+          liquifyPointerDown(
+            _liqCtx,
+            canvasPosDown.x,
+            canvasPosDown.y,
+            layerId,
           );
+          // Upload the frozen source to GPU — initLiquifyGPU reads from _liqSource snapshot
+          const liqLcCanvas = liqLcResolved;
+          if (liqLcCanvas && p.webglBrushRef.current) {
+            const snapshot = _liqCtx.getImageData(
+              0,
+              0,
+              liqLcCanvas.width,
+              liqLcCanvas.height,
+            );
+            p.webglBrushRef.current.initLiquifyGPU(
+              liqLcCanvas.width,
+              liqLcCanvas.height,
+              snapshot,
+            );
+
+            // Pre-bake background and foreground layer buffers for preview compositing.
+            // Layer order: high index = bottom of stack, low index = top of stack.
+            // Background = all layers BELOW active (index > activeIdx).
+            // Foreground = all layers ABOVE active (index < activeIdx).
+            const cw = p.canvasWidthRef.current;
+            const ch = p.canvasHeightRef.current;
+            const allLayers = p.layersRef.current;
+            const activeIdx = allLayers.findIndex((l) => l.id === layerId);
+
+            // Background buffer: layers below active (higher index), drawn bottom-to-top
+            const bgCanvas = new OffscreenCanvas(cw, ch);
+            const bgCtx = bgCanvas.getContext(
+              "2d",
+            ) as OffscreenCanvasRenderingContext2D;
+            bgCtx.clearRect(0, 0, cw, ch);
+            for (let i = allLayers.length - 1; i > activeIdx; i--) {
+              const lyr = allLayers[i];
+              if (!lyr.visible) continue;
+              if (lyr.type === "group" || lyr.type === "end_group") continue;
+              const lyrC = p.layerCanvasesRef.current.get(lyr.id);
+              if (!lyrC) continue;
+              bgCtx.globalAlpha = (lyr as { opacity?: number }).opacity ?? 1;
+              bgCtx.globalCompositeOperation =
+                ((lyr as { blendMode?: string })
+                  .blendMode as GlobalCompositeOperation) || "source-over";
+              bgCtx.drawImage(lyrC, 0, 0);
+            }
+            bgCtx.globalAlpha = 1;
+            bgCtx.globalCompositeOperation = "source-over";
+            _liqBgBufferRef.current = bgCanvas;
+
+            // Foreground buffer: layers above active (lower index), drawn bottom-to-top
+            // (iterate from activeIdx-1 down to 0 so we layer them in composite order)
+            const fgCanvas = new OffscreenCanvas(cw, ch);
+            const fgCtx = fgCanvas.getContext(
+              "2d",
+            ) as OffscreenCanvasRenderingContext2D;
+            fgCtx.clearRect(0, 0, cw, ch);
+            for (let i = activeIdx - 1; i >= 0; i--) {
+              const lyr = allLayers[i];
+              if (!lyr.visible) continue;
+              if (lyr.type === "group" || lyr.type === "end_group") continue;
+              const lyrC = p.layerCanvasesRef.current.get(lyr.id);
+              if (!lyrC) continue;
+              fgCtx.globalAlpha = (lyr as { opacity?: number }).opacity ?? 1;
+              fgCtx.globalCompositeOperation =
+                ((lyr as { blendMode?: string })
+                  .blendMode as GlobalCompositeOperation) || "source-over";
+              fgCtx.drawImage(lyrC, 0, 0);
+            }
+            fgCtx.globalAlpha = 1;
+            fgCtx.globalCompositeOperation = "source-over";
+            _liqFgBufferRef.current = fgCanvas;
+          }
+          p.liquifyBeforeSnapshotRef.current = null;
           p.liquifyMultiBeforeSnapshotsRef.current.clear();
           _liqBatchLayersRef.current = [];
         }
-        // Store multi/stride state for reuse in pointer-move
-        _liqIsMultiRef.current = _liqIsMulti;
-        _liqStrideRef.current = _liqWorkingLayers.length >= 3 ? 2 : 1;
 
-        const snapData = _liqSnapCtx.getImageData(
-          0,
-          0,
-          liqLcResolved.width,
-          liqLcResolved.height,
-        );
-        initLiquifyField(snapData, liqLcResolved.width, liqLcResolved.height);
+        _liqIsMultiRef.current = _liqIsMulti;
       }
-      if (p.liquifyHoldIntervalRef.current)
-        clearInterval(p.liquifyHoldIntervalRef.current);
     }
     if (p.webglBrushRef.current) {
       p.webglBrushRef.current.clear();
@@ -3428,7 +4473,33 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
 
     const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
     if (ctx) {
-      const rawPressure = e.pointerType === "mouse" ? 1.0 : (e.pressure ?? 0.5);
+      // ── 1€ Filter setup at stroke start ──────────────────────────────────
+      // Create a fresh filter for pen input; null for mouse/touch (no filtering needed).
+      if (e.pointerType === "pen") {
+        pressureFilterRef.current = new OneEuroFilter(
+          PRESSURE_FILTER_MIN_CUTOFF,
+          PRESSURE_FILTER_BETA,
+        );
+      } else {
+        pressureFilterRef.current = null;
+      }
+
+      // Normalize pressure by pointer type:
+      //   pen   → use as-is, clamped to [0,1] (handles Linux/Wacom GTK values > 1.0)
+      //   mouse → always 1.0 (browsers report 0.5; we want full pressure)
+      //   touch → divide by 0.5 and clamp (browsers report max 0.5 for touch/finger)
+      // This normalization happens before any filter so all downstream code sees [0,1].
+      const rawPressure =
+        e.pointerType === "pen"
+          ? Math.max(0, Math.min(1.0, e.pressure))
+          : e.pointerType === "touch"
+            ? Math.min(e.pressure / 0.5, 1.0)
+            : 1.0; // mouse
+      // Bug 1 fix: seed the 1€ Filter with the actual first-event pressure so
+      // xPrev starts at the real input — no cold-start spike on the first move event.
+      if (e.pointerType === "pen" && pressureFilterRef.current) {
+        pressureFilterRef.current.filter(rawPressure, e.timeStamp);
+      }
       p.smoothedPressureRef.current = rawPressure;
       p.prevPrimaryPressureRef.current = rawPressure;
       const pressure = p.smoothedPressureRef.current;
@@ -3561,13 +4632,6 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     const isIPad = p.isIPadRef.current;
     p.currentPointerTypeRef.current = e.pointerType;
     p.pointerScreenPosRef.current = { x: e.clientX, y: e.clientY };
-    // ── Diagnostic: confirm coalesced event delivery for Apple Pencil ───────
-    if (e.pointerType === "pen") {
-      const _diagCoalesced = e.getCoalescedEvents?.() ?? [e];
-      console.log(
-        `[Pencil] pointermove — coalesced count: ${_diagCoalesced.length}, primary: (${e.clientX.toFixed(1)}, ${e.clientY.toFixed(1)})`,
-      );
-    }
     {
       const sc = p.softwareCursorRef.current;
       if (sc) {
@@ -4194,7 +5258,11 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             newX = pX;
             newW = origBounds.x + origBounds.w + dx2 - pX;
           }
-          if (e.shiftKey && origBounds.w > 0 && origBounds.h > 0) {
+          if (
+            (p.transformProportionalRef.current ? !e.shiftKey : e.shiftKey) &&
+            origBounds.w > 0 &&
+            origBounds.h > 0
+          ) {
             const aspect = origBounds.w / origBounds.h;
             if (
               Math.abs(newW - origBounds.w) >= Math.abs(newH - origBounds.h)
@@ -4295,17 +5363,36 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       if (!_lineStart) return;
 
       // ── Continuous pressure sampling ────────────────────────────────────
-      const _lpCurrentPressure =
-        e.pointerType === "mouse"
-          ? 1.0
-          : Math.max(0, Math.min(1, e.pressure || 1.0));
+      // Normalize pressure by pointer type (same as pointer-down).
+      const _lpRawPressure =
+        e.pointerType === "pen"
+          ? Math.max(0, Math.min(1.0, e.pressure))
+          : e.pointerType === "touch"
+            ? Math.min(e.pressure / 0.5, 1.0)
+            : 1.0; // mouse
+      let _lpCurrentPressure =
+        e.pointerType === "pen" && linePressureFilterRef.current
+          ? linePressureFilterRef.current.filter(_lpRawPressure, e.timeStamp)
+          : _lpRawPressure;
+      // Fix C — clamp max pressure delta between adjacent samples
+      if (linePressureSamplesRef.current.length > 0) {
+        const _lpPrevPressure =
+          linePressureSamplesRef.current[
+            linePressureSamplesRef.current.length - 1
+          ].pressure;
+        const _lpDelta = _lpCurrentPressure - _lpPrevPressure;
+        if (Math.abs(_lpDelta) > MAX_PRESSURE_DELTA) {
+          _lpCurrentPressure =
+            _lpPrevPressure + Math.sign(_lpDelta) * MAX_PRESSURE_DELTA;
+        }
+      }
       const _lpMoveDx = _linePos.x - _lineStart.x;
       const _lpMoveDy = _linePos.y - _lineStart.y;
       const _lpCurrentDist = Math.sqrt(
         _lpMoveDx * _lpMoveDx + _lpMoveDy * _lpMoveDy,
       );
       if (_lpCurrentDist > lineFarthestDistanceRef.current) {
-        // Line is extending — add a new sample at the current distance
+        // Line is extending — add a new filtered+clamped sample at the current distance
         lineFarthestDistanceRef.current = _lpCurrentDist;
         linePressureSamplesRef.current.push({
           dist: _lpCurrentDist,
@@ -4334,20 +5421,30 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         ? 1.0
         : _lpBaseOpacity;
       // Compute line geometry
-      const _lpDx = _linePos.x - _lineStart.x;
-      const _lpDy = _linePos.y - _lineStart.y;
-      const _lpLineDist = Math.sqrt(_lpDx * _lpDx + _lpDy * _lpDy);
-      const _lpStrokeAngle = Math.atan2(_lpDy, _lpDx);
+      // Fix D — use a smoothed copy of samples for preview rendering
+      const _lpSamplesForPreview = smoothLinePressureSamples(
+        linePressureSamplesRef.current,
+      );
+      const _lpRawDx = _linePos.x - _lineStart.x;
+      const _lpRawDy = _linePos.y - _lineStart.y;
+      const _lpLineDist = Math.sqrt(_lpRawDx * _lpRawDx + _lpRawDy * _lpRawDy);
+      // Shift-snap: snap angle to nearest LINE_SNAP_DEGREES increment when Shift held
+      let _lpStrokeAngle = Math.atan2(_lpRawDy, _lpRawDx);
+      let _lpDx = _lpRawDx;
+      let _lpDy = _lpRawDy;
+      if (shiftHeldRef.current && _lpLineDist > 0.5) {
+        const _lpSnapRad = (LINE_SNAP_DEGREES * Math.PI) / 180;
+        _lpStrokeAngle = Math.round(_lpStrokeAngle / _lpSnapRad) * _lpSnapRad;
+        _lpDx = Math.cos(_lpStrokeAngle) * _lpLineDist;
+        _lpDy = Math.sin(_lpStrokeAngle) * _lpLineDist;
+      }
       const _lpSpacingPixels = Math.max(
         0.5,
         (_lpSettings.spacing / 100) * _lpBaseSize,
       );
       if (_lpLineDist < 0.5) {
         // Single stamp for near-zero-length drag
-        const _lpPressure = interpolateLinePressure(
-          linePressureSamplesRef.current,
-          0,
-        );
+        const _lpPressure = interpolateLinePressure(_lpSamplesForPreview, 0);
         const _lpCurved = evalPressureCurve(
           _lpPressure,
           p.universalPressureCurveRef.current as [
@@ -4390,7 +5487,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             _lineStart.y +
             _lpDy * (_lpLineDist > 0 ? _lpAccDist / _lpLineDist : 0);
           const _lpPressure = interpolateLinePressure(
-            linePressureSamplesRef.current,
+            _lpSamplesForPreview,
             _lpAccDist,
           );
           const _lpCurved = evalPressureCurve(
@@ -4497,7 +5594,13 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       const _smearFlipped = p.isFlippedRef.current;
       const baseStrength = settings.smearStrength ?? 0.8;
       const _smearPrevPrimary = p.prevPrimaryPressureRef.current;
-      const _smearCurrentPrimary = e.pressure > 0 ? e.pressure : 0.5;
+      // Normalize smudge pressure by pointer type.
+      const _smearCurrentPrimary =
+        e.pointerType === "pen"
+          ? Math.max(0, Math.min(1.0, e.pressure))
+          : e.pointerType === "touch"
+            ? Math.min(e.pressure / 0.5, 1.0)
+            : 1.0; // mouse
       for (let i = 0; i < smearCoalescedEvents.length; i++) {
         const sce = smearCoalescedEvents[i];
         let scePos = _getCanvasPosWithRect(
@@ -4616,6 +5719,44 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         }
       }
       p.prevPrimaryPressureRef.current = _smearCurrentPrimary;
+      // FIX 2: Expand the smear undo dirty rect to cover all brush positions this move.
+      // We use strokeDirtyRectRef (already tracked by pointer-down canvas region capture)
+      // but smear doesn't call stampWebGL, so we expand _smearUndoDirtyRect manually.
+      // Track dirty rect for both single-layer (_smearUndoBefore path) AND multi-layer
+      // (liquifyMultiBeforeSnapshotsRef path) so both produce accurate dirty-rect undo entries.
+      {
+        const _smearHalfSize = activeSize / 2;
+        const _lastSmearPos = p.lastPosRef.current;
+        if (_lastSmearPos) {
+          const nx = _lastSmearPos.x;
+          const ny = _lastSmearPos.y;
+          if (_smearUndoDirtyRect === null) {
+            _smearUndoDirtyRect = {
+              x: nx - _smearHalfSize,
+              y: ny - _smearHalfSize,
+              w: activeSize,
+              h: activeSize,
+            };
+          } else {
+            const nx0 = Math.min(_smearUndoDirtyRect.x, nx - _smearHalfSize);
+            const ny0 = Math.min(_smearUndoDirtyRect.y, ny - _smearHalfSize);
+            const nx1 = Math.max(
+              _smearUndoDirtyRect.x + _smearUndoDirtyRect.w,
+              nx + _smearHalfSize,
+            );
+            const ny1 = Math.max(
+              _smearUndoDirtyRect.y + _smearUndoDirtyRect.h,
+              ny + _smearHalfSize,
+            );
+            _smearUndoDirtyRect = {
+              x: nx0,
+              y: ny0,
+              w: nx1 - nx0,
+              h: ny1 - ny0,
+            };
+          }
+        }
+      }
       p.smearDirtyRef.current = true;
       if (!p.smearRafRef.current) {
         p.smearRafRef.current = requestAnimationFrame(() => {
@@ -4645,8 +5786,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         });
       }
     } else if (tool === "liquify") {
-      // Reuse the canvas for the active layer (or first visible layer as fallback).
-      // The actual per-layer rendering uses _liqBatchLayersRef built at pointer-down.
+      // Resolve the active layer canvas (or first batch layer as fallback)
       let liqLc = p.layerCanvasesRef.current.get(layerId);
       if (!liqLc) {
         const _fallbackBatch = _liqBatchLayersRef.current;
@@ -4662,18 +5802,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             coalescedEvents && coalescedEvents.length > 0
               ? coalescedEvents
               : [e];
-          // Use canvas rect (not container rect) — correct for all zoom levels
-          // and unaffected by sibling canvas insertions.
           const containerRect = display.getBoundingClientRect();
-          // Use the multi/stride flags captured at stroke-start — fixed for the
-          // entire stroke duration, no per-event recalculation.
           const _liqMoveIsMulti = _liqIsMultiRef.current;
-          const _liqStride = _liqStrideRef.current;
-          // Pre-read the batch array once for the whole pointer-move call
           const _liqBatch = _liqBatchLayersRef.current;
-
-          // Reset per-frame dirty rect at the start of processing this batch
-          resetLiquifyFrameDirty();
 
           const lastEvtIndex = evts.length - 1;
           for (let _evtIdx = 0; _evtIdx < evts.length; _evtIdx++) {
@@ -4686,7 +5817,7 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               if (_liqThrottleCounterRef.current % 2 !== 0) continue;
             }
 
-            let cePos = _getCanvasPosWithRect(
+            const cePos = _getCanvasPosWithRect(
               ce.clientX,
               ce.clientY,
               containerRect,
@@ -4696,61 +5827,198 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             );
             const cePrev = p.lastPosRef.current;
             if (cePrev) {
+              const radius = p.liquifySizeRef.current / 2;
+              const strength = p.liquifyStrengthRef.current;
+              const hardness = p.liquifyHardnessRef?.current ?? 0;
+              const stretch = p.liquifyStretchRef?.current ?? 1.0;
+              const spacing = Math.max(1, radius * 0.04);
               const ddx = cePos.x - cePrev.x;
               const ddy = cePos.y - cePrev.y;
               const ddist = Math.sqrt(ddx * ddx + ddy * ddy);
-              const radius = p.liquifySizeRef.current / 2;
-              const spacing = Math.max(1, radius * 0.04);
+
               if (ddist >= spacing) {
-                const ndx = ddist > 0 ? ddx / ddist : 0;
-                const ndy = ddist > 0 ? ddy / ddist : 0;
-
-                // Compute stamp bounds — expand per-frame dirty rect
-                const stampX0 = Math.max(0, Math.floor(cePos.x - radius));
-                const stampY0 = Math.max(0, Math.floor(cePos.y - radius));
-                const stampX1 = Math.min(
-                  getLiquifySnapW() > 0 ? getLiquifySnapW() : liqLc.width,
-                  Math.ceil(cePos.x + radius + 1),
-                );
-                const stampY1 = Math.min(
-                  getLiquifySnapH() > 0 ? getLiquifySnapH() : liqLc.height,
-                  Math.ceil(cePos.y + radius + 1),
-                );
-                expandLiquifyFrameDirty(stampX0, stampY0, stampX1, stampY1);
-
-                // Compute displacement once — reused for all layers
-                updateLiquifyDisplacementField(
-                  cePos.x,
-                  cePos.y,
-                  radius,
-                  p.liquifyStrengthRef.current * 0.6,
-                  ndx,
-                  ndy,
-                );
-
                 if (_liqMoveIsMulti && _liqBatch.length > 0) {
-                  // Apply the same displacement field to every layer in the
-                  // pre-built batch. No merging/compositing — each layer is
-                  // processed and written back independently.
-                  const savedSnapshot = getLiquifySnapshot();
-                  renderLiquifyMultiLayer(_liqBatch, _liqStride);
-                  // Restore global snapshot pointer (renderLiquifyMultiLayer
-                  // may have shifted it while iterating per-layer snapshots)
-                  setLiquifySnapshot(savedSnapshot);
-                  // Invalidate bitmap caches for all rendered layers
-                  for (const batchItem of _liqBatch) {
-                    markLayerBitmapDirty(batchItem.layerId);
+                  // Multi-layer All Visible: GPU warp per layer independently
+                  // Use same displacement formula as single-layer path
+                  const _mlPrevX = p.lastPosRef.current?.x ?? cePos.x;
+                  const _mlPrevY = p.lastPosRef.current?.y ?? cePos.y;
+                  const _mlDx = cePos.x - _mlPrevX;
+                  const _mlDy = cePos.y - _mlPrevY;
+                  const _mlLen = Math.sqrt(_mlDx * _mlDx + _mlDy * _mlDy);
+                  if (_mlLen >= 0.5 && p.webglBrushRef.current) {
+                    const _mlNormDx = _mlDx / _mlLen;
+                    const _mlNormDy = _mlDy / _mlLen;
+                    const _mlMaxDisp = Math.min(
+                      _mlLen * strength * stretch,
+                      radius * LIQUIFY_MAX_DISP_SCALE * 0.1,
+                    );
+                    if (_mlMaxDisp >= 0.5) {
+                      for (const batchItem of _liqBatch) {
+                        p.webglBrushRef.current.renderLiquifyFrameForLayer(
+                          batchItem.layerId,
+                          cePos.x,
+                          cePos.y,
+                          _mlNormDx,
+                          _mlNormDy,
+                          radius,
+                          _mlMaxDisp,
+                          hardness,
+                        );
+                      }
+
+                      // Preview: composite all layers with GPU output substituted for affected layers
+                      const _mlDisplayCanvas = p.displayCanvasRef.current;
+                      if (_mlDisplayCanvas) {
+                        const _mlDisplayCtx = _mlDisplayCanvas.getContext("2d");
+                        if (_mlDisplayCtx) {
+                          const _mlAllLayers = p.layersRef.current;
+                          const _mlAffectedIds = new Set(
+                            _liqBatch.map((b) => b.layerId),
+                          );
+                          const _mlW = p.canvasWidthRef.current;
+                          const _mlH = p.canvasHeightRef.current;
+
+                          _mlDisplayCtx.clearRect(0, 0, _mlW, _mlH);
+                          if (_liqBgBufferRef.current) {
+                            _mlDisplayCtx.globalAlpha = 1;
+                            _mlDisplayCtx.globalCompositeOperation =
+                              "source-over";
+                            _mlDisplayCtx.drawImage(
+                              _liqBgBufferRef.current,
+                              0,
+                              0,
+                            );
+                          }
+
+                          // Draw all layers in composite order (backwards: high idx = bottom)
+                          for (
+                            let _mlI = _mlAllLayers.length - 1;
+                            _mlI >= 0;
+                            _mlI--
+                          ) {
+                            const _mlLyr = _mlAllLayers[_mlI];
+                            if (!_mlLyr.visible) continue;
+                            if (
+                              _mlLyr.type === "group" ||
+                              _mlLyr.type === "end_group"
+                            )
+                              continue;
+                            const _mlOpacity =
+                              (_mlLyr as { opacity?: number }).opacity ?? 1;
+                            const _mlBlend =
+                              ((_mlLyr as { blendMode?: string })
+                                .blendMode as GlobalCompositeOperation) ||
+                              "source-over";
+                            _mlDisplayCtx.globalAlpha = _mlOpacity;
+                            _mlDisplayCtx.globalCompositeOperation = _mlBlend;
+
+                            if (_mlAffectedIds.has(_mlLyr.id)) {
+                              // Substitute with GPU warp result
+                              const _mlFboData =
+                                p.webglBrushRef.current?.readLiquifyLayerFBO(
+                                  _mlLyr.id,
+                                );
+                              if (_mlFboData) {
+                                const _mlTmpCanvas = new OffscreenCanvas(
+                                  _mlFboData.width,
+                                  _mlFboData.height,
+                                );
+                                const _mlTmpCtx = _mlTmpCanvas.getContext(
+                                  "2d",
+                                ) as OffscreenCanvasRenderingContext2D;
+                                _mlTmpCtx.putImageData(_mlFboData, 0, 0);
+                                _mlDisplayCtx.drawImage(_mlTmpCanvas, 0, 0);
+                              }
+                            } else {
+                              const _mlLyrC = p.layerCanvasesRef.current.get(
+                                _mlLyr.id,
+                              );
+                              if (_mlLyrC)
+                                _mlDisplayCtx.drawImage(_mlLyrC, 0, 0);
+                            }
+                          }
+                          _mlDisplayCtx.globalAlpha = 1;
+                          _mlDisplayCtx.globalCompositeOperation =
+                            "source-over";
+
+                          if (_liqFgBufferRef.current) {
+                            _mlDisplayCtx.drawImage(
+                              _liqFgBufferRef.current,
+                              0,
+                              0,
+                            );
+                          }
+                        }
+                      }
+                    }
                   }
                 } else {
-                  // Single-layer path: ruler layer guard — silently skip the write
+                  // Single-layer: GPU warp pipeline
                   const _liqActiveLayer = p.layersRef.current.find(
                     (l) => l.id === layerId,
                   );
                   if (
                     !(_liqActiveLayer as { isRuler?: boolean } | undefined)
-                      ?.isRuler
+                      ?.isRuler &&
+                    p.webglBrushRef.current &&
+                    liquifyIsActive()
                   ) {
-                    renderLiquifyFromSnapshot(liqCtx);
+                    // Fix 3 updated: displacement proportional to cursor speed
+                    // Slow strokes = gentle accumulation, fast strokes = stronger push
+                    // Cap at 10% of radius per frame to prevent oscillation
+                    const prevX = liquifyPrevX();
+                    const prevY = liquifyPrevY();
+                    const moveDx = cePos.x - prevX;
+                    const moveDy = cePos.y - prevY;
+                    const moveLen = Math.sqrt(
+                      moveDx * moveDx + moveDy * moveDy,
+                    );
+                    if (moveLen >= 0.5) {
+                      const normDx = moveDx / moveLen;
+                      const normDy = moveDy / moveLen;
+                      const maxDisp = Math.min(
+                        moveLen * strength * stretch,
+                        radius * LIQUIFY_MAX_DISP_SCALE * 0.1,
+                      );
+                      // Skip frames with negligible displacement (canvas pixel units)
+                      if (maxDisp >= 0.5) {
+                        p.webglBrushRef.current.renderLiquifyFrame(
+                          cePos.x,
+                          cePos.y,
+                          normDx,
+                          normDy,
+                          radius,
+                          maxDisp,
+                          hardness,
+                        );
+
+                        // Preview: blit FBO result composited with bg/fg layer buffers
+                        const displayCanvas = p.displayCanvasRef.current;
+                        if (displayCanvas) {
+                          const displayCtx = displayCanvas.getContext("2d");
+                          if (displayCtx) {
+                            const _activeLayer = p.layersRef.current.find(
+                              (l) => l.id === layerId,
+                            );
+                            const _activeOpacity =
+                              (_activeLayer as { opacity?: number })?.opacity ??
+                              1;
+                            const _activeBlend =
+                              (_activeLayer as { blendMode?: string })
+                                ?.blendMode || "source-over";
+                            p.webglBrushRef.current.blitLiquifyPreview(
+                              displayCtx,
+                              _liqBgBufferRef.current,
+                              _liqFgBufferRef.current,
+                              _activeOpacity,
+                              _activeBlend,
+                            );
+                          }
+                        }
+                      }
+
+                      liquifyUpdatePrev(cePos.x, cePos.y);
+                    }
                   }
                 }
                 p.lastPosRef.current = cePos;
@@ -4760,9 +6028,6 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             }
           }
 
-          // Defer composite to rAF via scheduleComposite — deduped internally.
-          // scheduleComposite is a no-op while liquifyStrokeActive is true, so
-          // no pre-warp state can flash at stroke start.
           cb.scheduleComposite();
         }
       }
@@ -4786,7 +6051,14 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         maxY: Number.NEGATIVE_INFINITY,
       };
       const _prevPrimary = p.prevPrimaryPressureRef.current;
-      const _currentPrimary = e.pressure > 0 ? e.pressure : 0.5;
+      // Normalize the primary event pressure the same way as pointer-down:
+      // pen → clamp [0,1], touch → divide by 0.5 and clamp, mouse → 1.0.
+      const _currentPrimary =
+        e.pointerType === "pen"
+          ? Math.max(0, Math.min(1.0, e.pressure))
+          : e.pointerType === "touch"
+            ? Math.min(e.pressure / 0.5, 1.0)
+            : 1.0; // mouse
       for (let i = 0; i < coalescedEvents.length; i++) {
         const ce = coalescedEvents[i];
         let cePos = _getCanvasPosWithRect(
@@ -4810,14 +6082,36 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         p.strokeWarmRawDistRef.current += ceDist;
         const _brushT =
           coalescedEvents.length > 1 ? i / (coalescedEvents.length - 1) : 1;
+        // Interpolate between previous and current normalized pressure for coalesced events.
+        // Both _prevPrimary and _currentPrimary are already normalized (no need to re-normalize here).
         const rawPressure =
-          ce.pointerType === "mouse"
+          e.pointerType === "mouse"
             ? 1.0
             : _prevPrimary + (_currentPrimary - _prevPrimary) * _brushT;
-        p.smoothedPressureRef.current =
-          p.smoothedPressureRef.current * (1 - PRESSURE_SMOOTHING) +
-          rawPressure * PRESSURE_SMOOTHING;
-        const pressure = p.smoothedPressureRef.current;
+        // ── Pressure filtering ───────────────────────────────────────────────
+        // Pen input: use the 1€ Filter for speed-adaptive smoothing that kills
+        // jitter at steady pressure but stays responsive during fast changes.
+        // Mouse/touch input: use the existing EMA unchanged — mouse pressure
+        // is either 0.5 or 0 and does not need the 1€ Filter.
+        let pressure: number;
+        if (e.pointerType === "pen" && pressureFilterRef.current) {
+          // Clamp the 1€ Filter output to [0, 1.0] — the derivative term can
+          // overshoot on step-function inputs (e.g. max-pressure Wacom on Linux).
+          pressure = Math.max(
+            0,
+            Math.min(
+              1.0,
+              pressureFilterRef.current.filter(rawPressure, ce.timeStamp),
+            ),
+          );
+          // Keep smoothedPressureRef in sync for any code that reads it directly.
+          p.smoothedPressureRef.current = pressure;
+        } else {
+          p.smoothedPressureRef.current =
+            p.smoothedPressureRef.current * (1 - PRESSURE_SMOOTHING) +
+            rawPressure * PRESSURE_SMOOTHING;
+          pressure = p.smoothedPressureRef.current;
+        }
         const baseSize = activeSize;
         const baseOpacity = p.brushOpacityRef.current;
         const curvedPressure = evalPressureCurve(
@@ -5185,10 +6479,6 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     if (e.pointerType === "touch") {
       const entry = activePointersRef.current.get(e.pointerId);
       if (entry?.hasActiveStroke) {
-        console.log(
-          "[PalmRejection] pointercancel rollback fired for touch pointerId",
-          e.pointerId,
-        );
         // Restore the pre-stroke snapshot if available
         if (entry.preStrokeSnapshot && p.displayCanvasRef.current) {
           const ctx = p.displayCanvasRef.current.getContext("2d");
@@ -5203,6 +6493,22 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         // Cancel any in-progress stroke state
         if (p.isDrawingRef) p.isDrawingRef.current = false;
         if (p.lastPosRef) p.lastPosRef.current = null;
+        // Free liquify state and GPU resources if a stroke was in progress
+        p.webglBrushRef.current?.destroyLiquifyGPU();
+        p.webglBrushRef.current?.destroyAllLiquifyGPULayers();
+        liquifyFreeState();
+        // Clear BOTH the stroke-active guard (strokeActiveRef, via clearStrokeGuard)
+        // AND the liquify-stroke-active flag. These are separate flags and both must
+        // be cleared here to avoid blocking compositing and layer canvas creation.
+        callbacksRef.current.clearStrokeGuard();
+        // FIX B: Force-clear stroke active flag AND reset the composite-scheduled
+        // flag so the next scheduleComposite() call on any tool/layer works correctly.
+        setLiquifyStrokeActive(false);
+        cancelScheduledComposite();
+        _liqIsMultiRef.current = false;
+        _liqBatchLayersRef.current = [];
+        _liqBgBufferRef.current = null;
+        _liqFgBufferRef.current = null;
       }
       activePointersRef.current.delete(e.pointerId);
     }
@@ -5291,25 +6597,118 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         const _h = _movLc.height;
         const _movCtx = _movLc.getContext("2d");
         if (_movCtx) {
-          // Create a temp canvas of the same size, draw the layer into it at the offset
+          // Simple commit: draw the before-snapshot at the accumulated offset.
+          // drawImage clips naturally — pixels outside canvas bounds are discarded.
           const _tmp = document.createElement("canvas");
           _tmp.width = _w;
           _tmp.height = _h;
           const _tmpCtx = _tmp.getContext("2d");
           if (_tmpCtx) {
-            _tmpCtx.drawImage(_movLc, _offset.x, _offset.y);
-            // Clear the original and draw temp back (pixels outside bounds are cropped)
+            _tmpCtx.putImageData(_beforeSnap.pixels, 0, 0);
             _movCtx.clearRect(0, 0, _w, _h);
-            _movCtx.drawImage(_tmp, 0, 0);
+            _movCtx.drawImage(
+              _tmp,
+              Math.round(_offset.x),
+              Math.round(_offset.y),
+            );
           }
-          // Read after state for undo
-          const _afterData = _movCtx.getImageData(0, 0, _w, _h);
-          cb.pushHistory({
-            type: "pixels",
-            layerId: _movId,
-            before: _beforeSnap.pixels,
-            after: _afterData,
-          });
+          // Compute dirty rect as the union of before-content bbox and
+          // after-content bbox (before bbox shifted by the accumulated offset).
+          const _beforePixels = _beforeSnap.pixels.data;
+          let _bMinX = _w;
+          let _bMinY = _h;
+          let _bMaxX = 0;
+          let _bMaxY = 0;
+          let _bHasContent = false;
+          for (let _bi = 3; _bi < _beforePixels.length; _bi += 4) {
+            if (_beforePixels[_bi] > 0) {
+              const _bPx = ((_bi - 3) / 4) % _w;
+              const _bPy = Math.floor((_bi - 3) / 4 / _w);
+              if (_bPx < _bMinX) _bMinX = _bPx;
+              if (_bPx + 1 > _bMaxX) _bMaxX = _bPx + 1;
+              if (_bPy < _bMinY) _bMinY = _bPy;
+              if (_bPy + 1 > _bMaxY) _bMaxY = _bPy + 1;
+              _bHasContent = true;
+            }
+          }
+          const _movDr = _bHasContent
+            ? (() => {
+                // Union of original bbox and shifted bbox, clamped to canvas
+                const _ux = Math.max(
+                  0,
+                  Math.min(_bMinX, _bMinX + Math.round(_offset.x)),
+                );
+                const _uy = Math.max(
+                  0,
+                  Math.min(_bMinY, _bMinY + Math.round(_offset.y)),
+                );
+                const _ux2 = Math.min(
+                  _w,
+                  Math.max(_bMaxX, _bMaxX + Math.round(_offset.x)),
+                );
+                const _uy2 = Math.min(
+                  _h,
+                  Math.max(_bMaxY, _bMaxY + Math.round(_offset.y)),
+                );
+                const _uw = _ux2 - _ux;
+                const _uh = _uy2 - _uy;
+                return _uw > 0 && _uh > 0
+                  ? { x: _ux, y: _uy, w: _uw, h: _uh }
+                  : null;
+              })()
+            : null;
+          // Build undo entry — use dirty rect when available, fall back to full canvas
+          const _movHistEntry: import("./useLayerSystem").UndoEntry = _movDr
+            ? (() => {
+                // Crop before-snapshot to dirty rect
+                const _mTmp = document.createElement("canvas");
+                _mTmp.width = _movDr.w;
+                _mTmp.height = _movDr.h;
+                const _mTmpCtx = _mTmp.getContext("2d", {
+                  willReadFrequently: true,
+                });
+                if (_mTmpCtx) {
+                  _mTmpCtx.putImageData(
+                    _beforeSnap.pixels,
+                    -_movDr.x,
+                    -_movDr.y,
+                  );
+                  const _croppedBefore = _mTmpCtx.getImageData(
+                    0,
+                    0,
+                    _movDr.w,
+                    _movDr.h,
+                  );
+                  const _croppedAfter = _movCtx.getImageData(
+                    _movDr.x,
+                    _movDr.y,
+                    _movDr.w,
+                    _movDr.h,
+                  );
+                  return {
+                    type: "pixels" as const,
+                    layerId: _movId,
+                    dirtyRect: _movDr,
+                    before: _croppedBefore,
+                    after: _croppedAfter,
+                  };
+                }
+                return {
+                  type: "pixels" as const,
+                  layerId: _movId,
+                  dirtyRect: { x: 0, y: 0, w: _w, h: _h },
+                  before: _beforeSnap.pixels,
+                  after: _movCtx.getImageData(0, 0, _w, _h),
+                };
+              })()
+            : {
+                type: "pixels" as const,
+                layerId: _movId,
+                dirtyRect: { x: 0, y: 0, w: _w, h: _h },
+                before: _beforeSnap.pixels,
+                after: _movCtx.getImageData(0, 0, _w, _h),
+              };
+          cb.pushHistory(_movHistEntry);
           markLayerBitmapDirty(_movId);
           markCanvasDirty(_movId);
         }
@@ -5461,15 +6860,42 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
               );
               cb.composite();
               markLayerBitmapDirty(layerId);
-              const afterPixels =
-                lcCtx?.getImageData(0, 0, lc.width, lc.height) ?? null;
-              if (beforePixels && afterPixels) {
-                cb.pushHistory({
-                  type: "pixels",
-                  layerId,
-                  before: beforePixels,
-                  after: afterPixels,
-                });
+              if (beforePixels && lcCtx) {
+                // Compute dirty rect from the bounding box of the lasso points
+                let _lfMinX = pts[0].x;
+                let _lfMinY = pts[0].y;
+                let _lfMaxX = pts[0].x;
+                let _lfMaxY = pts[0].y;
+                for (let _pi = 1; _pi < pts.length; _pi++) {
+                  if (pts[_pi].x < _lfMinX) _lfMinX = pts[_pi].x;
+                  if (pts[_pi].y < _lfMinY) _lfMinY = pts[_pi].y;
+                  if (pts[_pi].x > _lfMaxX) _lfMaxX = pts[_pi].x;
+                  if (pts[_pi].y > _lfMaxY) _lfMaxY = pts[_pi].y;
+                }
+                const _lfDrEntry = _makeDirtyRectEntry(
+                  beforePixels,
+                  lc,
+                  {
+                    minX: _lfMinX,
+                    minY: _lfMinY,
+                    maxX: _lfMaxX,
+                    maxY: _lfMaxY,
+                  },
+                  lc.width,
+                  lc.height,
+                  isIPad,
+                );
+                if (_lfDrEntry) {
+                  cb.pushHistory({
+                    type: "pixels",
+                    layerId,
+                    before: _lfDrEntry.before,
+                    after: _lfDrEntry.after,
+                    ...(_lfDrEntry.dirtyRect && {
+                      dirtyRect: _lfDrEntry.dirtyRect,
+                    }),
+                  });
+                }
               }
               markCanvasDirty(layerId);
             }
@@ -5644,64 +7070,125 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
 
     // Liquify: commit stroke as one history entry
     if (p.activeToolRef.current === "liquify") {
-      // Stroke is ending — clear the single authoritative suppression flag so
-      // subsequent non-liquify composites are not accidentally blocked.
+      // Clear liquify stroke guard BEFORE the try block so that if anything
+      // inside the try calls scheduleComposite(), the guard is already false
+      // and the composite can run.  The finally block mirrors this for safety.
       setLiquifyStrokeActive(false);
-      if (p.liquifyHoldIntervalRef.current) {
-        clearInterval(p.liquifyHoldIntervalRef.current);
-        p.liquifyHoldIntervalRef.current = null;
-      }
+      // Also reset any stuck composite-scheduled flag so brush strokes on
+      // new layers (created after this pointer-up) schedule composites correctly.
+      forceResetCompositeSchedule();
       p.isCommittingRef.current = true;
       p.isDrawingRef.current = false;
       const liqLayerId = p.activeLayerIdRef.current;
 
-      if (p.liquifyMultiBeforeSnapshotsRef.current.size > 1) {
-        for (const [lid, liqBefore] of p.liquifyMultiBeforeSnapshotsRef
-          .current) {
-          const lc2 = p.layerCanvasesRef.current.get(lid);
-          if (!lc2) continue;
-          const ctx2 = lc2.getContext("2d", { willReadFrequently: !isIPad });
-          if (!ctx2) continue;
-          const liqAfter = ctx2.getImageData(0, 0, lc2.width, lc2.height);
-          cb.pushHistory({
-            type: "pixels",
-            layerId: lid,
-            before: liqBefore,
-            after: liqAfter,
-          });
-          markLayerBitmapDirty(lid);
-          markCanvasDirty(lid);
+      try {
+        if (_liqIsMultiRef.current && _liqBatchLayersRef.current.length > 0) {
+          // Multi-layer All Visible commit: GPU commit per layer then push undo entries.
+          const _mlBatch = _liqBatchLayersRef.current;
+          for (const batchItem of _mlBatch) {
+            const lc2 = p.layerCanvasesRef.current.get(batchItem.layerId);
+            if (!lc2) continue;
+            const ctx2 = lc2.getContext("2d", { willReadFrequently: !isIPad });
+            if (!ctx2) continue;
+            // Commit GPU warp to layer canvas (destroys GPU state for this layer)
+            if (p.webglBrushRef.current) {
+              p.webglBrushRef.current.commitLiquifyForLayer(
+                batchItem.layerId,
+                ctx2,
+              );
+            }
+            const after = ctx2.getImageData(0, 0, lc2.width, lc2.height);
+            const liqBefore = p.liquifyMultiBeforeSnapshotsRef.current.get(
+              batchItem.layerId,
+            );
+            if (liqBefore) {
+              cb.pushHistory({
+                type: "pixels",
+                layerId: batchItem.layerId,
+                before: liqBefore,
+                after,
+                dirtyRect: { x: 0, y: 0, w: lc2.width, h: lc2.height },
+              });
+            }
+            markLayerBitmapDirty(batchItem.layerId);
+            markCanvasDirty(batchItem.layerId);
+          }
+          // Destroy any remaining GPU state (handles layers that passed alpha check but weren't rendered)
+          p.webglBrushRef.current?.destroyAllLiquifyGPULayers();
+          p.liquifyMultiBeforeSnapshotsRef.current.clear();
+          _liqBatchLayersRef.current = [];
+          _liqIsMultiRef.current = false;
+          p.isCommittingRef.current = false;
+          p.lastPosRef.current = null;
+          // Guard is already false (cleared before the try block above).
+          cb.composite();
+          return;
         }
-        p.liquifyMultiBeforeSnapshotsRef.current.clear();
+
+        // Single-layer commit — GPU path
+        const liqLc = p.layerCanvasesRef.current.get(liqLayerId);
         _liqBatchLayersRef.current = [];
+        if (liqLc && liquifyIsActive()) {
+          const liqCtx = liqLc.getContext("2d", {
+            willReadFrequently: !isIPad,
+          });
+          if (liqCtx) {
+            try {
+              // Commit the final GPU warp result to the layer canvas,
+              // then destroyLiquifyGPU is called internally by commitLiquify.
+              if (p.webglBrushRef.current) {
+                p.webglBrushRef.current.commitLiquify(liqCtx);
+              }
+              // liquifyPointerUp reads the layer canvas (after commit) for the "after" snapshot
+              // and returns the frozen "before" snapshot for the undo entry.
+              const result = liquifyPointerUp(liqCtx);
+              if (result) {
+                cb.pushHistory({
+                  type: "pixels",
+                  layerId: liqLayerId,
+                  before: result.before,
+                  after: result.after,
+                  dirtyRect: {
+                    x: result.dirtyRect.x,
+                    y: result.dirtyRect.y,
+                    w: result.dirtyRect.width,
+                    h: result.dirtyRect.height,
+                  },
+                });
+                markLayerBitmapDirty(liqLayerId);
+                markCanvasDirty(liqLayerId);
+              }
+            } finally {
+              // Ensure GPU resources are freed even if commit throws
+              p.webglBrushRef.current?.destroyLiquifyGPU();
+            }
+          }
+        } else {
+          // No active single-layer stroke — just free state and GPU resources
+          p.webglBrushRef.current?.destroyLiquifyGPU();
+          liquifyFreeState();
+        }
         p.isCommittingRef.current = false;
         p.lastPosRef.current = null;
+        // Guard is already false (cleared before the try block above).
         cb.composite();
-        return;
+      } finally {
+        // Unconditional cleanup — runs even if commit throws or on pointercancel.
+        // clearStrokeGuard() MUST be first: it clears strokeActiveRef, the
+        // layer-canvas creation guard that blocks all new layer canvases and
+        // compositing until explicitly reset. This is a separate flag from
+        // setLiquifyStrokeActive — both must be cleared here.
+        callbacksRef.current.clearStrokeGuard();
+        setLiquifyStrokeActive(false);
+        forceResetCompositeSchedule();
+        liquifyFreeState();
+        p.webglBrushRef.current?.destroyLiquifyGPU();
+        p.webglBrushRef.current?.destroyAllLiquifyGPULayers();
+        _liqIsMultiRef.current = false;
+        _liqBatchLayersRef.current = [];
+        _liqBgBufferRef.current = null;
+        _liqFgBufferRef.current = null;
       }
-
-      const liqLc = p.layerCanvasesRef.current.get(liqLayerId);
-      const liqBefore = p.liquifyBeforeSnapshotRef.current;
-      p.liquifyBeforeSnapshotRef.current = null;
-      _liqBatchLayersRef.current = [];
-      if (liqLc && liqBefore) {
-        const liqCtx = liqLc.getContext("2d", { willReadFrequently: !isIPad });
-        if (liqCtx) {
-          const liqAfter = liqCtx.getImageData(0, 0, liqLc.width, liqLc.height);
-          cb.pushHistory({
-            type: "pixels",
-            layerId: liqLayerId,
-            before: liqBefore,
-            after: liqAfter,
-          });
-          markLayerBitmapDirty(liqLayerId);
-        }
-        p.isCommittingRef.current = false;
-        markCanvasDirty(liqLayerId);
-      }
-      p.isCommittingRef.current = false;
-      p.lastPosRef.current = null;
-      cb.composite();
       return;
     }
 
@@ -5730,10 +7217,13 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
                 p.isFlippedRef.current,
               )
             : _lStart;
+        // Normalize end pressure by pointer type.
         const _lEndPressure = e
-          ? e.pointerType === "mouse"
-            ? 1.0
-            : Math.max(0, Math.min(1, e.pressure || 1.0))
+          ? e.pointerType === "pen"
+            ? Math.max(0, Math.min(1.0, e.pressure))
+            : e.pointerType === "touch"
+              ? Math.min(e.pressure / 0.5, 1.0)
+              : 1.0 // mouse
           : lineStartPressureRef.current;
         // Finalize the pressure sample array:
         // add the endpoint pressure at the final dist, discard any samples beyond it
@@ -5785,20 +7275,31 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
           : _lBaseOpacity;
 
         // Compute line length and spacing
-        const _lDx = _lEndPos.x - _lStart.x;
-        const _lDy = _lEndPos.y - _lStart.y;
-        const _lLineDist = Math.sqrt(_lDx * _lDx + _lDy * _lDy);
-        const _lStrokeAngle = Math.atan2(_lDy, _lDx);
+        // Fix D — apply rolling median to a COPY of the sample array before commit rendering.
+        // The original linePressureSamplesRef.current is left unmodified.
+        const _lSamplesForCommit = smoothLinePressureSamples(
+          linePressureSamplesRef.current,
+        );
+        const _lRawDx = _lEndPos.x - _lStart.x;
+        const _lRawDy = _lEndPos.y - _lStart.y;
+        const _lLineDist = Math.sqrt(_lRawDx * _lRawDx + _lRawDy * _lRawDy);
+        // Shift-snap: snap angle to nearest LINE_SNAP_DEGREES increment when Shift held
+        let _lStrokeAngle = Math.atan2(_lRawDy, _lRawDx);
+        let _lDx = _lRawDx;
+        let _lDy = _lRawDy;
+        if (shiftHeldRef.current && _lLineDist > 0.5) {
+          const _lSnapRad = (LINE_SNAP_DEGREES * Math.PI) / 180;
+          _lStrokeAngle = Math.round(_lStrokeAngle / _lSnapRad) * _lSnapRad;
+          _lDx = Math.cos(_lStrokeAngle) * _lLineDist;
+          _lDy = Math.sin(_lStrokeAngle) * _lLineDist;
+        }
         const _lSpacingPixels = Math.max(
           0.5,
           (_lSettings.spacing / 100) * _lBaseSize,
         );
         if (_lLineDist < 0.5) {
           // Tap: place a single stamp at the start
-          const _ltPressure = interpolateLinePressure(
-            linePressureSamplesRef.current,
-            0,
-          );
+          const _ltPressure = interpolateLinePressure(_lSamplesForCommit, 0);
           const _ltCurved = evalPressureCurve(
             _ltPressure,
             p.universalPressureCurveRef.current as [
@@ -5838,9 +7339,9 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             const _lt = _lLineDist > 0 ? _lAccDist / _lLineDist : 0;
             const _lSx = _lStart.x + _lDx * _lt;
             const _lSy = _lStart.y + _lDy * _lt;
-            // Interpolate pressure from the continuous samples array
+            // Interpolate pressure from the smoothed commit samples (Fix D)
             const _lPressure = interpolateLinePressure(
-              linePressureSamplesRef.current,
+              _lSamplesForCommit,
               _lAccDist,
             );
             const _lCurved = evalPressureCurve(
@@ -5901,21 +7402,23 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         cb.composite();
         // Push history
         if (_lBefore) {
-          const _lCtxAfter = _lLc.getContext("2d", {
-            willReadFrequently: false,
-          });
-          if (_lCtxAfter) {
-            const _lAfter = _lCtxAfter.getImageData(
-              0,
-              0,
-              _lLc.width,
-              _lLc.height,
-            );
+          // Use the stroke dirty rect accumulated by stampWebGL during line rendering
+          const _lDR = p.strokeDirtyRectRef.current;
+          const _lDrEntry = _makeDirtyRectEntry(
+            _lBefore,
+            _lLc,
+            _lDR,
+            _lLc.width,
+            _lLc.height,
+            isIPad,
+          );
+          if (_lDrEntry) {
             cb.pushHistory({
               type: "pixels",
               layerId: _lLayerId,
-              before: _lBefore,
-              after: _lAfter,
+              before: _lDrEntry.before,
+              after: _lDrEntry.after,
+              ...(_lDrEntry.dirtyRect && { dirtyRect: _lDrEntry.dirtyRect }),
             });
           }
         }
@@ -5986,15 +7489,6 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     const tool = p.activeToolRef.current;
     const layerId = p.activeLayerIdRef.current;
     const lc = p.layerCanvasesRef.current.get(layerId);
-
-    console.log(
-      "[Paint] stroke commit — layerId:",
-      layerId,
-      "canvas in map:",
-      !!p.layerCanvasesRef.current.get(layerId),
-      "canvas size:",
-      p.layerCanvasesRef.current.get(layerId)?.width,
-    );
 
     const _baseOpacity = p.brushOpacityRef.current;
     const _upPressure = p.smoothedPressureRef.current;
@@ -6149,21 +7643,28 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
                 p.tailDoCommitRef.current = null;
                 cb.composite();
                 if (_tailLc && _tailSnap) {
-                  const ctx = _tailLc.getContext("2d", {
-                    willReadFrequently: !isIPad,
-                  });
-                  if (ctx) {
-                    const after = ctx.getImageData(
-                      0,
-                      0,
-                      _tailLc.width,
-                      _tailLc.height,
-                    );
+                  // Fix 1 (tail commit): use the accumulated stroke dirty rect so only the
+                  // touched pixels are stored in the undo entry, not the full canvas.
+                  // strokeDirtyRectRef is still valid here — it's reset AFTER doCommit returns
+                  // (at the end of the pointer-up handler, not inside this closure).
+                  const _tailDR = p.strokeDirtyRectRef.current;
+                  const _tailDrEntry = _makeDirtyRectEntry(
+                    _tailSnap.pixels,
+                    _tailLc,
+                    _tailDR,
+                    _tailLc.width,
+                    _tailLc.height,
+                    isIPad,
+                  );
+                  if (_tailDrEntry) {
                     cb.pushHistory({
                       type: "pixels",
                       layerId: _tailLayerId,
-                      before: _tailSnap.pixels,
-                      after,
+                      before: _tailDrEntry.before,
+                      after: _tailDrEntry.after,
+                      ...(_tailDrEntry.dirtyRect && {
+                        dirtyRect: _tailDrEntry.dirtyRect,
+                      }),
                     });
                   }
                 }
@@ -6318,6 +7819,8 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
     }
 
     p.smoothedPressureRef.current = 0.5;
+    pressureFilterRef.current = null; // discard 1€ Filter — do not carry state between strokes
+    linePressureFilterRef.current = null; // Fix A — discard line tool 1€ Filter between strokes
     p.stabBrushPosRef.current = null;
     p.smoothBufferRef.current = [];
     p.elasticPosRef.current = null;
@@ -6333,9 +7836,16 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         tool === "smudge" &&
         p.liquifyMultiBeforeSnapshotsRef.current.size > 1
       ) {
+        // Compute the dirty rect for multi-layer smudge from _smearUndoDirtyRect
+        // (tracked in pointer-move for both single- and multi-layer paths).
+        const _mlSmearDr = _smearUndoDirtyRect;
         const atomicLayers = new Map<
           string,
-          { before: ImageData; after: ImageData }
+          {
+            before: ImageData;
+            after: ImageData;
+            dirtyRect?: { x: number; y: number; w: number; h: number };
+          }
         >();
         for (const [lid, smudgeBefore] of p.liquifyMultiBeforeSnapshotsRef
           .current) {
@@ -6345,16 +7855,31 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
             willReadFrequently: !isIPad,
           });
           if (!smudgeCtx) continue;
-          const smudgeAfter = smudgeCtx.getImageData(
-            0,
-            0,
+          // Apply dirty-rect crop to reduce stored ImageData size.
+          // _makeDirtyRectEntryXYWH crops smudgeBefore to the dirty region and reads
+          // only the dirty region for smudgeAfter — same pattern as single-layer smudge.
+          const _mlSmearEntry = _makeDirtyRectEntryXYWH(
+            smudgeBefore,
+            smudgeLc,
+            _mlSmearDr,
             smudgeLc.width,
             smudgeLc.height,
+            isIPad,
           );
-          atomicLayers.set(lid, { before: smudgeBefore, after: smudgeAfter });
+          if (_mlSmearEntry) {
+            atomicLayers.set(lid, {
+              before: _mlSmearEntry.before,
+              after: _mlSmearEntry.after,
+              ...(_mlSmearEntry.dirtyRect && {
+                dirtyRect: _mlSmearEntry.dirtyRect,
+              }),
+            });
+          }
           markLayerBitmapDirty(lid);
           markCanvasDirty(lid);
         }
+        // Release the multi-smear dirty rect — it's been consumed
+        _smearUndoDirtyRect = null;
         if (atomicLayers.size > 0) {
           cb.pushHistory({
             type: "multi-layer-pixels",
@@ -6371,15 +7896,103 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
         p.strokeHvAxisRef.current = null;
         p.strokeHvPivotRef.current = null;
         p.lastPosRef.current = null;
+      } else if (tool === "smudge" && lc && _smearUndoBefore) {
+        // FIX 2: Single-layer smear undo using before/after dirty-rect snapshots.
+        // _smearUndoBefore holds the full-canvas before-snapshot captured at pointer-down.
+        // _smearUndoDirtyRect holds the union of all brush positions during this stroke.
+        // We crop _smearUndoBefore to the dirty rect here (before nulling it) and capture
+        // the after snapshot from the same region of the now-modified layer canvas.
+        const _smearDr = _smearUndoDirtyRect;
+        const _smearCtx = lc.getContext("2d", { willReadFrequently: !isIPad });
+        if (_smearCtx && _smearDr) {
+          // Clamp dirty rect to canvas bounds
+          const pad = 2;
+          const drX = Math.max(0, Math.floor(_smearDr.x) - pad);
+          const drY = Math.max(0, Math.floor(_smearDr.y) - pad);
+          const drX2 = Math.min(
+            lc.width,
+            Math.ceil(_smearDr.x + _smearDr.w) + pad,
+          );
+          const drY2 = Math.min(
+            lc.height,
+            Math.ceil(_smearDr.y + _smearDr.h) + pad,
+          );
+          const drW = drX2 - drX;
+          const drH = drY2 - drY;
+          if (drW > 0 && drH > 0) {
+            // Crop the full-canvas before-snapshot to the dirty region
+            const tmpCanvas = document.createElement("canvas");
+            tmpCanvas.width = drW;
+            tmpCanvas.height = drH;
+            const tmpCtx = tmpCanvas.getContext("2d", {
+              willReadFrequently: true,
+            });
+            if (tmpCtx) {
+              tmpCtx.putImageData(_smearUndoBefore, -drX, -drY);
+              const croppedBefore = tmpCtx.getImageData(0, 0, drW, drH);
+              const smearAfter = _smearCtx.getImageData(drX, drY, drW, drH);
+              const useFullCanvas = drW * drH >= lc.width * lc.height * 0.5;
+              // Build undo entry: omit dirtyRect key entirely when using full canvas so
+              // V8 doesn't allocate a hidden-class slot for an undefined property (heap Hole).
+              cb.pushHistory(
+                useFullCanvas
+                  ? {
+                      type: "pixels",
+                      layerId,
+                      dirtyRect: { x: 0, y: 0, w: lc.width, h: lc.height },
+                      before: _smearUndoBefore,
+                      after: _smearCtx.getImageData(0, 0, lc.width, lc.height),
+                    }
+                  : {
+                      type: "pixels",
+                      layerId,
+                      before: croppedBefore,
+                      after: smearAfter,
+                      // dirtyRect is a fully-assigned {x,y,w,h} — never undefined here
+                      dirtyRect: { x: drX, y: drY, w: drW, h: drH },
+                    },
+              );
+            } else {
+              // Fallback: full canvas
+              const smearAfterFull = _smearCtx.getImageData(
+                0,
+                0,
+                lc.width,
+                lc.height,
+              );
+              cb.pushHistory({
+                type: "pixels",
+                layerId,
+                dirtyRect: { x: 0, y: 0, w: lc.width, h: lc.height },
+                before: _smearUndoBefore,
+                after: smearAfterFull,
+              });
+            }
+          }
+        } else if (_smearCtx) {
+          // No dirty rect tracked (no movement) — skip undo entry, stroke had no effect
+        }
+        // Release the before snapshot — it is no longer needed
+        _smearUndoBefore = null;
+        _smearUndoDirtyRect = null;
       } else if (lc && before) {
-        const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
-        if (ctx) {
-          const after = ctx.getImageData(0, 0, lc.width, lc.height);
+        // Read the dirty rect BEFORE resetting it below (strokeDirtyRectRef is cleared later)
+        const _strokeDR = p.strokeDirtyRectRef.current;
+        const _drEntry = _makeDirtyRectEntry(
+          before.pixels,
+          lc,
+          _strokeDR,
+          lc.width,
+          lc.height,
+          isIPad,
+        );
+        if (_drEntry) {
           cb.pushHistory({
             type: "pixels",
             layerId,
-            before: before.pixels,
-            after,
+            before: _drEntry.before,
+            after: _drEntry.after,
+            ...(_drEntry.dirtyRect && { dirtyRect: _drEntry.dirtyRect }),
           });
         }
       }
@@ -6401,9 +8014,14 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       p.lastPosRef.current = null;
     }
 
-    // Spec: carriedBuffer must be null between strokes — reset at every pointer-up
+    // Spec: carriedBuffer must be null between strokes — reset at every pointer-up.
+    // FIX 1/2: Also clear the three per-stroke smear working buffers and undo tracking state.
     if (tool === "smudge") {
       clearSmudgeBuffer();
+      clearSmearBuffers();
+      // Ensure smear undo state is always cleaned up (handles cancelled/interrupted strokes)
+      _smearUndoBefore = null;
+      _smearUndoDirtyRect = null;
     }
 
     if (p.tailRafIdRef.current === null) {
@@ -6708,6 +8326,121 @@ export function usePaintingCanvasEvents(p: PaintingCanvasEventsParams) {
       window.removeEventListener("pointerdown", onWindowPointerDown);
       window.removeEventListener("pointermove", onWindowPointerMove);
       window.removeEventListener("pointerup", onWindowPointerUp);
+    };
+  }, [handlePointerDown, handlePointerMove, handlePointerUp]);
+
+  // ── 8b. Window-level transform/move pointer listeners ─────────────────────
+  // Transform handles are drawn on a fixed-position overlay covering the full
+  // viewport. When a handle is positioned outside the canvas element's bounds
+  // (e.g. a layer extends beyond the canvas edge, or the canvas is zoomed out),
+  // the canvas-level pointerdown won't fire for it. These window-level listeners
+  // forward such events to handlePointerDown/Move/Up so handles outside the
+  // canvas area are still grabbable.
+  //
+  // Logic: only intercept when transform is active, pointer is NOT over the
+  // canvas (canvas listener already handles those), and the hit test says we're
+  // over a transform handle.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all mutable state accessed via stable refs
+  useEffect(() => {
+    const onWindowXfPointerDown = (e: PointerEvent) => {
+      if (e.pointerType === "touch") return;
+      const tool = p.activeToolRef.current;
+      if (tool !== "move" && tool !== "transform") return;
+      if (!p.transformActiveRef.current) return;
+
+      const display = p.displayCanvasRef.current;
+      const container = p.containerRef.current;
+      if (!display || !container) return;
+
+      // If the pointer is over the canvas element, the canvas listener handles it.
+      const canvasRect = display.getBoundingClientRect();
+      const overCanvas =
+        e.clientX >= canvasRect.left &&
+        e.clientX <= canvasRect.right &&
+        e.clientY >= canvasRect.top &&
+        e.clientY <= canvasRect.bottom;
+      if (overCanvas) return;
+
+      // Convert to canvas space and check whether a handle is hit.
+      const pos = _getCanvasPosTransformed(
+        e.clientX,
+        e.clientY,
+        container,
+        display,
+        p.viewTransformRef.current,
+        p.isFlippedRef.current,
+      );
+      const hitHandle = p.transformActionsRef.current.hitTestTransformHandle(
+        pos.x,
+        pos.y,
+      );
+      if (!hitHandle) return;
+
+      // A handle outside the canvas is being grabbed — forward to the main
+      // pointer-down handler which manages the full drag lifecycle.
+      e.preventDefault();
+      handlePointerDown(e);
+    };
+
+    const onWindowXfPointerMove = (e: PointerEvent) => {
+      if (e.pointerType === "touch") return;
+      const tool = p.activeToolRef.current;
+      if (tool !== "move" && tool !== "transform") return;
+
+      // Only intercept mid-drag (a transform handle is being dragged).
+      if (!p.transformHandleRef.current) return;
+
+      const display = p.displayCanvasRef.current;
+      const container = p.containerRef.current;
+      if (!display || !container) return;
+
+      // If pointer is over the canvas, the canvas listener handles it.
+      const canvasRect = display.getBoundingClientRect();
+      const overCanvas =
+        e.clientX >= canvasRect.left &&
+        e.clientX <= canvasRect.right &&
+        e.clientY >= canvasRect.top &&
+        e.clientY <= canvasRect.bottom;
+      if (overCanvas) return;
+
+      handlePointerMove(e);
+    };
+
+    const onWindowXfPointerUp = (e: PointerEvent) => {
+      if (e.pointerType === "touch") return;
+      const tool = p.activeToolRef.current;
+      if (tool !== "move" && tool !== "transform") return;
+
+      if (!p.transformHandleRef.current) return;
+
+      const display = p.displayCanvasRef.current;
+      if (!display) return;
+
+      const canvasRect = display.getBoundingClientRect();
+      const overCanvas =
+        e.clientX >= canvasRect.left &&
+        e.clientX <= canvasRect.right &&
+        e.clientY >= canvasRect.top &&
+        e.clientY <= canvasRect.bottom;
+      if (overCanvas) return;
+
+      handlePointerUp(e);
+    };
+
+    window.addEventListener("pointerdown", onWindowXfPointerDown, {
+      passive: false,
+    });
+    window.addEventListener("pointermove", onWindowXfPointerMove, {
+      passive: true,
+    });
+    window.addEventListener("pointerup", onWindowXfPointerUp, {
+      passive: false,
+    });
+
+    return () => {
+      window.removeEventListener("pointerdown", onWindowXfPointerDown);
+      window.removeEventListener("pointermove", onWindowXfPointerMove);
+      window.removeEventListener("pointerup", onWindowXfPointerUp);
     };
   }, [handlePointerDown, handlePointerMove, handlePointerUp]);
 

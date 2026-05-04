@@ -50,6 +50,11 @@ export interface RightSidebarAreaProps {
   onMergeLayers: () => void;
   onRenameLayer: (id: string, name: string) => void;
   onToggleAlphaLock: (id: string) => void;
+  onToggleLockLayer: (id: string) => void;
+  onDuplicateLayer: () => void;
+  onCutToNewLayer: () => void;
+  onCopyToNewLayer: () => void;
+  hasSelection?: boolean;
   onCtrlClickLayer: (id: string) => void;
   onToggleRulerActive: (id: string) => void;
   onToggleGroupCollapse: (groupId: string) => void;
@@ -114,6 +119,11 @@ export function RightSidebarArea({
   onMergeLayers,
   onRenameLayer,
   onToggleAlphaLock,
+  onToggleLockLayer,
+  onDuplicateLayer,
+  onCutToNewLayer,
+  onCopyToNewLayer,
+  hasSelection = false,
   onCtrlClickLayer,
   onToggleRulerActive,
   onToggleGroupCollapse,
@@ -240,6 +250,11 @@ export function RightSidebarArea({
                     onMergeLayers={onMergeLayers}
                     onRenameLayer={onRenameLayer}
                     onToggleAlphaLock={onToggleAlphaLock}
+                    onToggleLockLayer={onToggleLockLayer}
+                    onDuplicateLayer={onDuplicateLayer}
+                    onCutToNewLayer={onCutToNewLayer}
+                    onCopyToNewLayer={onCopyToNewLayer}
+                    hasActiveSelection={hasSelection}
                     thumbnails={layerThumbnails}
                     onCtrlClickLayer={onCtrlClickLayer}
                     onToggleRulerActive={onToggleRulerActive}

@@ -6,9 +6,10 @@ import {
 } from "@/components/ui/tooltip";
 import { BLEND_MODES } from "@/utils/constants";
 import {
-  Check,
+  ArrowDownToLine,
   ChevronDown,
   ChevronRight,
+  ClipboardCopy,
   Eraser,
   Eye,
   EyeOff,
@@ -16,7 +17,7 @@ import {
   FolderOpen,
   FolderPlus,
   GripVertical,
-  Lock,
+  Layers,
   Plus,
   Ruler,
   Scissors,
@@ -45,6 +46,7 @@ export interface Layer extends RulerFields {
   blendMode: string;
   isClippingMask: boolean;
   alphaLock: boolean;
+  isLocked?: boolean;
   // Flat-array type discriminant — kept optional for backward compat
   // GroupHeader and EndGroup objects are cast through this interface at runtime.
   type?: string;
@@ -623,6 +625,10 @@ interface LayersPanelProps {
   onCtrlClickLayer: (id: string) => void;
   onRenameLayer: (id: string, newName: string) => void;
   onToggleAlphaLock: (id: string) => void;
+  onToggleLockLayer: (id: string) => void;
+  onDuplicateLayer: () => void;
+  onCutToNewLayer: () => void;
+  onCopyToNewLayer: () => void;
   thumbnails: Record<string, string>;
   onToggleRulerActive: (id: string) => void;
   onToggleGroupCollapse: (groupId: string) => void;
@@ -652,6 +658,10 @@ interface LayersPanelProps {
   onCreateGroup: () => void;
   onClose?: () => void;
   shiftHeld?: boolean;
+  /** True when there is an active selection — enables Cut/Copy to New Layer buttons */
+  hasActiveSelection?: boolean;
+  /** Called when the user interacts with a layer (selects it) — used by mobile to bring panel to front */
+  onInteract?: () => void;
 }
 
 // ── LayersPanel ───────────────────────────────────────────────────────────────
@@ -674,6 +684,10 @@ export const LayersPanel = memo(function LayersPanel({
   onCtrlClickLayer,
   onRenameLayer,
   onToggleAlphaLock,
+  onToggleLockLayer: _onToggleLockLayer,
+  onDuplicateLayer,
+  onCutToNewLayer,
+  onCopyToNewLayer,
   thumbnails,
   onToggleRulerActive,
   onToggleGroupCollapse,
@@ -690,10 +704,21 @@ export const LayersPanel = memo(function LayersPanel({
   onCreateGroup,
   onClose: _onClose,
   shiftHeld = false,
+  hasActiveSelection = false,
+  onInteract,
 }: LayersPanelProps) {
   // ── Always-current refs ────────────────────────────────────────────────────
   const layersRef = useRef<Layer[]>(layers);
   layersRef.current = layers;
+
+  // Wrap onSetActive to fire onInteract when a layer is selected
+  const handleSetActive = useCallback(
+    (id: string) => {
+      onInteract?.();
+      onSetActive(id);
+    },
+    [onSetActive, onInteract],
+  );
 
   // ── Drag state ─────────────────────────────────────────────────────────────
   const dragStateRef = useRef<DragState>({ ...IDLE_DRAG });
@@ -895,6 +920,26 @@ export const LayersPanel = memo(function LayersPanel({
       !(l as PaintLayer).isRuler,
   ).length;
 
+  // ── Action bar disabled states ─────────────────────────────────────────────
+  const activeLayerRaw = layers.find((l) => l.id === activeLayerId) as
+    | { type?: string }
+    | undefined;
+  const isGroupHeader = activeLayerRaw?.type === "group";
+  const isEndGroup = activeLayerRaw?.type === "end_group";
+  const activeLayerIndex = layers.findIndex((l) => l.id === activeLayerId);
+  const layerBelow =
+    activeLayerIndex < layers.length - 1 ? layers[activeLayerIndex + 1] : null;
+  const mergeDownDisabled =
+    !activeLayerRaw ||
+    isGroupHeader ||
+    isEndGroup ||
+    !layerBelow ||
+    (layerBelow as { type?: string }).type === "end_group" ||
+    (layerBelow as { type?: string }).type === "group";
+  const selectionOpsDisabled = !hasActiveSelection;
+  const lockOpsDisabled = isGroupHeader || isEndGroup;
+  const newGroupDisabled = isGroupHeader || isEndGroup;
+
   /**
    * Panel-level blend mode selector value.
    * - Single active non-ruler layer → show its blend mode
@@ -1022,7 +1067,7 @@ export const LayersPanel = memo(function LayersPanel({
         dropIndicatorBefore={dropBefore}
         dropIndicatorAfter={dropAfter}
         shiftHeld={layer.isRuler ? shiftHeld : false}
-        onSetActive={onSetActive}
+        onSetActive={handleSetActive}
         onToggleVisible={onToggleVisible}
         onSetOpacity={onSetOpacity}
         onSetOpacityLive={onSetOpacityLive}
@@ -1058,33 +1103,8 @@ export const LayersPanel = memo(function LayersPanel({
     >
       {/* Action buttons row — desktop only */}
       <TooltipProvider>
-        <div className="flex items-center gap-0.5 px-2 py-1 border-b border-border/60 bg-muted/20">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                onClick={() => onToggleAlphaLock(activeLayerId)}
-                className={`p-1 rounded hover:bg-accent ${activeLayer?.alphaLock ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                data-ocid="layers.toggle.button"
-              >
-                <Lock size={12} />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent>Alpha Lock</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                onClick={() => onToggleClippingMask(activeLayerId)}
-                className={`p-1 rounded hover:bg-accent ${activeLayer?.isClippingMask ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                data-ocid="layers.clipping_mask_button"
-              >
-                <Scissors size={12} />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent>Cut to New Layer</TooltipContent>
-          </Tooltip>
+        <div className="flex items-center flex-wrap gap-0.5 px-2 py-1 border-b border-border/60 bg-muted/20">
+          {/* 1. Clear Layer */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -1098,25 +1118,108 @@ export const LayersPanel = memo(function LayersPanel({
             </TooltipTrigger>
             <TooltipContent>Clear Layer</TooltipContent>
           </Tooltip>
+
+          {/* 2. Merge Down */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
                 onClick={onMergeLayers}
-                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+                disabled={mergeDownDisabled}
+                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground disabled:opacity-40 disabled:cursor-not-allowed"
                 data-ocid="layers.merge_button"
               >
-                <Check size={12} />
+                <ArrowDownToLine size={12} />
               </button>
             </TooltipTrigger>
             <TooltipContent>Merge Down</TooltipContent>
           </Tooltip>
+
+          {/* 3. Alpha Lock */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => onToggleAlphaLock(activeLayerId)}
+                disabled={lockOpsDisabled}
+                className={`p-1 rounded hover:bg-accent disabled:opacity-40 disabled:cursor-not-allowed ${activeLayer?.alphaLock ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                data-ocid="layers.alpha_lock_button"
+              >
+                <span
+                  style={{
+                    fontSize: 12,
+                    fontWeight: "bold",
+                    lineHeight: 1,
+                    fontFamily: "serif",
+                  }}
+                >
+                  α
+                </span>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Alpha Lock</TooltipContent>
+          </Tooltip>
+
+          {/* 4. Clipping Mask */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => onToggleClippingMask(activeLayerId)}
+                disabled={lockOpsDisabled}
+                className={`p-1 rounded hover:bg-accent disabled:opacity-40 disabled:cursor-not-allowed ${activeLayer?.isClippingMask ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                data-ocid="layers.clipping_mask_button"
+              >
+                <Layers size={12} />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Clipping Mask</TooltipContent>
+          </Tooltip>
+
+          {/* 5. Copy to New Layer / Duplicate Layer (dual behavior) */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={
+                  hasActiveSelection ? onCopyToNewLayer : onDuplicateLayer
+                }
+                disabled={lockOpsDisabled}
+                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground disabled:opacity-40 disabled:cursor-not-allowed"
+                data-ocid="layers.copy_to_new_layer_button"
+              >
+                <ClipboardCopy size={12} />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {hasActiveSelection ? "Copy to New Layer" : "Duplicate Layer"}
+            </TooltipContent>
+          </Tooltip>
+
+          {/* 6. Cut to New Layer */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={onCutToNewLayer}
+                disabled={selectionOpsDisabled || lockOpsDisabled}
+                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground disabled:opacity-40 disabled:cursor-not-allowed"
+                data-ocid="layers.cut_to_new_layer_button"
+              >
+                <Scissors size={12} />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Cut to New Layer</TooltipContent>
+          </Tooltip>
+
+          {/* 7. New Group */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
                 onClick={onCreateGroup}
-                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+                disabled={newGroupDisabled}
+                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground disabled:opacity-40 disabled:cursor-not-allowed"
                 data-ocid="layers.create_group_button"
               >
                 <FolderPlus size={12} />
@@ -1124,6 +1227,8 @@ export const LayersPanel = memo(function LayersPanel({
             </TooltipTrigger>
             <TooltipContent>New Layer Group</TooltipContent>
           </Tooltip>
+
+          {/* 8. New Layer */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -1149,6 +1254,15 @@ export const LayersPanel = memo(function LayersPanel({
           <select
             value={panelBlendMode}
             onChange={(e) => handlePanelBlendModeChange(e.target.value)}
+            onBlur={() => {
+              requestAnimationFrame(() => {
+                document
+                  .querySelector<HTMLCanvasElement>(
+                    '[data-ocid="canvas.canvas_target"]',
+                  )
+                  ?.focus();
+              });
+            }}
             onMouseDown={(e) => e.stopPropagation()}
             className="flex-1 text-[9px] bg-transparent text-foreground border border-border/40 rounded px-1 py-0.5 focus:outline-none focus:border-primary cursor-pointer min-w-0 truncate"
             data-ocid="layers.panel_blend_select"

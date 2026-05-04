@@ -17,7 +17,8 @@ export type HotkeyAction = {
     | "Brush"
     | "History"
     | "Selection"
-    | "Ruler";
+    | "Ruler"
+    | "Interface";
   primary: KeyBinding | null;
   secondary: KeyBinding | null;
   locked?: boolean;
@@ -374,6 +375,14 @@ export const DEFAULT_HOTKEYS: Record<string, HotkeyAction> = {
     label: "Crop Canvas",
     category: "Tools",
     primary: { key: "c", shift: true },
+    secondary: null,
+  },
+  // Interface
+  toggle_ui_mode: {
+    id: "toggle_ui_mode",
+    label: "Toggle Mobile/Desktop UI",
+    category: "Interface",
+    primary: { key: "tab", ctrl: false, shift: false, alt: false, meta: false },
     secondary: null,
   },
 };

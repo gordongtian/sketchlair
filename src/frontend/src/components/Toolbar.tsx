@@ -211,7 +211,6 @@ export function Toolbar({
   onNavigateToSplash,
 }: ToolbarProps) {
   const [showUnsavedDialog, setShowUnsavedDialog] = useState(false);
-
   const handleHomeTap = () => {
     if (hasUnsavedChanges) {
       setShowUnsavedDialog(true);

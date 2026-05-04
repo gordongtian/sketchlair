@@ -142,19 +142,42 @@ export interface BrushPreset {
     settings: string;
     isDefault: boolean;
 }
+export interface CatalogItem {
+    id: string;
+    contentType: ContentType;
+    name: string;
+    imageCount: bigint;
+    description: string;
+    isFree: boolean;
+    previewThumbnail: string;
+    isSubscriberContent: boolean;
+    priceUsdCents?: bigint;
+}
+export interface SubscriptionStatus {
+    active: boolean;
+    expiryDateMs?: bigint;
+}
 export interface UserProfile {
     name: string;
 }
 export interface ImageSet {
     id: string;
+    contentType: ContentType;
     name: string;
     tags: Array<string>;
     imageCount: bigint;
+    description: string;
     isFree: boolean;
     previewThumbnail: string;
     isDefault: boolean;
+    isSubscriberContent: boolean;
+    priceUsdCents?: bigint;
     priceICP?: string;
     images: Array<ImageReference>;
+}
+export enum ContentType {
+    learningmodule = "learningmodule",
+    referencepack = "referencepack"
 }
 export enum UserRole {
     admin = "admin",
@@ -200,6 +223,18 @@ export interface backendInterface {
      */
     deleteImageSet(setId: string): Promise<boolean>;
     /**
+     * / Admin only — remove an animation from the mascot registry.
+     * / If the deleted animation was the default idle, clears defaultIdleAnimationName.
+     * / Returns true on success, false if caller is not admin or name not found.
+     */
+    deleteMascotAnimation(name: string): Promise<boolean>;
+    /**
+     * / Admin only — remove an expression from the mascot registry.
+     * / If the deleted expression was the default, clears defaultExpressionName.
+     * / Returns true on success, false if caller is not admin or name not found.
+     */
+    deleteMascotExpression(name: string): Promise<boolean>;
+    /**
      * / Admin only — get all image sets including paid ones, for admin management UI.
      * / Returns an empty array if caller is not admin.
      * / Uses an update call (not query) so it can run ensureStarterSetsCleared()
@@ -214,18 +249,47 @@ export interface backendInterface {
     getAllPublicImageSets(): Promise<Array<PublicImageSet>>;
     /**
      * / Public query — returns all free sets plus sets the caller has purchased entitlements for.
+     * / Also includes subscriber-tagged sets if the caller has an active subscription.
      */
     getAvailableImageSets(): Promise<Array<ImageSet>>;
     getBrushPresets(): Promise<string | null>;
     getCallerUserProfile(): Promise<UserProfile | null>;
     getCallerUserRole(): Promise<UserRole>;
     getCanvasHash(): Promise<CanvasSave | null>;
+    getFullCatalog(): Promise<{
+        packs: Array<CatalogItem>;
+        modules: Array<CatalogItem>;
+    }>;
+    /**
+     * / Public query — returns the in-app guide script, or null if not yet set.
+     * / Equivalent to getModuleScript("guide").
+     */
+    getGuideScript(): Promise<string | null>;
+    /**
+     * / Public query — returns all mascot registry data: expressions, animations, and defaults.
+     * / Returns empty arrays and null defaults if nothing has been uploaded yet.
+     */
+    getMascotAssets(): Promise<{
+        defaultIdleAnimationName?: string;
+        animations: Array<[string, string]>;
+        expressions: Array<[string, string]>;
+        defaultExpressionName?: string;
+    }>;
+    /**
+     * / Public query — returns the script text for a module, or null if not stored.
+     */
+    getModuleScript(moduleId: string): Promise<string | null>;
     /**
      * / Returns the username for the caller's principal, or null if none registered.
      */
     getMyUsername(): Promise<string | null>;
     getPreferences(): Promise<UserPreferences | null>;
     getSchemaVersion(): Promise<bigint>;
+    /**
+     * / Adds a new admin. Only an existing admin may call this.
+     * / Returns false if the caller is not an admin.
+     */
+    getSubscriptionStatus(): Promise<SubscriptionStatus>;
     /**
      * / Returns the set IDs the caller has been explicitly granted.
      */
@@ -253,12 +317,14 @@ export interface backendInterface {
      * / pack does not exist in the image set registry.
      */
     grantPackEntitlement(userPrincipal: Principal, packId: string): Promise<boolean>;
+    grantSubscription(userPrincipal: Principal, stripeSubId: string, expiryDateMs: bigint): Promise<boolean>;
     /**
      * / Returns true if the given principal is in the admin set.
      * / Safe as a query because isAdminPrincipal() never mutates state.
      */
     isAdmin(p: Principal): Promise<boolean>;
     isCallerAdmin(): Promise<boolean>;
+    isEntitledTo(userPrincipal: Principal, packId: string): Promise<boolean>;
     /**
      * / Registers a username for the caller's principal.
      * / Returns true on success, false if the caller already has a username
@@ -286,12 +352,38 @@ export interface backendInterface {
      * / Admin: revoke a set from a principal. Returns false if the set does not exist.
      */
     revokeEntitlement(principal: Principal, setId: string): Promise<boolean>;
+    revokeSubscription(userPrincipal: Principal): Promise<boolean>;
     saveBrush(brush: BrushPreset): Promise<void>;
     saveBrushPresets(data: string): Promise<void>;
     saveCallerUserProfile(profile: UserProfile): Promise<void>;
     saveCanvasHash(canvasHash: CanvasSave): Promise<void>;
+    /**
+     * / Admin only — save or overwrite the in-app guide dialogue script.
+     * / Equivalent to saveModuleScript("guide", scriptText).
+     * / Returns true on success, false if caller is not admin.
+     */
+    saveGuideScript(scriptText: string): Promise<boolean>;
+    /**
+     * / Admin only — save or overwrite the dialogue script for a module.
+     * / Module IDs are simple strings like "figure-drawing" or "still-life".
+     * / Use moduleId = "guide" to set the in-app guide script.
+     * / Returns true on success, false if caller is not admin.
+     */
+    saveModuleScript(moduleId: string, scriptText: string): Promise<boolean>;
     savePreferences(prefs: UserPreferences): Promise<void>;
     saveUserSettings(settings: SettingsSave): Promise<void>;
+    setContentType(setId: string, contentType: ContentType): Promise<boolean>;
+    /**
+     * / Admin only — set the default expression name.
+     * / Returns false if no expression with that name exists or caller is not admin.
+     */
+    setDefaultExpression(name: string): Promise<boolean>;
+    /**
+     * / Admin only — set the default idle animation name.
+     * / Returns false if no animation with that name exists or caller is not admin.
+     */
+    setDefaultIdleAnimation(name: string): Promise<boolean>;
+    setDescription(setId: string, description: string): Promise<boolean>;
     /**
      * / Admin only — mark a set as the sole default set.
      * / Unsets isDefault on all other sets. Returns false if caller is not admin
@@ -310,14 +402,29 @@ export interface backendInterface {
      * / Returns false if the caller is not an admin.
      */
     setPaymentsCanisterPrincipal(p: Principal): Promise<boolean>;
+    setPriceUsdCents(setId: string, priceUsdCents: bigint | null): Promise<boolean>;
+    setSubscriberContent(setId: string, isSubscriberContent: boolean): Promise<boolean>;
     /**
      * / Admin only — update the tags for an image set.
      * / All tags are normalized to lowercase before storing.
      * / Returns false if caller is not admin or setId doesn't exist.
      */
     updateSetTags(setId: string, tags: Array<string>): Promise<boolean>;
+    updateSubscriptionExpiry(userPrincipal: Principal, newExpiryMs: bigint): Promise<boolean>;
+    /**
+     * / Admin only — add or replace an animation (Lottie JSON) in the mascot registry.
+     * / If an animation with the same name already exists, its blobUrl is replaced.
+     * / Returns true on success, false if caller is not admin.
+     */
+    uploadMascotAnimation(name: string, blobUrl: string): Promise<boolean>;
+    /**
+     * / Admin only — add or replace an expression (PNG) in the mascot registry.
+     * / If an expression with the same name already exists, its blobUrl is replaced.
+     * / Returns true on success, false if caller is not admin.
+     */
+    uploadMascotExpression(name: string, blobUrl: string): Promise<boolean>;
 }
-import type { CanvasSave as _CanvasSave, ImageReference as _ImageReference, ImageSet as _ImageSet, SettingsSave as _SettingsSave, UserPreferences as _UserPreferences, UserProfile as _UserProfile, UserRole as _UserRole, _ImmutableObjectStorageRefillInformation as __ImmutableObjectStorageRefillInformation, _ImmutableObjectStorageRefillResult as __ImmutableObjectStorageRefillResult } from "./declarations/backend.did.d.ts";
+import type { CanvasSave as _CanvasSave, CatalogItem as _CatalogItem, ContentType as _ContentType, ImageReference as _ImageReference, ImageSet as _ImageSet, SettingsSave as _SettingsSave, SubscriptionStatus as _SubscriptionStatus, UserPreferences as _UserPreferences, UserProfile as _UserProfile, UserRole as _UserRole, _ImmutableObjectStorageRefillInformation as __ImmutableObjectStorageRefillInformation, _ImmutableObjectStorageRefillResult as __ImmutableObjectStorageRefillResult } from "./declarations/backend.did.d.ts";
 export class Backend implements backendInterface {
     constructor(private actor: ActorSubclass<_SERVICE>, private _uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, private _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, private processError?: (error: unknown) => never){}
     async _immutableObjectStorageBlobsAreLive(arg0: Array<Uint8Array>): Promise<Array<boolean>> {
@@ -516,6 +623,34 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async deleteMascotAnimation(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.deleteMascotAnimation(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.deleteMascotAnimation(arg0);
+            return result;
+        }
+    }
+    async deleteMascotExpression(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.deleteMascotExpression(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.deleteMascotExpression(arg0);
+            return result;
+        }
+    }
     async getAllImageSetsAdmin(): Promise<Array<ImageSet>> {
         if (this.processError) {
             try {
@@ -576,42 +711,106 @@ export class Backend implements backendInterface {
         if (this.processError) {
             try {
                 const result = await this.actor.getCallerUserProfile();
-                return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
+                return from_candid_opt_n17(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.getCallerUserProfile();
-            return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
+            return from_candid_opt_n17(this._uploadFile, this._downloadFile, result);
         }
     }
     async getCallerUserRole(): Promise<UserRole> {
         if (this.processError) {
             try {
                 const result = await this.actor.getCallerUserRole();
-                return from_candid_UserRole_n16(this._uploadFile, this._downloadFile, result);
+                return from_candid_UserRole_n18(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.getCallerUserRole();
-            return from_candid_UserRole_n16(this._uploadFile, this._downloadFile, result);
+            return from_candid_UserRole_n18(this._uploadFile, this._downloadFile, result);
         }
     }
     async getCanvasHash(): Promise<CanvasSave | null> {
         if (this.processError) {
             try {
                 const result = await this.actor.getCanvasHash();
-                return from_candid_opt_n18(this._uploadFile, this._downloadFile, result);
+                return from_candid_opt_n20(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.getCanvasHash();
-            return from_candid_opt_n18(this._uploadFile, this._downloadFile, result);
+            return from_candid_opt_n20(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getFullCatalog(): Promise<{
+        packs: Array<CatalogItem>;
+        modules: Array<CatalogItem>;
+    }> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getFullCatalog();
+                return from_candid_record_n21(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getFullCatalog();
+            return from_candid_record_n21(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getGuideScript(): Promise<string | null> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getGuideScript();
+                return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getGuideScript();
+            return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getMascotAssets(): Promise<{
+        defaultIdleAnimationName?: string;
+        animations: Array<[string, string]>;
+        expressions: Array<[string, string]>;
+        defaultExpressionName?: string;
+    }> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getMascotAssets();
+                return from_candid_record_n25(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getMascotAssets();
+            return from_candid_record_n25(this._uploadFile, this._downloadFile, result);
+        }
+    }
+    async getModuleScript(arg0: string): Promise<string | null> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getModuleScript(arg0);
+                return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getModuleScript(arg0);
+            return from_candid_opt_n11(this._uploadFile, this._downloadFile, result);
         }
     }
     async getMyUsername(): Promise<string | null> {
@@ -632,14 +831,14 @@ export class Backend implements backendInterface {
         if (this.processError) {
             try {
                 const result = await this.actor.getPreferences();
-                return from_candid_opt_n19(this._uploadFile, this._downloadFile, result);
+                return from_candid_opt_n26(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.getPreferences();
-            return from_candid_opt_n19(this._uploadFile, this._downloadFile, result);
+            return from_candid_opt_n26(this._uploadFile, this._downloadFile, result);
         }
     }
     async getSchemaVersion(): Promise<bigint> {
@@ -654,6 +853,20 @@ export class Backend implements backendInterface {
         } else {
             const result = await this.actor.getSchemaVersion();
             return result;
+        }
+    }
+    async getSubscriptionStatus(): Promise<SubscriptionStatus> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.getSubscriptionStatus();
+                return from_candid_SubscriptionStatus_n27(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.getSubscriptionStatus();
+            return from_candid_SubscriptionStatus_n27(this._uploadFile, this._downloadFile, result);
         }
     }
     async getUserEntitlements(): Promise<Array<string>> {
@@ -688,28 +901,28 @@ export class Backend implements backendInterface {
         if (this.processError) {
             try {
                 const result = await this.actor.getUserProfile(arg0);
-                return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
+                return from_candid_opt_n17(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.getUserProfile(arg0);
-            return from_candid_opt_n15(this._uploadFile, this._downloadFile, result);
+            return from_candid_opt_n17(this._uploadFile, this._downloadFile, result);
         }
     }
     async getUserSettings(): Promise<SettingsSave | null> {
         if (this.processError) {
             try {
                 const result = await this.actor.getUserSettings();
-                return from_candid_opt_n20(this._uploadFile, this._downloadFile, result);
+                return from_candid_opt_n30(this._uploadFile, this._downloadFile, result);
             } catch (e) {
                 this.processError(e);
                 throw new Error("unreachable");
             }
         } else {
             const result = await this.actor.getUserSettings();
-            return from_candid_opt_n20(this._uploadFile, this._downloadFile, result);
+            return from_candid_opt_n30(this._uploadFile, this._downloadFile, result);
         }
     }
     async getUsernameForPrincipal(arg0: Principal): Promise<string | null> {
@@ -754,6 +967,20 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async grantSubscription(arg0: Principal, arg1: string, arg2: bigint): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.grantSubscription(arg0, arg1, arg2);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.grantSubscription(arg0, arg1, arg2);
+            return result;
+        }
+    }
     async isAdmin(arg0: Principal): Promise<boolean> {
         if (this.processError) {
             try {
@@ -779,6 +1006,20 @@ export class Backend implements backendInterface {
             }
         } else {
             const result = await this.actor.isCallerAdmin();
+            return result;
+        }
+    }
+    async isEntitledTo(arg0: Principal, arg1: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.isEntitledTo(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.isEntitledTo(arg0, arg1);
             return result;
         }
     }
@@ -852,6 +1093,20 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async revokeSubscription(arg0: Principal): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.revokeSubscription(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.revokeSubscription(arg0);
+            return result;
+        }
+    }
     async saveBrush(arg0: BrushPreset): Promise<void> {
         if (this.processError) {
             try {
@@ -908,6 +1163,34 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async saveGuideScript(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.saveGuideScript(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.saveGuideScript(arg0);
+            return result;
+        }
+    }
+    async saveModuleScript(arg0: string, arg1: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.saveModuleScript(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.saveModuleScript(arg0, arg1);
+            return result;
+        }
+    }
     async savePreferences(arg0: UserPreferences): Promise<void> {
         if (this.processError) {
             try {
@@ -933,6 +1216,62 @@ export class Backend implements backendInterface {
             }
         } else {
             const result = await this.actor.saveUserSettings(arg0);
+            return result;
+        }
+    }
+    async setContentType(arg0: string, arg1: ContentType): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setContentType(arg0, to_candid_ContentType_n31(this._uploadFile, this._downloadFile, arg1));
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setContentType(arg0, to_candid_ContentType_n31(this._uploadFile, this._downloadFile, arg1));
+            return result;
+        }
+    }
+    async setDefaultExpression(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setDefaultExpression(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setDefaultExpression(arg0);
+            return result;
+        }
+    }
+    async setDefaultIdleAnimation(arg0: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setDefaultIdleAnimation(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setDefaultIdleAnimation(arg0);
+            return result;
+        }
+    }
+    async setDescription(arg0: string, arg1: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setDescription(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setDescription(arg0, arg1);
             return result;
         }
     }
@@ -978,6 +1317,34 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async setPriceUsdCents(arg0: string, arg1: bigint | null): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setPriceUsdCents(arg0, to_candid_opt_n33(this._uploadFile, this._downloadFile, arg1));
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setPriceUsdCents(arg0, to_candid_opt_n33(this._uploadFile, this._downloadFile, arg1));
+            return result;
+        }
+    }
+    async setSubscriberContent(arg0: string, arg1: boolean): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.setSubscriberContent(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.setSubscriberContent(arg0, arg1);
+            return result;
+        }
+    }
     async updateSetTags(arg0: string, arg1: Array<string>): Promise<boolean> {
         if (this.processError) {
             try {
@@ -992,12 +1359,63 @@ export class Backend implements backendInterface {
             return result;
         }
     }
+    async updateSubscriptionExpiry(arg0: Principal, arg1: bigint): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.updateSubscriptionExpiry(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.updateSubscriptionExpiry(arg0, arg1);
+            return result;
+        }
+    }
+    async uploadMascotAnimation(arg0: string, arg1: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.uploadMascotAnimation(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.uploadMascotAnimation(arg0, arg1);
+            return result;
+        }
+    }
+    async uploadMascotExpression(arg0: string, arg1: string): Promise<boolean> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.uploadMascotExpression(arg0, arg1);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.uploadMascotExpression(arg0, arg1);
+            return result;
+        }
+    }
+}
+function from_candid_CatalogItem_n23(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _CatalogItem): CatalogItem {
+    return from_candid_record_n24(_uploadFile, _downloadFile, value);
+}
+function from_candid_ContentType_n15(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _ContentType): ContentType {
+    return from_candid_variant_n16(_uploadFile, _downloadFile, value);
 }
 function from_candid_ImageSet_n13(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _ImageSet): ImageSet {
     return from_candid_record_n14(_uploadFile, _downloadFile, value);
 }
-function from_candid_UserRole_n16(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _UserRole): UserRole {
-    return from_candid_variant_n17(_uploadFile, _downloadFile, value);
+function from_candid_SubscriptionStatus_n27(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _SubscriptionStatus): SubscriptionStatus {
+    return from_candid_record_n28(_uploadFile, _downloadFile, value);
+}
+function from_candid_UserRole_n18(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: _UserRole): UserRole {
+    return from_candid_variant_n19(_uploadFile, _downloadFile, value);
 }
 function from_candid__ImmutableObjectStorageRefillResult_n4(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: __ImmutableObjectStorageRefillResult): _ImmutableObjectStorageRefillResult {
     return from_candid_record_n5(_uploadFile, _downloadFile, value);
@@ -1005,16 +1423,19 @@ function from_candid__ImmutableObjectStorageRefillResult_n4(_uploadFile: (file: 
 function from_candid_opt_n11(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [string]): string | null {
     return value.length === 0 ? null : value[0];
 }
-function from_candid_opt_n15(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_UserProfile]): UserProfile | null {
+function from_candid_opt_n17(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_UserProfile]): UserProfile | null {
     return value.length === 0 ? null : value[0];
 }
-function from_candid_opt_n18(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_CanvasSave]): CanvasSave | null {
+function from_candid_opt_n20(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_CanvasSave]): CanvasSave | null {
     return value.length === 0 ? null : value[0];
 }
-function from_candid_opt_n19(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_UserPreferences]): UserPreferences | null {
+function from_candid_opt_n26(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_UserPreferences]): UserPreferences | null {
     return value.length === 0 ? null : value[0];
 }
-function from_candid_opt_n20(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_SettingsSave]): SettingsSave | null {
+function from_candid_opt_n29(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [bigint]): bigint | null {
+    return value.length === 0 ? null : value[0];
+}
+function from_candid_opt_n30(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [_SettingsSave]): SettingsSave | null {
     return value.length === 0 ? null : value[0];
 }
 function from_candid_opt_n6(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: [] | [boolean]): boolean | null {
@@ -1025,35 +1446,122 @@ function from_candid_opt_n7(_uploadFile: (file: ExternalBlob) => Promise<Uint8Ar
 }
 function from_candid_record_n14(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
     id: string;
+    contentType: _ContentType;
     name: string;
     tags: Array<string>;
     imageCount: bigint;
+    description: string;
     isFree: boolean;
     previewThumbnail: string;
     isDefault: boolean;
+    isSubscriberContent: boolean;
+    priceUsdCents: [] | [bigint];
     priceICP: [] | [string];
     images: Array<_ImageReference>;
 }): {
     id: string;
+    contentType: ContentType;
     name: string;
     tags: Array<string>;
     imageCount: bigint;
+    description: string;
     isFree: boolean;
     previewThumbnail: string;
     isDefault: boolean;
+    isSubscriberContent: boolean;
+    priceUsdCents?: bigint;
     priceICP?: string;
     images: Array<ImageReference>;
 } {
     return {
         id: value.id,
+        contentType: from_candid_ContentType_n15(_uploadFile, _downloadFile, value.contentType),
         name: value.name,
         tags: value.tags,
         imageCount: value.imageCount,
+        description: value.description,
         isFree: value.isFree,
         previewThumbnail: value.previewThumbnail,
         isDefault: value.isDefault,
+        isSubscriberContent: value.isSubscriberContent,
+        priceUsdCents: record_opt_to_undefined(from_candid_opt_n7(_uploadFile, _downloadFile, value.priceUsdCents)),
         priceICP: record_opt_to_undefined(from_candid_opt_n11(_uploadFile, _downloadFile, value.priceICP)),
         images: value.images
+    };
+}
+function from_candid_record_n21(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+    packs: Array<_CatalogItem>;
+    modules: Array<_CatalogItem>;
+}): {
+    packs: Array<CatalogItem>;
+    modules: Array<CatalogItem>;
+} {
+    return {
+        packs: from_candid_vec_n22(_uploadFile, _downloadFile, value.packs),
+        modules: from_candid_vec_n22(_uploadFile, _downloadFile, value.modules)
+    };
+}
+function from_candid_record_n24(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+    id: string;
+    contentType: _ContentType;
+    name: string;
+    imageCount: bigint;
+    description: string;
+    isFree: boolean;
+    previewThumbnail: string;
+    isSubscriberContent: boolean;
+    priceUsdCents: [] | [bigint];
+}): {
+    id: string;
+    contentType: ContentType;
+    name: string;
+    imageCount: bigint;
+    description: string;
+    isFree: boolean;
+    previewThumbnail: string;
+    isSubscriberContent: boolean;
+    priceUsdCents?: bigint;
+} {
+    return {
+        id: value.id,
+        contentType: from_candid_ContentType_n15(_uploadFile, _downloadFile, value.contentType),
+        name: value.name,
+        imageCount: value.imageCount,
+        description: value.description,
+        isFree: value.isFree,
+        previewThumbnail: value.previewThumbnail,
+        isSubscriberContent: value.isSubscriberContent,
+        priceUsdCents: record_opt_to_undefined(from_candid_opt_n7(_uploadFile, _downloadFile, value.priceUsdCents))
+    };
+}
+function from_candid_record_n25(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+    defaultIdleAnimationName: [] | [string];
+    animations: Array<[string, string]>;
+    expressions: Array<[string, string]>;
+    defaultExpressionName: [] | [string];
+}): {
+    defaultIdleAnimationName?: string;
+    animations: Array<[string, string]>;
+    expressions: Array<[string, string]>;
+    defaultExpressionName?: string;
+} {
+    return {
+        defaultIdleAnimationName: record_opt_to_undefined(from_candid_opt_n11(_uploadFile, _downloadFile, value.defaultIdleAnimationName)),
+        animations: value.animations,
+        expressions: value.expressions,
+        defaultExpressionName: record_opt_to_undefined(from_candid_opt_n11(_uploadFile, _downloadFile, value.defaultExpressionName))
+    };
+}
+function from_candid_record_n28(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+    active: boolean;
+    expiryDateMs: [] | [bigint];
+}): {
+    active: boolean;
+    expiryDateMs?: bigint;
+} {
+    return {
+        active: value.active,
+        expiryDateMs: record_opt_to_undefined(from_candid_opt_n29(_uploadFile, _downloadFile, value.expiryDateMs))
     };
 }
 function from_candid_record_n5(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
@@ -1068,7 +1576,14 @@ function from_candid_record_n5(_uploadFile: (file: ExternalBlob) => Promise<Uint
         topped_up_amount: record_opt_to_undefined(from_candid_opt_n7(_uploadFile, _downloadFile, value.topped_up_amount))
     };
 }
-function from_candid_variant_n17(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+function from_candid_variant_n16(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+    learningmodule: null;
+} | {
+    referencepack: null;
+}): ContentType {
+    return "learningmodule" in value ? ContentType.learningmodule : "referencepack" in value ? ContentType.referencepack : value;
+}
+function from_candid_variant_n19(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
     admin: null;
 } | {
     user: null;
@@ -1079,6 +1594,12 @@ function from_candid_variant_n17(_uploadFile: (file: ExternalBlob) => Promise<Ui
 }
 function from_candid_vec_n12(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: Array<_ImageSet>): Array<ImageSet> {
     return value.map((x)=>from_candid_ImageSet_n13(_uploadFile, _downloadFile, x));
+}
+function from_candid_vec_n22(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: Array<_CatalogItem>): Array<CatalogItem> {
+    return value.map((x)=>from_candid_CatalogItem_n23(_uploadFile, _downloadFile, x));
+}
+function to_candid_ContentType_n31(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: ContentType): _ContentType {
+    return to_candid_variant_n32(_uploadFile, _downloadFile, value);
 }
 function to_candid_UserRole_n8(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: UserRole): _UserRole {
     return to_candid_variant_n9(_uploadFile, _downloadFile, value);
@@ -1092,6 +1613,9 @@ function to_candid_opt_n1(_uploadFile: (file: ExternalBlob) => Promise<Uint8Arra
 function to_candid_opt_n10(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: string | null): [] | [string] {
     return value === null ? candid_none() : candid_some(value);
 }
+function to_candid_opt_n33(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: bigint | null): [] | [bigint] {
+    return value === null ? candid_none() : candid_some(value);
+}
 function to_candid_record_n3(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
     proposed_top_up_amount?: bigint;
 }): {
@@ -1100,6 +1624,17 @@ function to_candid_record_n3(_uploadFile: (file: ExternalBlob) => Promise<Uint8A
     return {
         proposed_top_up_amount: value.proposed_top_up_amount ? candid_some(value.proposed_top_up_amount) : candid_none()
     };
+}
+function to_candid_variant_n32(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: ContentType): {
+    learningmodule: null;
+} | {
+    referencepack: null;
+} {
+    return value == ContentType.learningmodule ? {
+        learningmodule: null
+    } : value == ContentType.referencepack ? {
+        referencepack: null
+    } : value;
 }
 function to_candid_variant_n9(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: UserRole): {
     admin: null;

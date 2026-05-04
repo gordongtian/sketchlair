@@ -29,14 +29,313 @@ export function chaikinSmooth(
   return pts;
 }
 
-// ─── Shared BFS flood fill utility ───────────────────────────────────────────
+// ─── Perceptual color distance ────────────────────────────────────────────────
+/**
+ * Weighted RGB distance approximating human perceptual difference.
+ * The human eye is most sensitive to green and least sensitive to blue.
+ * distance = sqrt(2·ΔR² + 4·ΔG² + 3·ΔB²)
+ */
+function perceptualDistance(
+  r1: number,
+  g1: number,
+  b1: number,
+  r2: number,
+  g2: number,
+  b2: number,
+): number {
+  const dr = r1 - r2;
+  const dg = g1 - g2;
+  const db = b1 - b2;
+  return Math.sqrt(2 * dr * dr + 4 * dg * dg + 3 * db * db);
+}
+
+/** Un-premultiply a pixel's RGB by its alpha (browser canvas stores premultiplied). */
+function unpremultiply(
+  r: number,
+  g: number,
+  b: number,
+  a: number,
+): [number, number, number] {
+  if (a === 0) return [0, 0, 0];
+  return [
+    Math.round((r * 255) / a),
+    Math.round((g * 255) / a),
+    Math.round((b * 255) / a),
+  ];
+}
+
+/**
+ * Hermite smooth step: maps t ∈ [0,1] to a smoothly interpolated weight.
+ * Result has zero derivative at both ends — eliminates banding at the transition.
+ */
+function smoothStep(t: number): number {
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Compute soft selection weight for a pixel given its color distance and the
+ * active tolerance.  Returns 1.0 (fully selected) when well within tolerance,
+ * 0.0 (not selected) when clearly outside, and a smooth blend in the
+ * transition band (tolerance × [0.85, 1.15]).
+ */
+function smoothWeight(distance: number, tolerance: number): number {
+  if (tolerance <= 0) return distance === 0 ? 1.0 : 0.0;
+  const lower = tolerance * 0.85;
+  const upper = tolerance * 1.15;
+  if (distance <= lower) return 1.0;
+  if (distance >= upper) return 0.0;
+  const t = (upper - distance) / (upper - lower);
+  return smoothStep(t);
+}
+
+// ─── Post-processing: erosion on transition region ───────────────────────────
+// biome-ignore lint/correctness/noUnusedVariables: kept for potential future use — do not call from magicWandFloodFill
+function erodeTransition(
+  mask: Float32Array,
+  width: number,
+  height: number,
+): Float32Array {
+  const out = new Float32Array(mask);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      const w = mask[idx];
+      if (w <= 0.1 || w >= 0.9) continue; // only transition band
+      // Check 4-neighbors: if any neighbor < 0.15, reduce this pixel's weight
+      let minNeighbor = 1.0;
+      if (x > 0) minNeighbor = Math.min(minNeighbor, mask[idx - 1]);
+      if (x < width - 1) minNeighbor = Math.min(minNeighbor, mask[idx + 1]);
+      if (y > 0) minNeighbor = Math.min(minNeighbor, mask[idx - width]);
+      if (y < height - 1)
+        minNeighbor = Math.min(minNeighbor, mask[idx + width]);
+      if (minNeighbor < 0.15) {
+        out[idx] = Math.max(0.0, w - 0.3);
+      }
+    }
+  }
+  return out;
+}
+
+// ─── Post-processing: Gaussian blur on transition region only ─────────────────
+// Separable 5-tap Gaussian kernel for sigma ≈ 1.5
+const GAUSS_KERNEL = [0.0625, 0.25, 0.375, 0.25, 0.0625];
+
+function gaussianBlurTransition(
+  mask: Float32Array,
+  width: number,
+  height: number,
+): Float32Array {
+  // First find which pixels are in / near transition band
+  const isTransition = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const w = mask[y * width + x];
+      if (w > 0.05 && w < 0.95) {
+        // Mark this pixel and its 2-pixel neighborhood
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            const ny = y + dy;
+            const nx = x + dx;
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+              isTransition[ny * width + nx] = 1;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Horizontal pass
+  const tmp = new Float32Array(mask);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (!isTransition[idx]) continue;
+      let sum = 0;
+      let wsum = 0;
+      for (let k = 0; k < 5; k++) {
+        const nx = x + k - 2;
+        if (nx >= 0 && nx < width) {
+          sum += mask[y * width + nx] * GAUSS_KERNEL[k];
+          wsum += GAUSS_KERNEL[k];
+        }
+      }
+      tmp[idx] = wsum > 0 ? sum / wsum : mask[idx];
+    }
+  }
+
+  // Vertical pass
+  const out = new Float32Array(tmp);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (!isTransition[idx]) continue;
+      let sum = 0;
+      let wsum = 0;
+      for (let k = 0; k < 5; k++) {
+        const ny = y + k - 2;
+        if (ny >= 0 && ny < height) {
+          sum += tmp[ny * width + x] * GAUSS_KERNEL[k];
+          wsum += GAUSS_KERNEL[k];
+        }
+      }
+      const blurred = wsum > 0 ? sum / wsum : tmp[idx];
+      // Only apply blur to transition pixels — preserve exact 0.0 and 1.0
+      const orig = mask[idx];
+      if (orig >= 0.95) {
+        out[idx] = orig; // keep fully selected
+      } else if (orig <= 0.05) {
+        out[idx] = orig; // keep fully unselected
+      } else {
+        out[idx] = Math.max(0.0, Math.min(1.0, blurred));
+      }
+    }
+  }
+  return out;
+}
+
+// ─── Magic wand scanline flood fill (returns Float32Array) ───────────────────
+/**
+ * Scanline flood fill for the magic wand tool.
+ * Returns a Float32Array (one float per pixel, 0.0–1.0) representing soft selection weights.
+ *
+ * Uses perceptual color distance and Hermite smooth weighting for natural soft edges.
+ * Includes edge post-processing: erosion then Gaussian blur on transition band only.
+ *
+ * @param srcData  - RGBA Uint8ClampedArray from the active layer canvas
+ * @param width    - canvas width
+ * @param height   - canvas height
+ * @param seedX    - x coordinate of the seed pixel
+ * @param seedY    - y coordinate of the seed pixel
+ * @param tolerance - color distance threshold (0–255, used directly)
+ * @param contiguous - true = scanline flood fill; false = all-matching scan
+ */
+export function magicWandFloodFill(
+  srcData: Uint8ClampedArray,
+  width: number,
+  height: number,
+  seedX: number,
+  seedY: number,
+  tolerance: number,
+  contiguous: boolean,
+): Float32Array {
+  const sidx = (seedY * width + seedX) * 4;
+  const seedA = srcData[sidx + 3];
+  const transparentMode = seedA < 10;
+
+  // Seed color (unpremultiplied)
+  const [seedR, seedG, seedB] = transparentMode
+    ? [0, 0, 0]
+    : unpremultiply(srcData[sidx], srcData[sidx + 1], srcData[sidx + 2], seedA);
+
+  /**
+   * Get the selection weight for a pixel at index i in srcData.
+   */
+  function getWeight(pixelIdx: number): number {
+    const pi = pixelIdx * 4;
+    const a = srcData[pi + 3];
+    if (transparentMode) {
+      return a < 10 ? 1.0 : 0.0;
+    }
+    if (a < 10) return 0.0;
+    // Alpha proximity check: if alpha differs too much, treat as different
+    if (Math.abs(a - seedA) > 30) return 0.0;
+    const [r, g, b] = unpremultiply(
+      srcData[pi],
+      srcData[pi + 1],
+      srcData[pi + 2],
+      a,
+    );
+    const dist = perceptualDistance(r, g, b, seedR, seedG, seedB);
+    return smoothWeight(dist, tolerance);
+  }
+
+  let rawMask: Float32Array;
+
+  if (!contiguous) {
+    // All-matching mode: scan every pixel, no connectivity check
+    rawMask = new Float32Array(width * height);
+    for (let i = 0; i < width * height; i++) {
+      rawMask[i] = getWeight(i);
+    }
+  } else {
+    // Contiguous mode: scanline span-fill
+    rawMask = new Float32Array(width * height);
+    const visited = new Uint8Array(width * height);
+
+    // Cutoff weight below which a pixel is treated as a boundary (stops the span)
+    const TRAVERSAL_CUTOFF = 0.02;
+
+    // Stack of {x, y} seed points to expand from
+    const stack: number[] = [];
+    stack.push(seedY * width + seedX);
+
+    while (stack.length > 0) {
+      const pos = stack.pop()!;
+      const sy = Math.floor(pos / width);
+      const sx = pos % width;
+
+      if (visited[pos]) continue;
+      if (getWeight(pos) <= TRAVERSAL_CUTOFF) continue;
+
+      // Walk left to find the leftmost matching pixel in this span
+      let lx = sx;
+      while (lx > 0 && getWeight(sy * width + lx - 1) > TRAVERSAL_CUTOFF) {
+        lx--;
+      }
+
+      // Walk right to find the rightmost matching pixel in this span
+      let rx = sx;
+      while (
+        rx < width - 1 &&
+        getWeight(sy * width + rx + 1) > TRAVERSAL_CUTOFF
+      ) {
+        rx++;
+      }
+
+      // Fill entire span and queue rows above/below
+      for (let cx = lx; cx <= rx; cx++) {
+        const cidx = sy * width + cx;
+        if (!visited[cidx]) {
+          visited[cidx] = 1;
+          rawMask[cidx] = getWeight(cidx);
+        }
+        // Queue pixels above
+        if (sy > 0) {
+          const aboveIdx = (sy - 1) * width + cx;
+          if (!visited[aboveIdx] && getWeight(aboveIdx) > TRAVERSAL_CUTOFF) {
+            stack.push(aboveIdx);
+          }
+        }
+        // Queue pixels below
+        if (sy < height - 1) {
+          const belowIdx = (sy + 1) * width + cx;
+          if (!visited[belowIdx] && getWeight(belowIdx) > TRAVERSAL_CUTOFF) {
+            stack.push(belowIdx);
+          }
+        }
+      }
+    }
+  }
+
+  // Post-processing: Gaussian blur on transition band only (erosion removed — was causing ghost outlines)
+  const blurred = gaussianBlurTransition(rawMask, width, height);
+  return blurred;
+}
+
+// ─── Fill tool BFS flood fill ─────────────────────────────────────────────────
+/**
+ * Binary scanline flood fill used by the fill tool.
+ * Returns Uint8Array (1 = filled, 0 = not filled).
+ * Uses perceptual color distance (matching magic wand formula).
+ */
 export function bfsFloodFill(
   srcData: Uint8ClampedArray,
   width: number,
   height: number,
   sx: number,
   sy: number,
-  tolerance: number, // 0–100 scale
+  tolerance: number, // fill tool's own scale (0–100)
   contiguous: boolean,
   selMask?: Uint8ClampedArray | null,
 ): Uint8Array {
@@ -44,7 +343,6 @@ export function bfsFloodFill(
   const sidx = (sy * width + sx) * 4;
   const sa = srcData[sidx + 3];
 
-  // When seed is transparent, fill all connected transparent pixels
   const fillTransparent = sa === 0;
 
   if (fillTransparent) {
@@ -89,17 +387,18 @@ export function bfsFloodFill(
     srcData[sidx + 2],
     sa,
   );
+  // Use perceptual distance (matching magic wand). tolerance 0–100 maps to 0–255 scale.
   const tol = (tolerance / 100) * 255;
 
   const matches = (i: number): boolean => {
     const a = srcData[i + 3];
     if (a === 0) return false;
     const [r, g, b] = unprem(srcData[i], srcData[i + 1], srcData[i + 2], a);
-    return (
-      Math.abs(r - seedR) <= tol &&
-      Math.abs(g - seedG) <= tol &&
-      Math.abs(b - seedB) <= tol
-    );
+    const dr = r - seedR;
+    const dg = g - seedG;
+    const db = b - seedB;
+    const dist = Math.sqrt(2 * dr * dr + 4 * dg * dg + 3 * db * db);
+    return dist <= tol;
   };
 
   if (contiguous) {
@@ -128,18 +427,250 @@ export function bfsFloodFill(
   return mask;
 }
 
+// ─── Phase 2: destination-over expansion for fill tool ───────────────────────
 /**
- * Grow or shrink a binary mask using a TRUE CIRCULAR structuring element.
+ * After a flood fill, expand the filled region outward by 1 pixel and composite
+ * the fill color UNDERNEATH existing pixels (destination-over blending).
  *
- * pixels > 0 → dilation by |pixels| pixel radius
- * pixels < 0 → erosion  by |pixels| pixel radius
+ * This closes the gap between the fill and anti-aliased line edges:
+ * - Fully opaque line pixels (alpha=255): destination-over = zero visible change
+ * - Fully transparent pixels (alpha=0): fill color appears at full opacity
+ * - Semi-transparent edge pixels: fill color shows through proportionally
  *
- * Circular check: a neighbor Q at offset (dx, dy) is within the structuring
- * element if sqrt(dx² + dy²) <= R, i.e. dx² + dy² <= R².
- * This replaces the old 4-neighbor iteration that produced axis-aligned artifacts.
- *
- * Two-pass (input → output) to avoid in-place propagation artifacts.
+ * @param data       - RGBA pixel array (modified in place)
+ * @param width      - canvas width
+ * @param height     - canvas height
+ * @param filledMask - Uint8Array from bfsFloodFill (1 = filled)
+ * @param fr/fg/fb/fa - fill color RGBA (0–255)
+ * @param seedR/G/B  - seed pixel color (unpremultiplied), used for skip condition
+ * @param tolerance  - fill tolerance (0–100 scale), used for skip condition
  */
+export function applyDestinationOverExpansion(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  filledMask: Uint8Array,
+  fr: number,
+  fg: number,
+  fb: number,
+  fa: number,
+  seedR: number,
+  seedG: number,
+  seedB: number,
+  tolerance: number,
+): void {
+  // Convert tolerance to perceptual distance scale (matching bfsFloodFill)
+  const tol = (tolerance / 100) * 255;
+  const expansionTol = tol * 1.5;
+
+  // Collect expansion zone pixels: unfilled 8-neighbors of filled pixels
+  // Use a Uint8Array as a fast set (1 = in expansion zone)
+  const expansionZone = new Uint8Array(width * height);
+  const unprem = (r: number, g: number, b: number, a: number) => {
+    if (a === 0) return [0, 0, 0] as [number, number, number];
+    return [
+      Math.round((r * 255) / a),
+      Math.round((g * 255) / a),
+      Math.round((b * 255) / a),
+    ] as [number, number, number];
+  };
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (!filledMask[idx]) continue;
+      // Check 8 neighbors
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+          const nidx = ny * width + nx;
+          if (filledMask[nidx]) continue; // already filled — skip
+          if (expansionZone[nidx]) continue; // already queued
+
+          // Skip condition: fully opaque AND color distance > tolerance × 1.5
+          const pi = nidx * 4;
+          const existingA = data[pi + 3];
+          if (existingA === 255) {
+            const [er, eg, eb] = unprem(
+              data[pi],
+              data[pi + 1],
+              data[pi + 2],
+              existingA,
+            );
+            const dr = er - seedR;
+            const dg = eg - seedG;
+            const db = eb - seedB;
+            const dist = Math.sqrt(2 * dr * dr + 4 * dg * dg + 3 * db * db);
+            if (dist > expansionTol) continue; // hard boundary pixel — skip
+          }
+
+          expansionZone[nidx] = 1;
+        }
+      }
+    }
+  }
+
+  // Compute bounding box of expansion zone for batched getImageData
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (expansionZone[y * width + x]) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < 0) return; // no expansion pixels
+
+  // Apply destination-over math directly into the data array
+  // data already contains the canvas pixel data (modified by Phase 1)
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const idx = y * width + x;
+      if (!expansionZone[idx]) continue;
+
+      const pi = idx * 4;
+      const eA = data[pi + 3];
+      const eR = data[pi];
+      const eG = data[pi + 1];
+      const eB = data[pi + 2];
+
+      // destination-over:
+      // outA = eA + fillA × (1 - eA/255)
+      // outR = (eR × eA + fillR × fillA × (1 - eA/255)) / outA
+      const oneMinusEA = 1 - eA / 255;
+      const outA = eA + fa * oneMinusEA;
+      if (outA < 1) continue; // leave fully transparent pixels untouched
+
+      data[pi + 3] = Math.round(outA);
+      data[pi] = Math.round((eR * eA + fr * fa * oneMinusEA) / outA);
+      data[pi + 1] = Math.round((eG * eA + fg * fa * oneMinusEA) / outA);
+      data[pi + 2] = Math.round((eB * eA + fb * fa * oneMinusEA) / outA);
+    }
+  }
+}
+
+// ─── Edge expansion for float masks (magic wand) ──────────────────────────────
+/**
+ * Expand a Float32Array selection mask outward by `radius` pixels.
+ * Each iteration spreads selected pixels one pixel further using 8-neighbor connectivity.
+ * Expanded pixels receive a weight slightly lower than their source pixel (subtract 0.2 per step),
+ * so the transition stays smooth. After all iterations, all values are clamped to [0.0, 1.0].
+ *
+ * This is the equivalent of Photoshop "Select > Modify > Expand" — pushes the selection
+ * boundary into the anti-aliased line transition pixels to eliminate ghost outlines.
+ *
+ * @param mask   - Float32Array of selection weights (0.0–1.0), one per pixel
+ * @param width  - canvas width
+ * @param height - canvas height
+ * @param radius - number of pixels to expand outward (0 = no-op)
+ */
+export function expandFloatMask(
+  mask: Float32Array,
+  width: number,
+  height: number,
+  radius: number,
+): Float32Array {
+  if (radius <= 0) return mask;
+  let cur = new Float32Array(mask);
+  for (let iter = 0; iter < radius; iter++) {
+    const next = new Float32Array(cur);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        if (cur[idx] < 0.1) continue; // only spread from pixels with meaningful weight
+        // Check all 8 neighbors and expand with reduced weight
+        const expandedWeight = cur[idx] - 0.05;
+        if (expandedWeight <= 0) continue;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+            const nidx = ny * width + nx;
+            if (next[nidx] < expandedWeight) {
+              next[nidx] = expandedWeight;
+            }
+          }
+        }
+      }
+    }
+    cur = next;
+  }
+  // Clamp all values to [0.0, 1.0]
+  for (let i = 0; i < cur.length; i++) {
+    if (cur[i] > 1.0) cur[i] = 1.0;
+    else if (cur[i] < 0.0) cur[i] = 0.0;
+  }
+  return cur;
+}
+
+// ─── Grow/shrink for float masks (magic wand) ─────────────────────────────────
+/**
+ * Grow (positive) or shrink (negative) a Float32Array selection mask.
+ * Each iteration dilates or erodes by one pixel using 4-neighbor connectivity.
+ * Preserves float weights: grown pixels inherit the maximum neighbor weight,
+ * eroded pixels are zeroed when any 4-neighbor is zero.
+ */
+export function growShrinkFloatMask(
+  mask: Float32Array,
+  width: number,
+  height: number,
+  pixels: number,
+): Float32Array {
+  if (pixels === 0) return mask;
+  let cur = new Float32Array(mask);
+  const iters = Math.abs(pixels);
+  const grow = pixels > 0;
+  for (let iter = 0; iter < iters; iter++) {
+    const next = new Float32Array(cur);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        if (grow) {
+          if (cur[idx] < 1.0) {
+            // Dilate: take max of neighbors
+            let maxN = cur[idx];
+            if (x > 0) maxN = Math.max(maxN, cur[idx - 1]);
+            if (x < width - 1) maxN = Math.max(maxN, cur[idx + 1]);
+            if (y > 0) maxN = Math.max(maxN, cur[idx - width]);
+            if (y < height - 1) maxN = Math.max(maxN, cur[idx + width]);
+            next[idx] = maxN;
+          }
+        } else {
+          if (cur[idx] > 0.0) {
+            // Erode: zero if any 4-neighbor is zero
+            const onEdge =
+              x === 0 || x === width - 1 || y === 0 || y === height - 1;
+            if (
+              onEdge ||
+              cur[idx - 1] === 0 ||
+              cur[idx + 1] === 0 ||
+              cur[idx - width] === 0 ||
+              cur[idx + width] === 0
+            ) {
+              next[idx] = 0.0;
+            }
+          }
+        }
+      }
+    }
+    cur = next;
+  }
+  return cur;
+}
+
+// ─── Legacy grow/shrink (binary, fill tool) ───────────────────────────────────
 export function growShrinkMask(
   mask: Uint8Array,
   width: number,
@@ -147,432 +678,48 @@ export function growShrinkMask(
   pixels: number,
 ): Uint8Array {
   if (pixels === 0) return mask;
-
-  const R = Math.abs(pixels);
-  const R2 = R * R;
+  let cur = new Uint8Array(mask);
+  const iters = Math.abs(pixels);
   const grow = pixels > 0;
-
-  const input = new Uint8Array(mask);
-  const output = new Uint8Array(mask); // copy so unchanged pixels stay same
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = y * width + x;
-
-      if (grow) {
-        // Dilation: mark unselected pixel as selected if any neighbor within
-        // the circular radius is selected.
-        if (input[idx]) continue; // already selected — keep as is
-        const minY = Math.max(0, y - R);
-        const maxY = Math.min(height - 1, y + R);
-        const minX = Math.max(0, x - R);
-        const maxX = Math.min(width - 1, x + R);
-        let found = false;
-        for (let ny = minY; ny <= maxY && !found; ny++) {
-          for (let nx = minX; nx <= maxX && !found; nx++) {
-            const dx = nx - x;
-            const dy = ny - y;
-            if (dx * dx + dy * dy <= R2 && input[ny * width + nx]) {
-              found = true;
-            }
-          }
-        }
-        if (found) output[idx] = 1;
-      } else {
-        // Erosion: deselect a selected pixel if any neighbor within the
-        // circular radius is NOT selected (including out-of-bounds → treated as 0).
-        if (!input[idx]) continue; // already unselected — keep as is
-        const minY = Math.max(0, y - R);
-        const maxY = Math.min(height - 1, y + R);
-        const minX = Math.max(0, x - R);
-        const maxX = Math.min(width - 1, x + R);
-        // Out-of-bounds neighbor counts as unselected → immediate erosion
-        if (y - R < 0 || y + R >= height || x - R < 0 || x + R >= width) {
-          output[idx] = 0;
-          continue;
-        }
-        let erode = false;
-        for (let ny = minY; ny <= maxY && !erode; ny++) {
-          for (let nx = minX; nx <= maxX && !erode; nx++) {
-            const dx = nx - x;
-            const dy = ny - y;
-            if (dx * dx + dy * dy <= R2 && !input[ny * width + nx]) {
-              erode = true;
-            }
-          }
-        }
-        if (erode) output[idx] = 0;
-      }
-    }
-  }
-
-  return output;
-}
-
-// ─── Perceptual color distance (weighted RGB, accounts for human perception) ──
-/**
- * Computes perceptual color distance using a weighted RGB approach.
- * weightedDistance = sqrt(2*ΔR² + 4*ΔG² + 3*ΔB²)
- * Produces more intuitive results than simple Euclidean RGB distance.
- */
-export function perceptualColorDistance(
-  r1: number,
-  g1: number,
-  b1: number,
-  r2: number,
-  g2: number,
-  b2: number,
-): number {
-  const dr = r1 - r2;
-  const dg = g1 - g2;
-  const db = b1 - b2;
-  return Math.sqrt(2 * dr * dr + 4 * dg * dg + 3 * db * db);
-}
-
-// ─── Distance transform (2-pass chamfer approximation) ────────────────────────
-/**
- * Computes approximate Euclidean distance to nearest boundary pixel for each pixel.
- * Uses a 2-pass chamfer distance transform (top-left sweep, then bottom-right sweep).
- * Result[i] = 0 for boundary pixels, positive float for non-boundary pixels.
- */
-export function computeDistanceTransform(
-  boundaryMask: Uint8Array,
-  width: number,
-  height: number,
-): Float32Array {
-  const dist = new Float32Array(width * height).fill(Number.POSITIVE_INFINITY);
-
-  // Seed boundary pixels at 0
-  for (let i = 0; i < width * height; i++) {
-    if (boundaryMask[i]) dist[i] = 0;
-  }
-
-  // Pass 1: top-left to bottom-right
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = y * width + x;
-      if (boundaryMask[idx]) continue;
-      // Check top and left neighbors
-      if (y > 0) {
-        const top = dist[(y - 1) * width + x] + 1;
-        if (top < dist[idx]) dist[idx] = top;
-      }
-      if (x > 0) {
-        const left = dist[y * width + x - 1] + 1;
-        if (left < dist[idx]) dist[idx] = left;
-      }
-      // Diagonal neighbors (√2)
-      if (y > 0 && x > 0) {
-        const topLeft = dist[(y - 1) * width + (x - 1)] + Math.SQRT2;
-        if (topLeft < dist[idx]) dist[idx] = topLeft;
-      }
-      if (y > 0 && x < width - 1) {
-        const topRight = dist[(y - 1) * width + (x + 1)] + Math.SQRT2;
-        if (topRight < dist[idx]) dist[idx] = topRight;
-      }
-    }
-  }
-
-  // Pass 2: bottom-right to top-left
-  for (let y = height - 1; y >= 0; y--) {
-    for (let x = width - 1; x >= 0; x--) {
-      const idx = y * width + x;
-      if (boundaryMask[idx]) continue;
-      if (y < height - 1) {
-        const bottom = dist[(y + 1) * width + x] + 1;
-        if (bottom < dist[idx]) dist[idx] = bottom;
-      }
-      if (x < width - 1) {
-        const right = dist[y * width + x + 1] + 1;
-        if (right < dist[idx]) dist[idx] = right;
-      }
-      if (y < height - 1 && x < width - 1) {
-        const bottomRight = dist[(y + 1) * width + (x + 1)] + Math.SQRT2;
-        if (bottomRight < dist[idx]) dist[idx] = bottomRight;
-      }
-      if (y < height - 1 && x > 0) {
-        const bottomLeft = dist[(y + 1) * width + (x - 1)] + Math.SQRT2;
-        if (bottomLeft < dist[idx]) dist[idx] = bottomLeft;
-      }
-    }
-  }
-
-  return dist;
-}
-
-// ─── Morphological dilation by radius ─────────────────────────────────────────
-/**
- * Returns new ImageData with boundary pixels expanded outward by radius pixels.
- * For radius < 10: uses simple nested loop neighbor scan.
- * For radius >= 10: uses distance transform for efficiency.
- * Non-boundary pixels within radius of any boundary pixel become
- * copies of the nearest boundary pixel's color.
- */
-export function dilateByRadius(
-  src: ImageData,
-  boundaryMask: Uint8Array,
-  radius: number,
-  width: number,
-  height: number,
-): ImageData {
-  const out = new ImageData(new Uint8ClampedArray(src.data), width, height);
-
-  if (radius <= 0) return out;
-
-  if (radius < 10) {
-    // Simple neighbor scan approach
+  for (let iter = 0; iter < iters; iter++) {
+    const next = new Uint8Array(cur);
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const idx = y * width + x;
-        if (boundaryMask[idx]) continue; // already a boundary pixel
-
-        // Search in a square neighborhood of size (2*radius+1)
-        let nearestDist = Number.POSITIVE_INFINITY;
-        let nearestIdx = -1;
-
-        const minY = Math.max(0, y - radius);
-        const maxY = Math.min(height - 1, y + radius);
-        const minX = Math.max(0, x - radius);
-        const maxX = Math.min(width - 1, x + radius);
-
-        for (let ny = minY; ny <= maxY; ny++) {
-          for (let nx = minX; nx <= maxX; nx++) {
-            const nidx = ny * width + nx;
-            if (!boundaryMask[nidx]) continue;
-            const dx = nx - x;
-            const dy = ny - y;
-            const d = dx * dx + dy * dy;
-            if (d <= radius * radius && d < nearestDist) {
-              nearestDist = d;
-              nearestIdx = nidx;
+        if (grow) {
+          if (!cur[idx]) {
+            if (
+              (x > 0 && cur[idx - 1]) ||
+              (x < width - 1 && cur[idx + 1]) ||
+              (y > 0 && cur[idx - width]) ||
+              (y < height - 1 && cur[idx + width])
+            ) {
+              next[idx] = 1;
+            }
+          }
+        } else {
+          if (cur[idx]) {
+            if (
+              x === 0 ||
+              x === width - 1 ||
+              y === 0 ||
+              y === height - 1 ||
+              !cur[idx - 1] ||
+              !cur[idx + 1] ||
+              !cur[idx - width] ||
+              !cur[idx + width]
+            ) {
+              next[idx] = 0;
             }
           }
         }
-
-        if (nearestIdx >= 0) {
-          const pi = idx * 4;
-          const ni = nearestIdx * 4;
-          out.data[pi] = src.data[ni];
-          out.data[pi + 1] = src.data[ni + 1];
-          out.data[pi + 2] = src.data[ni + 2];
-          out.data[pi + 3] = src.data[ni + 3];
-        }
       }
     }
-  } else {
-    // Distance transform approach for large radii
-    const dist = computeDistanceTransform(boundaryMask, width, height);
-
-    // For each non-boundary pixel within radius, copy nearest boundary pixel color
-    // We also need to track nearest boundary pixel index — do a second pass using
-    // the distance transform to propagate source indices
-    const nearestIdx = new Int32Array(width * height).fill(-1);
-
-    // Seed with boundary pixel indices
-    for (let i = 0; i < width * height; i++) {
-      if (boundaryMask[i]) nearestIdx[i] = i;
-    }
-
-    // Pass 1: top-left to bottom-right — propagate nearest index
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const idx = y * width + x;
-        if (boundaryMask[idx]) continue;
-        if (dist[idx] > radius) continue;
-
-        const candidates: number[] = [];
-        if (y > 0) candidates.push((y - 1) * width + x);
-        if (x > 0) candidates.push(y * width + x - 1);
-        if (y > 0 && x > 0) candidates.push((y - 1) * width + x - 1);
-        if (y > 0 && x < width - 1) candidates.push((y - 1) * width + x + 1);
-
-        let best = Number.POSITIVE_INFINITY;
-        for (const c of candidates) {
-          if (nearestIdx[c] >= 0 && dist[c] < best) {
-            best = dist[c];
-            nearestIdx[idx] = nearestIdx[c];
-          }
-        }
-      }
-    }
-
-    // Pass 2: bottom-right to top-left — propagate nearest index
-    for (let y = height - 1; y >= 0; y--) {
-      for (let x = width - 1; x >= 0; x--) {
-        const idx = y * width + x;
-        if (boundaryMask[idx]) continue;
-        if (dist[idx] > radius) continue;
-
-        const candidates: number[] = [];
-        if (y < height - 1) candidates.push((y + 1) * width + x);
-        if (x < width - 1) candidates.push(y * width + x + 1);
-        if (y < height - 1 && x < width - 1)
-          candidates.push((y + 1) * width + x + 1);
-        if (y < height - 1 && x > 0) candidates.push((y + 1) * width + x - 1);
-
-        let best =
-          nearestIdx[idx] >= 0
-            ? dist[nearestIdx[idx]]
-            : Number.POSITIVE_INFINITY;
-        for (const c of candidates) {
-          if (nearestIdx[c] >= 0 && dist[c] < best) {
-            best = dist[c];
-            nearestIdx[idx] = nearestIdx[c];
-          }
-        }
-      }
-    }
-
-    // Apply dilation: copy color from nearest boundary pixel
-    for (let i = 0; i < width * height; i++) {
-      if (boundaryMask[i]) continue;
-      if (dist[i] > radius) continue;
-      const ni = nearestIdx[i];
-      if (ni < 0) continue;
-      const pi = i * 4;
-      const npi = ni * 4;
-      out.data[pi] = src.data[npi];
-      out.data[pi + 1] = src.data[npi + 1];
-      out.data[pi + 2] = src.data[npi + 2];
-      out.data[pi + 3] = src.data[npi + 3];
-    }
+    cur = next;
   }
-
-  return out;
+  return cur;
 }
 
-// ─── Edge-only Gaussian blur on float mask ────────────────────────────────────
-/**
- * Applies a small Gaussian/box blur only to transition pixels (0.05–0.95).
- * Fully selected (>= 0.95) and fully unselected (<= 0.05) pixels are not blurred.
- * This preserves sharp interiors while softening selection edges.
- */
-export function blurEdgesOnly(
-  mask: Float32Array,
-  width: number,
-  height: number,
-  radius: number,
-): Float32Array {
-  const out = new Float32Array(mask);
-  const r = Math.max(1, Math.round(radius));
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = y * width + x;
-      const v = mask[idx];
-      // Only blur edge/transition pixels
-      if (v <= 0.05 || v >= 0.95) continue;
-
-      // Box blur over (2r+1)² neighborhood
-      let sum = 0;
-      let count = 0;
-      const minY = Math.max(0, y - r);
-      const maxY = Math.min(height - 1, y + r);
-      const minX = Math.max(0, x - r);
-      const maxX = Math.min(width - 1, x + r);
-
-      for (let ny = minY; ny <= maxY; ny++) {
-        for (let nx = minX; nx <= maxX; nx++) {
-          sum += mask[ny * width + nx];
-          count++;
-        }
-      }
-
-      out[idx] = sum / count;
-    }
-  }
-
-  return out;
-}
-
-// ─── Float mask → HTMLCanvasElement (for selection system compatibility) ──────
-/**
- * Converts a float mask (0.0–1.0) to an HTMLCanvasElement with white pixels.
- * Pixels with mask >= 0.5 become white (255,255,255) with alpha = mask * 255.
- * Pixels with mask < 0.5 become transparent.
- * Supports soft edge compositing while remaining compatible with white-pixel
- * selection tools that check for white pixel presence.
- */
-export function floatMaskToCanvas(
-  mask: Float32Array,
-  width: number,
-  height: number,
-): HTMLCanvasElement {
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return canvas;
-
-  const imageData = ctx.createImageData(width, height);
-  const data = imageData.data;
-
-  for (let i = 0; i < width * height; i++) {
-    const v = mask[i];
-    if (v >= 0.5) {
-      const pi = i * 4;
-      data[pi] = 255;
-      data[pi + 1] = 255;
-      data[pi + 2] = 255;
-      data[pi + 3] = Math.round(v * 255);
-    }
-    // else: transparent (default zero)
-  }
-
-  ctx.putImageData(imageData, 0, 0);
-  return canvas;
-}
-
-// ─── Boundary pixel detection (for gap closing preprocessing) ─────────────────
-/**
- * Returns a Uint8Array where 1 = boundary pixel, 0 = non-boundary.
- * Boundary pixels are those with:
- *   - alpha > alphaThreshold, OR
- *   - perceptual color distance from seed color > colorThreshold
- * This identifies linework and obstructions that define fill regions.
- */
-export function extractBoundaryMask(
-  imageData: ImageData,
-  seedR: number,
-  seedG: number,
-  seedB: number,
-  alphaThreshold = 20,
-  colorThreshold = 30,
-): Uint8Array {
-  const { data, width, height } = imageData;
-  const mask = new Uint8Array(width * height);
-
-  for (let i = 0; i < width * height; i++) {
-    const pi = i * 4;
-    const a = data[pi + 3];
-
-    if (a > alphaThreshold) {
-      // Unpremultiply to get true color
-      const r = a > 0 ? Math.round((data[pi] * 255) / a) : 0;
-      const g = a > 0 ? Math.round((data[pi + 1] * 255) / a) : 0;
-      const b = a > 0 ? Math.round((data[pi + 2] * 255) / a) : 0;
-      const dist = perceptualColorDistance(r, g, b, seedR, seedG, seedB);
-      if (dist > colorThreshold) {
-        mask[i] = 1;
-      } else {
-        // Alpha above threshold but color matches seed — this is a semi-transparent
-        // pixel of the fill color, not a boundary. Still mark as boundary if alpha is high.
-        // We mark as boundary only if alpha alone exceeds a stronger threshold (e.g. 128)
-        // AND color is significantly different. Since dist <= colorThreshold here,
-        // only mark boundary if alpha is very high and could block fill.
-        if (a > 200) {
-          // Strong opaque pixel that happens to match seed color — not a boundary
-          mask[i] = 0;
-        }
-      }
-    }
-    // alpha <= alphaThreshold: transparent pixel, not a boundary
-  }
-
-  return mask;
-}
-
-// ─── Scan a mask canvas for tight pixel bounds ────────────────────────────────
 // Scan a mask canvas for tight pixel bounds. Returns null if the mask is empty.
 export function computeMaskBounds(
   mask: HTMLCanvasElement,
@@ -589,7 +736,7 @@ export function computeMaskBounds(
   let found = false;
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
-      if (data[(y * W + x) * 4 + 3] > 64) {
+      if (data[(y * W + x) * 4 + 3] > 26) {
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;

@@ -212,7 +212,7 @@ export function useDocumentManager(): DocumentManagerResult {
   const removeDocument = useCallback((id: string) => {
     setDocuments((prev) => {
       // Find the document being removed so we can flush its pixel data before removal.
-      const discardedDoc = prev.find((d) => d.id === id);
+      let discardedDoc = prev.find((d) => d.id === id);
 
       // Synchronously flush all pixel data from the discarded document BEFORE
       // filtering it from the array and BEFORE any new document initializes.
@@ -222,6 +222,13 @@ export function useDocumentManager(): DocumentManagerResult {
         const isActiveDoc = discardedDoc.id === loadedDocIdRef.current;
         discardFlushFnRef.current(discardedDoc, isActiveDoc);
       }
+
+      // Sever the local reference after the flush so this updater closure
+      // does not retain the DocumentState object (and its large properties)
+      // any longer than necessary. The flush callback already nulled out all
+      // large properties on the doc, but dropping the pointer here lets the
+      // JS engine reclaim the shell object too.
+      discardedDoc = undefined;
 
       const next = prev.filter((d) => d.id !== id);
 

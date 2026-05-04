@@ -1,4 +1,4 @@
-import { createActorWithConfig } from "@/config";
+import { clearConfigCache, createActorWithConfig } from "@/config";
 import type { Identity } from "@icp-sdk/core/agent";
 import type { Principal } from "@icp-sdk/core/principal";
 import { useEffect, useRef, useState } from "react";
@@ -9,6 +9,7 @@ export interface AuthState {
   principal: Principal | null;
   identity: Identity | null;
   isAdmin: boolean;
+  isAdminPending: boolean;
   username: string | null;
   login: () => void;
   logout: () => void;
@@ -16,10 +17,12 @@ export interface AuthState {
   isInitializing: boolean;
   isLoginSuccess: boolean;
   isLoginError: boolean;
+  retryAdminCheck: () => void;
 }
 
-const MAX_ADMIN_RETRIES = 5;
+const MAX_ADMIN_RETRIES = 8;
 const ADMIN_RETRY_DELAY_MS = 3000;
+const INITIAL_RETRY_DELAY_MS = 1000;
 
 export function useAuth(): AuthState {
   const {
@@ -65,6 +68,21 @@ export function useAuth(): AuthState {
   }
   principalRef.current = principal;
   identityRef.current = identity;
+
+  // isAdminPending: true while we're still trying (user logged in, not yet confirmed, not exhausted)
+  const isAdminPending =
+    !!principalText &&
+    !isAdminConfirmedRef.current &&
+    (isCheckingRef.current || retryCountRef.current < MAX_ADMIN_RETRIES);
+
+  // retryAdminCheck: manual retry — resets all state and triggers a fresh check
+  const retryAdminCheck = () => {
+    isAdminConfirmedRef.current = false;
+    retryCountRef.current = 0;
+    isCheckingRef.current = false;
+    clearConfigCache();
+    setRetryCounter((c) => c + 1);
+  };
 
   useEffect(() => {
     // ── Unauthenticated path ──────────────────────────────────────────────
@@ -137,15 +155,20 @@ export function useAuth(): AuthState {
           // Schedule retry so cold-start false results self-correct.
           isCheckingRef.current = false;
           if (retryCountRef.current < MAX_ADMIN_RETRIES) {
+            const isFirstRetry = retryCountRef.current === 0;
             retryCountRef.current += 1;
+            const delay = isFirstRetry
+              ? INITIAL_RETRY_DELAY_MS
+              : ADMIN_RETRY_DELAY_MS;
             console.log(
-              `[Auth] isAdmin returned false — retry ${retryCountRef.current}/${MAX_ADMIN_RETRIES} in ${ADMIN_RETRY_DELAY_MS}ms`,
+              `[Auth] isAdmin returned false — retry ${retryCountRef.current}/${MAX_ADMIN_RETRIES} in ${delay}ms`,
             );
+            clearConfigCache();
             setTimeout(() => {
               // BUG 5 FIX: Never call setIsAdmin(false) here. Only bump the
               // retry counter so the effect re-runs and tries again.
               if (!cancelled) setRetryCounter((c) => c + 1);
-            }, ADMIN_RETRY_DELAY_MS);
+            }, delay);
           }
         }
 
@@ -170,16 +193,26 @@ export function useAuth(): AuthState {
         }
       } catch (err) {
         if (!cancelled) {
-          console.warn("[Auth] isAdmin check error:", err);
+          console.warn(
+            "[Auth] isAdmin check error:",
+            typeof err === "object" && err !== null
+              ? JSON.stringify(err, null, 2)
+              : String(err),
+          );
           isCheckingRef.current = false;
           if (retryCountRef.current < MAX_ADMIN_RETRIES) {
+            const isFirstRetry = retryCountRef.current === 0;
             retryCountRef.current += 1;
+            const delay = isFirstRetry
+              ? INITIAL_RETRY_DELAY_MS
+              : ADMIN_RETRY_DELAY_MS;
             console.log(
-              `[Auth] isAdmin error — retry ${retryCountRef.current}/${MAX_ADMIN_RETRIES} in ${ADMIN_RETRY_DELAY_MS}ms`,
+              `[Auth] isAdmin error — retry ${retryCountRef.current}/${MAX_ADMIN_RETRIES} in ${delay}ms`,
             );
+            clearConfigCache();
             setTimeout(() => {
               if (!cancelled) setRetryCounter((c) => c + 1);
-            }, ADMIN_RETRY_DELAY_MS);
+            }, delay);
           }
         } else {
           isCheckingRef.current = false;
@@ -204,6 +237,7 @@ export function useAuth(): AuthState {
     principal,
     identity: isAuthenticated ? identity! : null,
     isAdmin,
+    isAdminPending,
     username,
     login,
     logout: clear,
@@ -211,5 +245,6 @@ export function useAuth(): AuthState {
     isInitializing,
     isLoginSuccess,
     isLoginError,
+    retryAdminCheck,
   };
 }

@@ -12,11 +12,12 @@ build:
           {
             "backend_host": "http://localhost:8081",
             "backend_canister_id": "$BACKEND_CANISTER_ID",
-            "payments_canister_id": "$CANISTER_ID_PAYMENTS",
+            "payments_canister_id": "",
             "project_id": "undefined",
             "ii_derivation_origin": "undefined"
           }
           EOF
+        - node ../../scripts/inject-canister-ids.mjs
         - pnpm --filter '@caffeine/template-frontend' build:skip-bindings
 
     - type: pre-built

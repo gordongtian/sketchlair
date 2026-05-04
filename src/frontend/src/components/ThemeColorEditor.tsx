@@ -555,6 +555,7 @@ export function ThemeColorEditor({ themeId, onClose }: ThemeColorEditorProps) {
         transform: "translateZ(0)",
       }}
       className="border border-border rounded-lg shadow-2xl overflow-hidden"
+      onPointerDown={(e) => e.stopPropagation()}
     >
       {/* Title bar */}
       <div

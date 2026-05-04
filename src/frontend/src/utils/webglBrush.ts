@@ -57,6 +57,72 @@ export interface WebGLBrushContext {
   isWebGL2: boolean;
   dispose(): void;
   preloadTipTexture(tipImageData: string): void;
+  flushTexCache(): void;
+
+  // ── Liquify GPU pipeline ──────────────────────────────────────────────────
+  /** Freeze source texture and allocate output FBO for one liquify stroke. */
+  initLiquifyGPU(
+    width: number,
+    height: number,
+    sourceImageData: ImageData,
+  ): void;
+  /** Render one warp frame into the output FBO (does NOT commit to the layer). */
+  renderLiquifyFrame(
+    cursorX: number,
+    cursorY: number,
+    dirX: number,
+    dirY: number,
+    radius: number,
+    strength: number,
+    hardness: number,
+  ): void;
+  /** Copy the FBO result (Y-flipped) to the display canvas for live preview,
+   *  composited between background and foreground layer buffers so other
+   *  layers remain visible during the stroke. */
+  blitLiquifyPreview(
+    displayCtx: CanvasRenderingContext2D,
+    bgBuffer: OffscreenCanvas | null,
+    fgBuffer: OffscreenCanvas | null,
+    activeLayerOpacity: number,
+    activeLayerBlendMode: string,
+  ): void;
+  /** Commit the final FBO result to the layer canvas and call destroyLiquifyGPU. */
+  commitLiquify(layerCtx: CanvasRenderingContext2D): void;
+  /** Free per-stroke GPU resources (source tex, output tex, output FBO).
+   *  Does NOT delete liqWarpProg — it is cached across strokes. */
+  destroyLiquifyGPU(): void;
+
+  // ── Per-layer liquify GPU pipeline (All Visible mode) ────────────────────
+  /** Init an independent ping-pong GPU pipeline for one layer. Safe to call
+   *  for multiple layers simultaneously — each layerId gets its own state. */
+  initLiquifyGPUForLayer(
+    layerId: string,
+    width: number,
+    height: number,
+    sourceImageData: ImageData,
+  ): void;
+  /** Render one warp frame for the given layer. Uses the shared liqWarpProg. */
+  renderLiquifyFrameForLayer(
+    layerId: string,
+    cursorX: number,
+    cursorY: number,
+    dirX: number,
+    dirY: number,
+    radius: number,
+    strength: number,
+    hardness: number,
+  ): void;
+  /** Read and Y-flip the current FBO result for a layer. Returns null if not found. */
+  readLiquifyLayerFBO(layerId: string): ImageData | null;
+  /** Commit the final FBO result to the layer canvas and destroy that layer's GPU state. */
+  commitLiquifyForLayer(
+    layerId: string,
+    layerCtx: CanvasRenderingContext2D,
+  ): void;
+  /** Destroy GPU state for one layer only. */
+  destroyLiquifyGPUForLayer(layerId: string): void;
+  /** Destroy GPU state for all per-layer entries. */
+  destroyAllLiquifyGPULayers(): void;
 }
 
 // ----- Shader sources -----
@@ -327,6 +393,70 @@ void main() {
   gl_FragColor = vec4(color * scaledAlpha, scaledAlpha);
 }
 `;
+
+// ── Liquify warp shaders ──────────────────────────────────────────────────────
+// Ping-pong GPU warp: each frame reads from the previous frame's output and applies
+// a small incremental displacement, so displacement accumulates as the brush moves.
+// Alpha bleed is applied on upload — transparent pixel RGB is padded from nearby opaque
+// neighbors so bilinear interpolation does not bleed black into painted edges.
+// Straight-alpha throughout: no premultiplication in upload or shader.
+
+const LIQ_VERT = `
+attribute vec2 a_position;
+varying vec2 v_uv;
+void main() {
+  v_uv = a_position * 0.5 + 0.5;
+  gl_Position = vec4(a_position, 0.0, 1.0);
+}`;
+
+const LIQ_FRAG = `
+precision highp float;
+
+uniform sampler2D u_source;
+uniform vec2 u_cursor;
+uniform vec2 u_direction;
+uniform float u_radius;
+uniform float u_strength;
+uniform float u_hardness;
+uniform vec2 u_aspect;
+
+varying vec2 v_uv;
+
+void main() {
+  // Correct UV for canvas orientation (row 0 = top of image)
+  vec2 uv = v_uv;
+
+  // Distance from this fragment to cursor — account for non-square canvas aspect
+  vec2 delta = (uv - u_cursor) * u_aspect;
+  float dist = length(delta);
+
+  if (dist >= u_radius * u_aspect.x) {
+    // Outside brush radius — sample source directly, no warp
+    gl_FragColor = texture2D(u_source, uv);
+    return;
+  }
+
+  // Normalized distance 0 (center) to 1 (edge)
+  float t = dist / (u_radius * u_aspect.x);
+
+  // Radial falloff: flat inside inner ring, smooth quadratic in outer ring
+  float weight;
+  float inner = u_hardness;
+  if (t <= inner) {
+    weight = 1.0;
+  } else {
+    float s = (t - inner) / (1.0 - inner + 0.0001);
+    weight = 1.0 - s * s;
+  }
+
+  // Backward mapping: sample source at displaced position
+  // uv - direction: output pixel at P samples from where the pixel came from
+  // before being pushed (P minus the push direction). Using + would invert the warp.
+  vec2 srcUV = uv - u_direction * weight * u_strength;
+  srcUV = clamp(srcUV, 0.0, 1.0);
+
+  gl_FragColor = texture2D(u_source, srcUV);
+}`;
 
 // ----- GL helpers -----
 
@@ -803,6 +933,47 @@ export function createWebGLBrushContext(
 
   // Flag: true after any mask stamp has been written this stroke
   let _maskHasData = false;
+
+  // ── Liquify GPU state ──────────────────────────────────────────────────────
+  // Per-stroke: allocated in initLiquifyGPU, freed in destroyLiquifyGPU.
+  // liqWarpProg is compiled once and cached across all strokes.
+  let liqSourceTex: WebGLTexture | null = null;
+  // Ping-pong pair — each frame reads from liqTex[liqPingIdx] and writes to liqTex[1-liqPingIdx]
+  let liqFBO: [WebGLFramebuffer | null, WebGLFramebuffer | null] = [null, null];
+  let liqTex: [WebGLTexture | null, WebGLTexture | null] = [null, null];
+  let liqPingIdx = 0; // index of the texture currently holding the latest result
+  let liqWarpProg: WebGLProgram | null = null;
+  let liqW = 0;
+  let liqH = 0;
+  // Uniform locations for liqWarpProg — resolved once at compile time
+  let liqWarpAPos = -1;
+  let liqWarpUSource: WebGLUniformLocation | null = null;
+  let liqWarpUCursor: WebGLUniformLocation | null = null;
+  let liqWarpUDirection: WebGLUniformLocation | null = null;
+  let liqWarpURadius: WebGLUniformLocation | null = null;
+  let liqWarpUStrength: WebGLUniformLocation | null = null;
+  let liqWarpUHardness: WebGLUniformLocation | null = null;
+  let liqWarpUAspect: WebGLUniformLocation | null = null;
+
+  // ── Liquify sharpen pass GPU state (retained for cleanup only) ────────────
+  // The sharpen pass is disabled — alpha bleed + LINEAR filtering replaces it.
+  // FBO/tex variables remain so destroyLiquifyGPU can clean up any previously
+  // allocated resources from builds that had the pass enabled.
+  let liqSharpenFBO: WebGLFramebuffer | null = null;
+  let liqSharpenTex: WebGLTexture | null = null;
+
+  // ── Per-layer liquify GPU state (All Visible mode) ────────────────────────
+  // Each visible layer affected by an All Visible stroke gets its own independent
+  // ping-pong FBO pair. All layers share liqWarpProg (compiled once above).
+  interface LiquifyLayerGPUState {
+    fbo: [WebGLFramebuffer | null, WebGLFramebuffer | null];
+    tex: [WebGLTexture | null, WebGLTexture | null];
+    sourceTex: WebGLTexture | null;
+    pingIdx: number;
+    w: number;
+    h: number;
+  }
+  const liqLayerMap = new Map<string, LiquifyLayerGPUState>();
 
   // ---- State ----
   const texCache = new Map<string, WebGLTexture>();
@@ -1518,6 +1689,11 @@ export function createWebGLBrushContext(
       }
       lastCustomTipKey = key;
     },
+    flushTexCache() {
+      for (const t of texCache.values()) gl.deleteTexture(t);
+      texCache.clear();
+      lastCustomTipKey = null;
+    },
     dispose() {
       for (const t of texCache.values()) gl.deleteTexture(t);
       texCache.clear();
@@ -1543,6 +1719,694 @@ export function createWebGLBrushContext(
       if (dualStampProg) gl.deleteProgram(dualStampProg);
       if (maskStampProg) gl.deleteProgram(maskStampProg);
       if (flushMaskProg) gl.deleteProgram(flushMaskProg);
+      if (liqWarpProg) {
+        gl.deleteProgram(liqWarpProg);
+        liqWarpProg = null;
+      }
+    },
+
+    // ── Liquify GPU pipeline ────────────────────────────────────────────────
+
+    initLiquifyGPU(
+      width: number,
+      height: number,
+      sourceImageData: ImageData,
+    ): void {
+      liqW = width;
+      liqH = height;
+
+      // Compile liqWarpProg ONCE — cache it across all strokes
+      if (!liqWarpProg) {
+        liqWarpProg = linkProgram(gl, LIQ_VERT, LIQ_FRAG);
+        if (liqWarpProg) {
+          liqWarpAPos = gl.getAttribLocation(liqWarpProg, "a_position");
+          liqWarpUSource = gl.getUniformLocation(liqWarpProg, "u_source");
+          liqWarpUCursor = gl.getUniformLocation(liqWarpProg, "u_cursor");
+          liqWarpUDirection = gl.getUniformLocation(liqWarpProg, "u_direction");
+          liqWarpURadius = gl.getUniformLocation(liqWarpProg, "u_radius");
+          liqWarpUStrength = gl.getUniformLocation(liqWarpProg, "u_strength");
+          liqWarpUHardness = gl.getUniformLocation(liqWarpProg, "u_hardness");
+          liqWarpUAspect = gl.getUniformLocation(liqWarpProg, "u_aspect");
+        }
+      }
+
+      // Create source texture — frozen at stroke start, retained for undo before snapshot
+      // NOT used as the per-frame render source after ping-pong is in place
+      liqSourceTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, liqSourceTex);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        sourceImageData,
+      );
+      // FIX 2+3: Use NEAREST filtering for the source texture — LINEAR would
+      // bilinearly interpolate into zero-alpha black pixels at painted edges,
+      // producing a dark fringe. NEAREST reads exact pixel values with no blending.
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+
+      // Create ping-pong texture/FBO pair 0
+      // Seeded with alpha-bled sourceImageData so the first frame has valid content to read from.
+      // UNPACK_FLIP_Y_WEBGL=true converts the ImageData (row 0 = canvas top) into
+      // GL bottom-up convention (row 0 = canvas bottom), matching all FBO textures.
+      // Alpha bleed: transparent pixel RGB is padded from nearby opaque neighbors so
+      // bilinear interpolation at painted/transparent boundaries does not bleed black
+      // into the warped result (straight-alpha, no premultiplication).
+      liqTex[0] = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, liqTex[0]);
+      {
+        const srcData = sourceImageData.data;
+        const W2 = sourceImageData.width;
+        const H2 = sourceImageData.height;
+        const bled = new Uint8ClampedArray(srcData.length);
+        // Copy original data first
+        bled.set(srcData);
+        // Single-pass alpha bleed: for transparent pixels, inherit RGB from opaque neighbors
+        for (let y = 0; y < H2; y++) {
+          for (let x = 0; x < W2; x++) {
+            const idx = (y * W2 + x) * 4;
+            if (bled[idx + 3] > 0) continue; // already opaque — skip
+            // Check 4 immediate neighbors
+            const neighbors = [
+              x > 0 ? (y * W2 + (x - 1)) * 4 : -1,
+              x < W2 - 1 ? (y * W2 + (x + 1)) * 4 : -1,
+              y > 0 ? ((y - 1) * W2 + x) * 4 : -1,
+              y < H2 - 1 ? ((y + 1) * W2 + x) * 4 : -1,
+            ];
+            for (const ni of neighbors) {
+              if (ni >= 0 && srcData[ni + 3] > 0) {
+                bled[idx] = srcData[ni];
+                bled[idx + 1] = srcData[ni + 1];
+                bled[idx + 2] = srcData[ni + 2];
+                // alpha stays 0
+                break;
+              }
+            }
+          }
+        }
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          W2,
+          H2,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          bled,
+        );
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      }
+      // LINEAR filtering for smooth displacement without step artifacts
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      liqFBO[0] = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, liqFBO[0]);
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT0,
+        gl.TEXTURE_2D,
+        liqTex[0],
+        0,
+      );
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      // Create ping-pong texture/FBO pair 1
+      // Starts with null data — will never be read before it has been written to
+      liqTex[1] = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, liqTex[1]);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        width,
+        height,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        null,
+      );
+      // LINEAR filtering — matches liqTex[0] so per-frame results are consistent
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      liqFBO[1] = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, liqFBO[1]);
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT0,
+        gl.TEXTURE_2D,
+        liqTex[1],
+        0,
+      );
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      // liqTex[0] holds the valid starting frame; first renderLiquifyFrame reads it
+      liqPingIdx = 0;
+    },
+
+    renderLiquifyFrame(
+      cursorX: number,
+      cursorY: number,
+      dirX: number,
+      dirY: number,
+      radius: number,
+      strength: number,
+      hardness: number,
+    ): void {
+      if (!liqWarpProg || !liqFBO[0] || !liqFBO[1] || !liqTex[0] || !liqTex[1])
+        return;
+
+      const W = liqW;
+      const H = liqH;
+      const maxDim = Math.max(W, H);
+
+      // Ping-pong: read from previous result, write to the other buffer
+      const readIdx = liqPingIdx;
+      const writeIdx = 1 - liqPingIdx;
+
+      // Convert pixel-space cursor to UV — GL UV y=0 = canvas bottom, so invert canvas Y
+      const cursorUX = cursorX / W;
+      const cursorUY = 1.0 - cursorY / H;
+
+      // Direction arrives already normalized in pixel space; convert to UV space and re-normalize
+      // NOTE: dirUY is negated because canvas Y is top-down but UV Y is bottom-up
+      // (the shader corrects for this with `1.0 - v_uv.y`). Without the negation,
+      // a downward stroke pushes content upward in the warped output.
+      const dirUX = dirX / W;
+      const dirUY = -(dirY / H);
+      const dirLen = Math.sqrt(dirUX * dirUX + dirUY * dirUY);
+      const normDirUX = dirLen > 0 ? dirUX / dirLen : 0;
+      const normDirUY = dirLen > 0 ? dirUY / dirLen : 0;
+
+      // Convert radius and strength to UV space
+      const radiusUV = radius / maxDim;
+      const strengthUV = strength / maxDim;
+
+      // Aspect correction — used for correct circular distance calculation in the shader
+      const aspectX = W / maxDim;
+      const aspectY = H / maxDim;
+
+      // Bind write FBO as render target
+      gl.bindFramebuffer(gl.FRAMEBUFFER, liqFBO[writeIdx]);
+      gl.viewport(0, 0, W, H);
+
+      // Reset blend state — warp shader must write without blending
+      gl.disable(gl.BLEND);
+      currentBlend = "none";
+
+      // biome-ignore lint/correctness/useHookAtTopLevel: WebGL API, not React
+      gl.useProgram(liqWarpProg);
+
+      // u_source reads from the PREVIOUS frame's output — not the frozen source
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, liqTex[readIdx]);
+      gl.uniform1i(liqWarpUSource, 0);
+
+      // Set uniforms
+      gl.uniform2f(liqWarpUCursor, cursorUX, cursorUY);
+      gl.uniform2f(liqWarpUDirection, normDirUX, normDirUY);
+      gl.uniform1f(liqWarpURadius, radiusUV);
+      gl.uniform1f(liqWarpUStrength, strengthUV);
+      gl.uniform1f(liqWarpUHardness, hardness);
+      gl.uniform2f(liqWarpUAspect, aspectX, aspectY);
+
+      // Draw full-screen quad using the same quadVbo used by other full-screen passes
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadVbo);
+      gl.enableVertexAttribArray(liqWarpAPos);
+      gl.vertexAttribPointer(liqWarpAPos, 2, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.disableVertexAttribArray(liqWarpAPos);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+      // Unbind FBO — restore to default framebuffer
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      // Swap ping-pong — next frame reads from writeIdx (the result just written)
+      liqPingIdx = writeIdx;
+
+      // ── Post-warp sharpen pass (disabled) ─────────────────────────────────
+      // With alpha bleed + LINEAR filtering, the root cause of the
+      // pepper/dissolve artifact (bilinear interpolation bleeding black from
+      // transparent pixels into painted edges) is eliminated. The sharpen pass
+      // is no longer needed and is skipped to avoid any cumulative amplification.
+
+      // Restore viewport to canvas dimensions
+      gl.viewport(0, 0, canvas.width, canvas.height);
+
+      // Restore blend state to source_over (expected by brush engine)
+      gl.enable(gl.BLEND);
+      gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD);
+      gl.blendFuncSeparate(
+        gl.ONE,
+        gl.ONE_MINUS_SRC_ALPHA,
+        gl.ONE,
+        gl.ONE_MINUS_SRC_ALPHA,
+      );
+      currentBlend = "source_over";
+
+      // Reset program setup flags so next brush stamp re-binds correctly
+      _stampProgSetup = false;
+      _dualStampProgSetup = false;
+      _msProgSetup = false;
+    },
+
+    blitLiquifyPreview(
+      displayCtx: CanvasRenderingContext2D,
+      bgBuffer: OffscreenCanvas | null,
+      fgBuffer: OffscreenCanvas | null,
+      activeLayerOpacity: number,
+      activeLayerBlendMode: string,
+    ): void {
+      if (!liqFBO[liqPingIdx]) return;
+
+      const W = liqW;
+      const H = liqH;
+
+      // Read FBO pixels — WebGL FBO is bottom-up (row 0 = bottom of image)
+      const rawPixels = new Uint8ClampedArray(W * H * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, liqFBO[liqPingIdx]);
+      gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, rawPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      // Flip Y: FBO row 0 = bottom of image, canvas row 0 = top
+      const flipped = new Uint8ClampedArray(W * H * 4);
+      for (let row = 0; row < H; row++) {
+        const srcRow = H - 1 - row;
+        const srcOffset = srcRow * W * 4;
+        const dstOffset = row * W * 4;
+        flipped.set(
+          rawPixels.subarray(srcOffset, srcOffset + W * 4),
+          dstOffset,
+        );
+      }
+
+      // 1. Clear and draw background (all layers below active)
+      displayCtx.clearRect(0, 0, W, H);
+      if (bgBuffer) {
+        displayCtx.globalAlpha = 1;
+        displayCtx.globalCompositeOperation = "source-over";
+        displayCtx.drawImage(bgBuffer, 0, 0);
+      }
+
+      // 2. Draw FBO result in place of the active layer
+      //    putImageData bypasses compositing, so we blit into a temp canvas
+      //    and draw that with the active layer's opacity and blend mode.
+      const tmpCanvas = new OffscreenCanvas(W, H);
+      const tmpCtx = tmpCanvas.getContext(
+        "2d",
+      ) as OffscreenCanvasRenderingContext2D;
+      tmpCtx.putImageData(new ImageData(flipped, W, H), 0, 0);
+      displayCtx.globalAlpha = activeLayerOpacity;
+      displayCtx.globalCompositeOperation =
+        (activeLayerBlendMode as GlobalCompositeOperation) || "source-over";
+      displayCtx.drawImage(tmpCanvas, 0, 0);
+      displayCtx.globalAlpha = 1;
+      displayCtx.globalCompositeOperation = "source-over";
+
+      // 3. Draw foreground (all layers above active) on top
+      if (fgBuffer) {
+        displayCtx.drawImage(fgBuffer, 0, 0);
+      }
+    },
+
+    commitLiquify(layerCtx: CanvasRenderingContext2D): void {
+      if (!liqFBO[liqPingIdx]) return;
+
+      const W = liqW;
+      const H = liqH;
+
+      // Read FBO pixels and flip Y — same as blitLiquifyPreview
+      const rawPixels = new Uint8ClampedArray(W * H * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, liqFBO[liqPingIdx]);
+      gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, rawPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      const flipped = new Uint8ClampedArray(W * H * 4);
+      for (let row = 0; row < H; row++) {
+        const srcRow = H - 1 - row;
+        flipped.set(
+          rawPixels.subarray(srcRow * W * 4, (srcRow + 1) * W * 4),
+          row * W * 4,
+        );
+      }
+
+      layerCtx.putImageData(new ImageData(flipped, W, H), 0, 0);
+
+      // Free per-stroke GPU resources (liqWarpProg is retained for reuse)
+      this.destroyLiquifyGPU();
+    },
+
+    destroyLiquifyGPU(): void {
+      if (liqSourceTex) {
+        gl.deleteTexture(liqSourceTex);
+        liqSourceTex = null;
+      }
+      // Delete both ping-pong texture/FBO pairs
+      for (let i = 0; i < 2; i++) {
+        if (liqTex[i]) {
+          gl.deleteTexture(liqTex[i]);
+          liqTex[i] = null;
+        }
+        if (liqFBO[i]) {
+          gl.deleteFramebuffer(liqFBO[i]);
+          liqFBO[i] = null;
+        }
+      }
+      liqPingIdx = 0;
+      // liqWarpProg is intentionally NOT deleted — cached for the next stroke
+      // Free per-stroke sharpen FBO/tex if any remain from previous builds
+      if (liqSharpenTex) {
+        gl.deleteTexture(liqSharpenTex);
+        liqSharpenTex = null;
+      }
+      if (liqSharpenFBO) {
+        gl.deleteFramebuffer(liqSharpenFBO);
+        liqSharpenFBO = null;
+      }
+    },
+
+    // ── Per-layer liquify GPU pipeline (All Visible mode) ──────────────────
+
+    initLiquifyGPUForLayer(
+      layerId: string,
+      layerWidth: number,
+      layerHeight: number,
+      sourceImageData: ImageData,
+    ): void {
+      // Ensure the shared warp program is compiled
+      if (!liqWarpProg) {
+        liqWarpProg = linkProgram(gl, LIQ_VERT, LIQ_FRAG);
+        if (liqWarpProg) {
+          liqWarpAPos = gl.getAttribLocation(liqWarpProg, "a_position");
+          liqWarpUSource = gl.getUniformLocation(liqWarpProg, "u_source");
+          liqWarpUCursor = gl.getUniformLocation(liqWarpProg, "u_cursor");
+          liqWarpUDirection = gl.getUniformLocation(liqWarpProg, "u_direction");
+          liqWarpURadius = gl.getUniformLocation(liqWarpProg, "u_radius");
+          liqWarpUStrength = gl.getUniformLocation(liqWarpProg, "u_strength");
+          liqWarpUHardness = gl.getUniformLocation(liqWarpProg, "u_hardness");
+          liqWarpUAspect = gl.getUniformLocation(liqWarpProg, "u_aspect");
+        }
+      }
+
+      // Destroy any existing state for this layer before re-initialising
+      this.destroyLiquifyGPUForLayer(layerId);
+
+      const state: {
+        fbo: [WebGLFramebuffer | null, WebGLFramebuffer | null];
+        tex: [WebGLTexture | null, WebGLTexture | null];
+        sourceTex: WebGLTexture | null;
+        pingIdx: number;
+        w: number;
+        h: number;
+      } = {
+        fbo: [null, null],
+        tex: [null, null],
+        sourceTex: null,
+        pingIdx: 0,
+        w: layerWidth,
+        h: layerHeight,
+      };
+
+      // source tex — frozen snapshot (not used for per-frame rendering, kept for reference)
+      state.sourceTex = gl.createTexture();
+      if (state.sourceTex) {
+        gl.bindTexture(gl.TEXTURE_2D, state.sourceTex);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          sourceImageData,
+        );
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+      }
+
+      // Ping-pong pair 0 — alpha-bled + LINEAR filtering for clean interpolation
+      state.tex[0] = gl.createTexture();
+      if (state.tex[0]) {
+        gl.bindTexture(gl.TEXTURE_2D, state.tex[0]);
+        // Alpha bleed: pad transparent pixel RGB from opaque neighbors so bilinear
+        // interpolation does not bleed black into painted edges. Straight-alpha, no premultiplication.
+        {
+          const srcData = sourceImageData.data;
+          const LW = layerWidth;
+          const LH = layerHeight;
+          const bled = new Uint8ClampedArray(srcData.length);
+          bled.set(srcData);
+          for (let y = 0; y < LH; y++) {
+            for (let x = 0; x < LW; x++) {
+              const idx = (y * LW + x) * 4;
+              if (bled[idx + 3] > 0) continue;
+              const neighbors = [
+                x > 0 ? (y * LW + (x - 1)) * 4 : -1,
+                x < LW - 1 ? (y * LW + (x + 1)) * 4 : -1,
+                y > 0 ? ((y - 1) * LW + x) * 4 : -1,
+                y < LH - 1 ? ((y + 1) * LW + x) * 4 : -1,
+              ];
+              for (const ni of neighbors) {
+                if (ni >= 0 && srcData[ni + 3] > 0) {
+                  bled[idx] = srcData[ni];
+                  bled[idx + 1] = srcData[ni + 1];
+                  bled[idx + 2] = srcData[ni + 2];
+                  break;
+                }
+              }
+            }
+          }
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA,
+            LW,
+            LH,
+            0,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            bled,
+          );
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        }
+        // LINEAR filtering for smooth displacement without step artifacts
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        state.fbo[0] = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, state.fbo[0]);
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0,
+          gl.TEXTURE_2D,
+          state.tex[0],
+          0,
+        );
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      }
+
+      // Ping-pong pair 1 — null data, never read before written
+      state.tex[1] = gl.createTexture();
+      if (state.tex[1]) {
+        gl.bindTexture(gl.TEXTURE_2D, state.tex[1]);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          layerWidth,
+          layerHeight,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          null,
+        );
+        // LINEAR filtering — matches pair 0 for consistent per-frame results
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        state.fbo[1] = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, state.fbo[1]);
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0,
+          gl.TEXTURE_2D,
+          state.tex[1],
+          0,
+        );
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      }
+
+      state.pingIdx = 0;
+      liqLayerMap.set(layerId, state);
+
+      // Sharpen pass disabled — alpha bleed + LINEAR filtering eliminates
+      // the edge artifact root cause; sharpen pass not needed for All Visible mode.
+    },
+
+    renderLiquifyFrameForLayer(
+      layerId: string,
+      cursorX: number,
+      cursorY: number,
+      dirX: number,
+      dirY: number,
+      radius: number,
+      strength: number,
+      hardness: number,
+    ): void {
+      if (!liqWarpProg) return;
+      const state = liqLayerMap.get(layerId);
+      if (
+        !state ||
+        !state.fbo[0] ||
+        !state.fbo[1] ||
+        !state.tex[0] ||
+        !state.tex[1]
+      )
+        return;
+
+      const W = state.w;
+      const H = state.h;
+      const maxDim = Math.max(W, H);
+      const readIdx = state.pingIdx;
+      const writeIdx = 1 - state.pingIdx;
+
+      const cursorUX = cursorX / W;
+      const cursorUY = 1.0 - cursorY / H;
+      const dirUX = dirX / W;
+      const dirUY = -(dirY / H);
+      const dirLen = Math.sqrt(dirUX * dirUX + dirUY * dirUY);
+      const normDirUX = dirLen > 0 ? dirUX / dirLen : 0;
+      const normDirUY = dirLen > 0 ? dirUY / dirLen : 0;
+      const radiusUV = radius / maxDim;
+      const strengthUV = strength / maxDim;
+      const aspectX = W / maxDim;
+      const aspectY = H / maxDim;
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, state.fbo[writeIdx]);
+      gl.viewport(0, 0, W, H);
+      gl.disable(gl.BLEND);
+      currentBlend = "none";
+
+      // biome-ignore lint/correctness/useHookAtTopLevel: WebGL API, not React
+      gl.useProgram(liqWarpProg);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, state.tex[readIdx]);
+      gl.uniform1i(liqWarpUSource, 0);
+      gl.uniform2f(liqWarpUCursor, cursorUX, cursorUY);
+      gl.uniform2f(liqWarpUDirection, normDirUX, normDirUY);
+      gl.uniform1f(liqWarpURadius, radiusUV);
+      gl.uniform1f(liqWarpUStrength, strengthUV);
+      gl.uniform1f(liqWarpUHardness, hardness);
+      gl.uniform2f(liqWarpUAspect, aspectX, aspectY);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadVbo);
+      gl.enableVertexAttribArray(liqWarpAPos);
+      gl.vertexAttribPointer(liqWarpAPos, 2, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.disableVertexAttribArray(liqWarpAPos);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      state.pingIdx = writeIdx;
+
+      // ── Post-warp sharpen pass (disabled) ─────────────────────────────────
+      // Premultiplied alpha + LINEAR filtering eliminates the pepper/fringe root cause.
+
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.enable(gl.BLEND);
+      gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD);
+      gl.blendFuncSeparate(
+        gl.ONE,
+        gl.ONE_MINUS_SRC_ALPHA,
+        gl.ONE,
+        gl.ONE_MINUS_SRC_ALPHA,
+      );
+      currentBlend = "source_over";
+      _stampProgSetup = false;
+      _dualStampProgSetup = false;
+      _msProgSetup = false;
+    },
+
+    readLiquifyLayerFBO(layerId: string): ImageData | null {
+      const state = liqLayerMap.get(layerId);
+      if (!state || !state.fbo[state.pingIdx]) return null;
+
+      const W = state.w;
+      const H = state.h;
+      const rawPixels = new Uint8ClampedArray(W * H * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, state.fbo[state.pingIdx]);
+      gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, rawPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      // Flip Y: FBO row 0 = GL bottom = canvas bottom; flip to top-down for ImageData
+      const flipped = new Uint8ClampedArray(W * H * 4);
+      for (let row = 0; row < H; row++) {
+        const srcRow = H - 1 - row;
+        flipped.set(
+          rawPixels.subarray(srcRow * W * 4, (srcRow + 1) * W * 4),
+          row * W * 4,
+        );
+      }
+      return new ImageData(flipped, W, H);
+    },
+
+    commitLiquifyForLayer(
+      layerId: string,
+      layerCtx: CanvasRenderingContext2D,
+    ): void {
+      const imgData = this.readLiquifyLayerFBO(layerId);
+      if (imgData) {
+        layerCtx.putImageData(imgData, 0, 0);
+      }
+      this.destroyLiquifyGPUForLayer(layerId);
+    },
+
+    destroyLiquifyGPUForLayer(layerId: string): void {
+      const state = liqLayerMap.get(layerId);
+      if (!state) return;
+      if (state.sourceTex) gl.deleteTexture(state.sourceTex);
+      for (let i = 0; i < 2; i++) {
+        if (state.tex[i]) gl.deleteTexture(state.tex[i]);
+        if (state.fbo[i]) gl.deleteFramebuffer(state.fbo[i]);
+      }
+      liqLayerMap.delete(layerId);
+    },
+
+    destroyAllLiquifyGPULayers(): void {
+      for (const layerId of Array.from(liqLayerMap.keys())) {
+        this.destroyLiquifyGPUForLayer(layerId);
+      }
+      // Also free the shared sharpen FBO/tex used by All Visible mode
+      if (liqSharpenTex) {
+        gl.deleteTexture(liqSharpenTex);
+        liqSharpenTex = null;
+      }
+      if (liqSharpenFBO) {
+        gl.deleteFramebuffer(liqSharpenFBO);
+        liqSharpenFBO = null;
+      }
     },
   };
 }

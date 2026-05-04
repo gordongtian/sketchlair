@@ -60,13 +60,16 @@ export let _smudgeCanvasMirror: Uint8ClampedArray | null = null;
 export let _smudgeCanvasMirrorCapacity = 0;
 export let _smudgeCanvasMirrorW = 0;
 export let _smudgeCanvasMirrorH = 0;
-let _smearPatchData: Uint8ClampedArray | null = null;
-let _smearPatchDataCapacity = 0;
 
-// ─── Smear pre-allocated buffers ─────────────────────────────────────────────
-const SMEAR_BUF_SIZE = 1200 * 900 * 4;
+// ─── Smear per-stroke working buffers ────────────────────────────────────────
+// These are null between strokes (freed at stroke end). Allocated at stroke
+// start via initSmearBuffers() to full canvas dimensions and nulled at stroke
+// end via clearSmearBuffers(). Never keep a permanent allocation.
+let _smearPatchData: Uint8ClampedArray | null = null;
 let _smearSoftnessWeights: Float32Array | null = null;
 let _smearPaintData: Uint8ClampedArray | null = null;
+// _smearOutputImageData is a tiny per-stamp ImageData (only clampedW × clampedH)
+// and is kept as a module-level reuse buffer to avoid allocating an ImageData per stamp.
 let _smearOutputImageData: ImageData | null = null;
 let _smearSoftnessSize = 0;
 let _smearTipCacheKey = "";
@@ -97,6 +100,42 @@ export function clearSmudgeBuffer(): void {
   _smudgeCanvasMirrorCapacity = 0;
   _smudgeCanvasMirrorW = 0;
   _smudgeCanvasMirrorH = 0;
+}
+
+/**
+ * Null all three smear working buffers.
+ * Call at smear stroke end (pointer-up) and on tool switch away from smudge.
+ * Allows GC to reclaim ~25 MB (2×4MB typed arrays + ~16.5MB weight map).
+ */
+export function clearSmearBuffers(): void {
+  _smearPaintData = null;
+  _smearPatchData = null;
+  _smearSoftnessWeights = null;
+  _smearSoftnessSize = 0;
+  _smearTipCacheKey = "";
+}
+
+/**
+ * Allocate all three smear working buffers at the current canvas dimensions
+ * and populate _smearPaintData with the current layer pixel state.
+ * Call at smear stroke start (pointer-down) before the first stamp.
+ */
+export function initSmearBuffers(
+  canvas: HTMLCanvasElement,
+  ctx: CanvasRenderingContext2D,
+): void {
+  const w = canvas.width;
+  const h = canvas.height;
+  const total = w * h * 4;
+  _smearPaintData = new Uint8ClampedArray(total);
+  _smearPatchData = new Uint8ClampedArray(total);
+  _smearSoftnessWeights = new Float32Array(w * h);
+  _smearSoftnessSize = 0; // force weight map recompute on first stamp
+  _smearTipCacheKey = "";
+  // Populate _smearPaintData from the current canvas state — this is the
+  // working copy that accumulates smear results across stamps this stroke.
+  const snap = ctx.getImageData(0, 0, w, h);
+  _smearPaintData.set(snap.data);
 }
 
 // ─── Pure helpers ─────────────────────────────────────────────────────────────
@@ -750,9 +789,7 @@ export function useStrokeEngine({
       if (!_smudgeInitialized || _smudgeBufferDataSize !== bufSize) {
         const needed = bufSize * bufSize * 4;
         if (!_smudgeBufferData || _smudgeBufferDataCapacity < needed) {
-          _smudgeBufferData = new Uint8ClampedArray(
-            Math.max(needed, SMEAR_BUF_SIZE),
-          );
+          _smudgeBufferData = new Uint8ClampedArray(needed);
           _smudgeBufferDataCapacity = _smudgeBufferData.length;
         }
         _smudgeBufferDataSize = bufSize;
@@ -818,16 +855,10 @@ export function useStrokeEngine({
             try {
               // Build tip alpha mask — cached on bufSize + tip image + softness.
               // This mask defines tipAlpha per pixel within the bufSize bounding box.
+              // _smearSoftnessWeights is pre-allocated at stroke start (canvas.width * canvas.height
+              // floats), which is always >= bufSize * bufSize, so no capacity check is needed.
+              if (!_smearSoftnessWeights) continue; // safety guard: buffers must be init'd
               const maxBufPixels = bufSize * bufSize;
-              if (
-                !_smearSoftnessWeights ||
-                _smearSoftnessWeights.length < maxBufPixels
-              ) {
-                _smearSoftnessWeights = new Float32Array(
-                  Math.max(maxBufPixels, SMEAR_BUF_SIZE),
-                );
-                _smearSoftnessSize = 0; // force recompute
-              }
               const tipImg = settings.tipImageData;
               const hasTip = !!tipImg;
               const newTipKey = `${hasTip ? tipImg!.slice(0, 60) : "circle"}_${bufSize}_${softness}`;
@@ -888,13 +919,10 @@ export function useStrokeEngine({
 
               // ── Step 1: Sample canvas BEFORE deposit ──────────────────────
               // Read canvas pixels at the stamp destination.
+              // _smearPatchData is pre-allocated at stroke start to canvas.width * canvas.height * 4
+              // bytes, which is always >= clampedW * clampedH * 4.
               const patchLen = clampedW * clampedH * 4;
-              if (!_smearPatchData || _smearPatchDataCapacity < patchLen) {
-                _smearPatchData = new Uint8ClampedArray(
-                  Math.max(patchLen, SMEAR_BUF_SIZE),
-                );
-                _smearPatchDataCapacity = _smearPatchData.length;
-              }
+              if (!_smearPatchData) continue; // safety guard
               const canvasPixels = _smearPatchData.subarray(0, patchLen);
               if (
                 _smudgeCanvasMirror &&
@@ -981,11 +1009,9 @@ export function useStrokeEngine({
               // ── Step 3: Deposit carried buffer onto canvas with tip mask ──
               // For each pixel: source-over composite at depositOpacity × tipAlpha.
               // Read existing canvas pixels for source-over blending.
-              if (!_smearPaintData || _smearPaintData.length < patchLen) {
-                _smearPaintData = new Uint8ClampedArray(
-                  Math.max(patchLen, SMEAR_BUF_SIZE),
-                );
-              }
+              // _smearPaintData is pre-allocated at stroke start to canvas.width * canvas.height * 4
+              // bytes, which is always >= clampedW * clampedH * 4.
+              if (!_smearPaintData) continue; // safety guard
               const outputPixels = _smearPaintData.subarray(0, patchLen);
 
               let lpx = 0;
@@ -1102,9 +1128,7 @@ export function useStrokeEngine({
       );
       const needed = size * size * 4;
       if (!_smudgeBufferData || _smudgeBufferDataCapacity < needed) {
-        _smudgeBufferData = new Uint8ClampedArray(
-          Math.max(needed, SMEAR_BUF_SIZE),
-        );
+        _smudgeBufferData = new Uint8ClampedArray(needed);
         _smudgeBufferDataCapacity = _smudgeBufferData.length;
       }
       _smudgeBufferDataSize = size;

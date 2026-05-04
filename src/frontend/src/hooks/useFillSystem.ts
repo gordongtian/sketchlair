@@ -1,11 +1,9 @@
 import type { HSVAColor } from "@/utils/colorUtils";
 import { generateLayerThumbnail, hsvToRgb } from "@/utils/colorUtils";
 import {
+  applyDestinationOverExpansion,
   bfsFloodFill,
   chaikinSmooth,
-  computeDistanceTransform,
-  dilateByRadius,
-  extractBoundaryMask,
 } from "@/utils/selectionUtils";
 import { getThumbCanvas, getThumbCtx } from "@/utils/thumbnailCache";
 import type React from "react";
@@ -103,9 +101,10 @@ export interface FillSystemReturn {
     fr: number,
     fg: number,
     fb: number,
-    _fa: number,
+    fa: number,
     tolerance: number,
     contiguous?: boolean,
+    featherEdges?: boolean,
   ) => void;
   applyLassoFill: (
     lc: HTMLCanvasElement,
@@ -207,13 +206,13 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
     tolerance: 30,
     gradientMode: "linear",
     contiguous: true,
-    gapClosing: 0,
+    featherEdges: true,
   });
   const fillSettingsRef = useRef<FillSettings>({
     tolerance: 30,
     gradientMode: "linear",
     contiguous: true,
-    gapClosing: 0,
+    featherEdges: true,
   });
 
   // Keep fillSettingsRef in sync with fillSettings state.
@@ -243,15 +242,21 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
       fr: number,
       fg: number,
       fb: number,
-      _fa: number,
+      fa: number,
       tolerance: number,
       contiguous = true,
+      featherEdges = true,
     ) => {
       // Ruler layer guard — silently abort if the active layer is a ruler layer
       const activeLayerFillCheck = layersRef.current.find(
         (l) => l.id === activeLayerIdRef.current,
       );
       if ((activeLayerFillCheck as { isRuler?: boolean } | undefined)?.isRuler)
+        return;
+      // Lock guard — silently abort if the active layer is locked
+      if (
+        (activeLayerFillCheck as { isLocked?: boolean } | undefined)?.isLocked
+      )
         return;
       const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
       if (!ctx) return;
@@ -261,6 +266,14 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
       if (x < 0 || x >= width || y < 0 || y >= height) return;
       const imgData = ctx.getImageData(0, 0, width, height);
       const data = imgData.data;
+
+      // Read seed pixel color (unpremultiplied) for Phase 2 skip condition
+      const sidx = (y * width + x) * 4;
+      const seedA = data[sidx + 3];
+      const seedR = seedA > 0 ? Math.round((data[sidx] * 255) / seedA) : 0;
+      const seedG = seedA > 0 ? Math.round((data[sidx + 1] * 255) / seedA) : 0;
+      const seedB = seedA > 0 ? Math.round((data[sidx + 2] * 255) / seedA) : 0;
+
       // Build selection mask if active
       let selData: Uint8ClampedArray | null = null;
       if (selectionMaskRef.current && selectionActiveRef.current) {
@@ -306,185 +319,7 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
         }
       }
 
-      // ── Gap closing branch (only when gapClosing > 0) ──────────────────
-      // Distance-transform-based gap closing:
-      //   1. Extract boundary mask from the layer
-      //   2. Compute distance from every non-boundary pixel to the nearest boundary
-      //   3. For each non-boundary pixel P within the gap-closing radius, check whether
-      //      P lies between TWO separate boundary segments (i.e. it bridges a genuine gap).
-      //      A pixel bridges a gap if there exist two boundary pixels B1 and B2 within
-      //      the radius such that B1 and B2 are from different segments
-      //      (Manhattan distance > 4 — not immediately adjacent).
-      //   4. Only those "genuine gap" pixels are added to a gapMask.
-      //   5. The sampling ImageData is built using (boundaryMask | gapMask) as the
-      //      effective boundary — gaps are closed; open fill areas are untouched.
-      //   6. Flood fill runs on the augmented sampling data; fill is written to the
-      //      original layer canvas as normal.
-      //
-      // When gapClosing === 0 the branch is never entered — identical to legacy path.
-      const gapClosing = fillSettingsRef.current.gapClosing ?? 0;
-      if (gapClosing > 0) {
-        // Get seed color (unpremultiplied)
-        const sidx = (y * width + x) * 4;
-        const sa = data[sidx + 3];
-        const seedR = sa > 0 ? Math.round((data[sidx] * 255) / sa) : 0;
-        const seedG = sa > 0 ? Math.round((data[sidx + 1] * 255) / sa) : 0;
-        const seedB = sa > 0 ? Math.round((data[sidx + 2] * 255) / sa) : 0;
-
-        // Step 1: extract boundary mask
-        const boundaryMask = extractBoundaryMask(
-          imgData,
-          seedR,
-          seedG,
-          seedB,
-          20,
-          tolerance,
-        );
-
-        // Step 2: compute distance transform — distance from each non-boundary pixel
-        // to the nearest boundary pixel.
-        const distFloat = computeDistanceTransform(boundaryMask, width, height);
-
-        // Step 3: pre-collect boundary pixel coordinates for fast neighborhood search.
-        // We only need to store coords of boundary pixels for the segment check.
-        const bndCoords: { x: number; y: number }[] = [];
-        for (let i = 0; i < width * height; i++) {
-          if (boundaryMask[i]) {
-            bndCoords.push({ x: i % width, y: Math.floor(i / width) });
-          }
-        }
-
-        // Step 4: for each non-boundary pixel within gapClosing distance, test
-        // whether it bridges two separate boundary segments.
-        const gapMask = new Uint8Array(width * height);
-        const R = gapClosing;
-        const R2 = R * R;
-
-        // Build a spatial index: for each cell in a coarse grid, store the boundary
-        // pixels that fall in it. This avoids an O(N·M) full scan per candidate pixel.
-        // Cell size = R+1 so any pixel within radius R of (px,py) is in the same or
-        // directly adjacent cell.
-        const cellSize = Math.max(1, R + 1);
-        const gridW = Math.ceil(width / cellSize);
-        const gridH = Math.ceil(height / cellSize);
-        const grid: number[][] = new Array(gridW * gridH)
-          .fill(null)
-          .map(() => []);
-        for (let bi = 0; bi < bndCoords.length; bi++) {
-          const gx = Math.floor(bndCoords[bi].x / cellSize);
-          const gy = Math.floor(bndCoords[bi].y / cellSize);
-          grid[gy * gridW + gx].push(bi);
-        }
-
-        for (let py = 0; py < height; py++) {
-          for (let px = 0; px < width; px++) {
-            const pidx = py * width + px;
-            if (boundaryMask[pidx]) continue; // already a boundary pixel
-            if (distFloat[pidx] > R) continue; // too far from any boundary
-
-            // Gather all boundary pixels within radius R using the spatial grid.
-            const cgx = Math.floor(px / cellSize);
-            const cgy = Math.floor(py / cellSize);
-            const cgMinX = Math.max(0, cgx - 1);
-            const cgMaxX = Math.min(gridW - 1, cgx + 1);
-            const cgMinY = Math.max(0, cgy - 1);
-            const cgMaxY = Math.min(gridH - 1, cgy + 1);
-
-            // Collect up to 2 boundary pixels from different segments.
-            // We store the first boundary pixel found (B1) and then look for B2
-            // that is NOT adjacent to B1 (Manhattan distance > 4).
-            let b1x = -1;
-            let b1y = -1;
-            let foundGap = false;
-
-            for (let gy2 = cgMinY; gy2 <= cgMaxY && !foundGap; gy2++) {
-              for (let gx2 = cgMinX; gx2 <= cgMaxX && !foundGap; gx2++) {
-                const cellBnds = grid[gy2 * gridW + gx2];
-                for (let ci = 0; ci < cellBnds.length && !foundGap; ci++) {
-                  const bi = cellBnds[ci];
-                  const bx = bndCoords[bi].x;
-                  const by = bndCoords[bi].y;
-                  const dx = bx - px;
-                  const dy = by - py;
-                  if (dx * dx + dy * dy > R2) continue; // outside circle
-
-                  if (b1x < 0) {
-                    // First boundary pixel found — store as B1
-                    b1x = bx;
-                    b1y = by;
-                  } else {
-                    // Check if this boundary pixel (B2) is from a different segment
-                    // than B1 — i.e., not immediately adjacent (Manhattan dist > 4).
-                    const sepManhattan =
-                      Math.abs(bx - b1x) + Math.abs(by - b1y);
-                    if (sepManhattan > 4) {
-                      // P bridges two separate boundary segments → genuine gap pixel
-                      foundGap = true;
-                    }
-                  }
-                }
-              }
-            }
-
-            if (foundGap) {
-              gapMask[pidx] = 1;
-            }
-          }
-        }
-
-        // Step 5: build combined boundary = original boundary ∪ gap-bridging pixels
-        const combinedMask = new Uint8Array(width * height);
-        for (let i = 0; i < width * height; i++) {
-          combinedMask[i] = boundaryMask[i] | gapMask[i];
-        }
-
-        // Step 6: build sampling ImageData — dilate combined boundary colors into the
-        // gap pixels so flood fill sees the closed gaps as genuine boundaries.
-        const samplingImgData = dilateByRadius(
-          imgData,
-          combinedMask,
-          gapClosing,
-          width,
-          height,
-        );
-
-        // Step 7: run flood fill on sampling data (boundary detection only)
-        const fillMask = bfsFloodFill(
-          samplingImgData.data,
-          width,
-          height,
-          x,
-          y,
-          tolerance,
-          contiguous,
-          selData,
-        );
-
-        // Step 8: apply fill to ORIGINAL layer data (not the sampling copy)
-        for (let i = 0; i < fillMask.length; i++) {
-          if (fillMask[i]) {
-            const pi = i * 4;
-            const existingAlpha = data[pi + 3];
-            if (existingAlpha === 0) {
-              data[pi] = fr;
-              data[pi + 1] = fg;
-              data[pi + 2] = fb;
-              data[pi + 3] = 255;
-            } else {
-              if (data[pi] === fr && data[pi + 1] === fg && data[pi + 2] === fb)
-                continue;
-              data[pi] = fr;
-              data[pi + 1] = fg;
-              data[pi + 2] = fb;
-              // alpha stays exactly what it was
-            }
-          }
-        }
-        ctx.putImageData(imgData, 0, 0);
-        return;
-      }
-      // ── End gap closing branch ─────────────────────────────────────────
-
+      // Phase 1: scanline flood fill — fills pixels within tolerance
       const fillMask = bfsFloodFill(
         data,
         width,
@@ -496,31 +331,65 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
         selData,
       );
 
-      // Fill pixels in the fill mask:
-      // - alpha === 0 (fully transparent): write fill RGB at full opacity (alpha → 255)
-      // - alpha > 0 (semi-opaque or fully opaque): write fill RGB directly, preserve original alpha
-      //   Exception: if the pixel's RGB already matches the fill color, leave it untouched.
+      // Apply Phase 1 fill pixels, respecting float selection weights.
       for (let i = 0; i < fillMask.length; i++) {
         if (fillMask[i]) {
           const pi = i * 4;
+          // Determine selection weight for this pixel (1.0 when no selection)
+          const selWeight = selData ? selData[pi + 3] / 255 : 1.0;
+          if (selWeight <= 0) continue;
+
           const existingAlpha = data[pi + 3];
           if (existingAlpha === 0) {
-            // Fully transparent → pure fill color at full opacity
+            // Fully transparent pixel — write fill color at selWeight opacity
             data[pi] = fr;
             data[pi + 1] = fg;
             data[pi + 2] = fb;
-            data[pi + 3] = 255;
+            data[pi + 3] = Math.round(fa * selWeight);
           } else {
-            // Semi-opaque or fully opaque → overwrite RGB only, keep alpha as-is
-            // Skip if RGB is already the fill color (no change needed)
-            if (data[pi] === fr && data[pi + 1] === fg && data[pi + 2] === fb)
-              continue;
-            data[pi] = fr;
-            data[pi + 1] = fg;
-            data[pi + 2] = fb;
-            // alpha stays exactly what it was
+            // Opaque/semi-opaque pixel — blend fill color by selWeight
+            if (selWeight >= 1.0) {
+              // Full selection: overwrite RGB, keep alpha
+              if (data[pi] === fr && data[pi + 1] === fg && data[pi + 2] === fb)
+                continue;
+              data[pi] = fr;
+              data[pi + 1] = fg;
+              data[pi + 2] = fb;
+            } else {
+              // Partial selection: lerp toward fill color
+              data[pi] = Math.round(data[pi] + (fr - data[pi]) * selWeight);
+              data[pi + 1] = Math.round(
+                data[pi + 1] + (fg - data[pi + 1]) * selWeight,
+              );
+              data[pi + 2] = Math.round(
+                data[pi + 2] + (fb - data[pi + 2]) * selWeight,
+              );
+              // alpha stays as-is for partial selections on opaque pixels
+            }
           }
         }
+      }
+
+      // Phase 2: destination-over expansion (feather edges)
+      // Expands 1 pixel outward from the filled region and composites the fill
+      // color UNDERNEATH existing pixels using destination-over blending.
+      // Fully opaque line pixels are unchanged. Semi-transparent edge pixels
+      // receive fill color proportional to their transparency — closing the gap.
+      if (featherEdges) {
+        applyDestinationOverExpansion(
+          data,
+          width,
+          height,
+          fillMask,
+          fr,
+          fg,
+          fb,
+          fa,
+          seedR,
+          seedG,
+          seedB,
+          tolerance,
+        );
       }
 
       ctx.putImageData(imgData, 0, 0);
@@ -553,6 +422,9 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
         (l) => l.id === activeLayerIdRef.current,
       );
       if ((activeLayerLasso as { isRuler?: boolean } | undefined)?.isRuler)
+        return;
+      // Lock guard — silently abort if the active layer is locked
+      if ((activeLayerLasso as { isLocked?: boolean } | undefined)?.isLocked)
         return;
       const ctx = lc.getContext("2d", { willReadFrequently: !isIPad });
       if (!ctx) return;
@@ -644,6 +516,7 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
           fa,
           tol,
           fSettings.contiguous ?? true,
+          fSettings.featherEdges ?? true,
         );
         composite();
         markLayerBitmapDirty(layerId);
@@ -653,6 +526,7 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
           pushHistory({
             type: "pixels",
             layerId,
+            dirtyRect: { x: 0, y: 0, w: lc.width, h: lc.height },
             before: beforeFlood,
             after: afterFlood,
           });
@@ -779,6 +653,12 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
         gradientDragEndRef.current = null;
         return;
       }
+      // Lock guard — silently abort if the active layer is locked
+      if ((activeLayerGrad as { isLocked?: boolean } | undefined)?.isLocked) {
+        gradientDragStartRef.current = null;
+        gradientDragEndRef.current = null;
+        return;
+      }
       const ctxG = lcG.getContext("2d", { willReadFrequently: !isIPad });
       if (!ctxG) return;
       const start = gradientDragStartRef.current;
@@ -787,6 +667,7 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
 
       const col = colorRef.current;
       const [gr, gg, gb] = hsvToRgb(col.h, col.s, col.v);
+      const ga = Math.round(col.a * 255);
       const fSettings = fillSettingsRef.current;
 
       // ── Step 1: Region detection via flood fill ──────────────────────────
@@ -799,6 +680,15 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
 
       const seedX = Math.round(start.x);
       const seedY = Math.round(start.y);
+
+      // Read seed color (unpremultiplied) for Phase 2 skip condition
+      const sidxG = (seedY * width + seedX) * 4;
+      const seedAG = data[sidxG + 3];
+      const seedRG = seedAG > 0 ? Math.round((data[sidxG] * 255) / seedAG) : 0;
+      const seedGG =
+        seedAG > 0 ? Math.round((data[sidxG + 1] * 255) / seedAG) : 0;
+      const seedBG =
+        seedAG > 0 ? Math.round((data[sidxG + 2] * 255) / seedAG) : 0;
 
       // Build selection data for bfsFloodFill if a selection is active
       let selData: Uint8ClampedArray | null = null;
@@ -866,8 +756,32 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
         }
       }
 
-      // Direct write — no compositing, no blending
+      // Direct write for gradient pixels — no compositing, no blending
       ctxG.putImageData(imgData, 0, 0);
+
+      // Phase 2: destination-over expansion at gradient boundary
+      // Reads back the canvas to get the post-gradient state, then expands 1px
+      // outward from the filled region compositing the seed-point fill color
+      // underneath existing pixels — closing the gap at anti-aliased line edges.
+      // Uses the full fill color (not gradient-interpolated) for the expansion edge.
+      if (fSettings.featherEdges ?? true) {
+        const postGradData = ctxG.getImageData(0, 0, width, height);
+        applyDestinationOverExpansion(
+          postGradData.data,
+          width,
+          height,
+          fillMask,
+          Math.round(gr),
+          Math.round(gg),
+          Math.round(gb),
+          ga,
+          seedRG,
+          seedGG,
+          seedBG,
+          fSettings.tolerance,
+        );
+        ctxG.putImageData(postGradData, 0, 0);
+      }
 
       composite();
       markLayerBitmapDirty(layerIdG);
@@ -875,6 +789,7 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
       pushHistory({
         type: "pixels",
         layerId: layerIdG,
+        dirtyRect: { x: 0, y: 0, w: lcG.width, h: lcG.height },
         before,
         after,
       });
@@ -898,6 +813,15 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
         strokeStartSnapshotRef.current = null;
         return;
       }
+      // Lock guard — silently abort if the active layer is locked
+      if ((activeLayerLF as { isLocked?: boolean } | undefined)?.isLocked) {
+        isLassoFillDrawingRef.current = false;
+        lassoFillOriginRef.current = null;
+        lassoFillLastPtRef.current = null;
+        lassoFillPointsRef.current = [];
+        strokeStartSnapshotRef.current = null;
+        return;
+      }
       if (lcLF) {
         const col = colorRef.current;
         const [cr, cg, cb] = hsvToRgb(col.h, col.s, col.v);
@@ -914,17 +838,86 @@ export function useFillSystem(params: FillSystemParams): FillSystemReturn {
         }
         composite();
         markLayerBitmapDirty(layerIdLF);
-        const after = lcLF
-          .getContext("2d", { willReadFrequently: !isIPad })
-          ?.getImageData(0, 0, lcLF.width, lcLF.height);
+        const _lfCtxAfter = lcLF.getContext("2d", {
+          willReadFrequently: !isIPad,
+        });
         const before = strokeStartSnapshotRef.current;
-        if (before && after) {
-          pushHistory({
-            type: "pixels",
-            layerId: layerIdLF,
-            before: before.pixels,
-            after,
-          });
+        if (before && _lfCtxAfter) {
+          // Compute dirty rect from lasso points bounding box
+          let _lfMinX = Number.POSITIVE_INFINITY;
+          let _lfMinY = Number.POSITIVE_INFINITY;
+          let _lfMaxX = Number.NEGATIVE_INFINITY;
+          let _lfMaxY = Number.NEGATIVE_INFINITY;
+          for (const _pt of pts) {
+            if (_pt.x < _lfMinX) _lfMinX = _pt.x;
+            if (_pt.x > _lfMaxX) _lfMaxX = _pt.x;
+            if (_pt.y < _lfMinY) _lfMinY = _pt.y;
+            if (_pt.y > _lfMaxY) _lfMaxY = _pt.y;
+          }
+          const _lfPad = 4;
+          const _lfDrX = Math.max(0, Math.floor(_lfMinX) - _lfPad);
+          const _lfDrY = Math.max(0, Math.floor(_lfMinY) - _lfPad);
+          const _lfDrX2 = Math.min(lcLF.width, Math.ceil(_lfMaxX) + _lfPad);
+          const _lfDrY2 = Math.min(lcLF.height, Math.ceil(_lfMaxY) + _lfPad);
+          const _lfDrW = _lfDrX2 - _lfDrX;
+          const _lfDrH = _lfDrY2 - _lfDrY;
+          const _lfUseDirtyRect =
+            _lfDrW > 0 &&
+            _lfDrH > 0 &&
+            _lfDrW * _lfDrH < lcLF.width * lcLF.height * 0.5;
+          if (_lfUseDirtyRect) {
+            // Crop the full-canvas before-snapshot to the dirty region
+            const _lfTmp = document.createElement("canvas");
+            _lfTmp.width = _lfDrW;
+            _lfTmp.height = _lfDrH;
+            const _lfTmpCtx = _lfTmp.getContext("2d", {
+              willReadFrequently: true,
+            });
+            if (_lfTmpCtx) {
+              _lfTmpCtx.putImageData(before.pixels, -_lfDrX, -_lfDrY);
+              const _lfCroppedBefore = _lfTmpCtx.getImageData(
+                0,
+                0,
+                _lfDrW,
+                _lfDrH,
+              );
+              const _lfAfter = _lfCtxAfter.getImageData(
+                _lfDrX,
+                _lfDrY,
+                _lfDrW,
+                _lfDrH,
+              );
+              const _lfDirtyRect = {
+                x: _lfDrX,
+                y: _lfDrY,
+                w: _lfDrW,
+                h: _lfDrH,
+              };
+              pushHistory({
+                type: "pixels",
+                layerId: layerIdLF,
+                dirtyRect: _lfDirtyRect,
+                before: _lfCroppedBefore,
+                after: _lfAfter,
+              });
+            } else {
+              pushHistory({
+                type: "pixels",
+                layerId: layerIdLF,
+                dirtyRect: { x: 0, y: 0, w: lcLF.width, h: lcLF.height },
+                before: before.pixels,
+                after: _lfCtxAfter.getImageData(0, 0, lcLF.width, lcLF.height),
+              });
+            }
+          } else {
+            pushHistory({
+              type: "pixels",
+              layerId: layerIdLF,
+              dirtyRect: { x: 0, y: 0, w: lcLF.width, h: lcLF.height },
+              before: before.pixels,
+              after: _lfCtxAfter.getImageData(0, 0, lcLF.width, lcLF.height),
+            });
+          }
         }
       }
       if (lcLF) {

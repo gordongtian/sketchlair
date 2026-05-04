@@ -1,26 +1,29 @@
 {
-  "overview": "SketchLair is a professional digital painting web application on ICP with a figure drawing Learn module, multi-document workflows, cloud preferences sync, and a new Stripe-powered marketplace for purchasing reference image packs.",
+  "overview": "SketchLair is a professional digital painting web app with a full marketplace for purchasing learning modules and reference image packs. It features multi-document workflow, a GPU-accelerated painting engine, a Learn module system for figure drawing, and a Stripe-powered shop with permanent licenses and subscription access.",
   "features": [
-    "Stripe-powered marketplace for purchasing reference image packs",
-    "Payments canister with webhook signature verification and idempotency",
-    "Per-pack USD pricing set by admins",
-    "On-chain entitlements tied to Internet Identity principal",
-    "Pack grid with owned/unowned state and checkout flow",
-    "Admin pricing UI and Stripe credentials configuration",
-    "Professional digital painting with WebGL brush engine",
-    "Figure drawing learn module with timer and pose references",
-    "Multi-document tab system",
-    "Cloud preferences sync via ICP canister"
+    "GPU-accelerated brush engine with WebGL",
+    "Multi-document workflow with tab bar",
+    "Figure drawing Learn module with reference images",
+    "Shop marketplace with Learning Modules and Reference Packs tabs",
+    "Permanent purchase licensing (pay once, own forever)",
+    "Subscription model unlocking subscriber-tagged content",
+    "Stripe Checkout for fiat payments (USD)",
+    "Admin portal for managing content and pricing",
+    "Profile page for subscription management",
+    "Post-purchase confirmation page",
+    "Internet Identity authentication",
+    "Entitlements stored on-chain (ICP)"
   ],
-  "category": "productivity",
+  "category": "creative-tools",
   "tags": [
     "digital-painting",
     "art",
-    "icp",
-    "stripe",
     "marketplace",
     "figure-drawing",
-    "web-app"
+    "subscriptions",
+    "stripe",
+    "icp",
+    "webgl"
   ],
-  "last_updated": "2026-04-20T17:19:36.173Z"
+  "last_updated": "2026-05-03T00:28:27.784Z"
 }

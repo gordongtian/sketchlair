@@ -14,6 +14,8 @@
  */
 
 import { createActorWithConfig } from "@/config";
+import { exportAllThemes, importThemes } from "@/utils/themeOverrides";
+import type { ThemeId } from "@/utils/themeOverrides";
 import type { Preset } from "@/utils/toolPresets";
 import { DEFAULT_PRESETS } from "@/utils/toolPresets";
 import type { Identity } from "@icp-sdk/core/agent";
@@ -102,6 +104,11 @@ export interface PreferencesManager {
 const CURRENT_SCHEMA_VERSION = 1;
 const DEBOUNCE_MS = 2000;
 
+/** How many times to retry a sync call when the canister is temporarily stopped. */
+const SYNC_RETRY_ATTEMPTS = 3;
+/** Milliseconds to wait between retry attempts. */
+const SYNC_RETRY_DELAY_MS = 2000;
+
 const LS_LAST_UPLOADED = "sketchlair_last_uploaded";
 const LS_LAST_DOWNLOADED = "sketchlair_last_downloaded";
 
@@ -176,6 +183,8 @@ function migratePreferences(prefs: UserPreferences): UserPreferences {
  * Map raw canister/network error strings to clear user-facing messages.
  * "Unauthorized" from Motoko means an anonymous or mismatched principal — tell
  * the user to sign in rather than surfacing internal error text.
+ * IC0508 / reject_code 5 means the canister is temporarily stopped — tell the
+ * user the service is unavailable rather than dumping the raw rejection.
  */
 function extractSyncError(
   raw: string,
@@ -193,8 +202,83 @@ function extractSyncError(
   if (lower.includes("network") || lower.includes("fetch")) {
     return "Network error — check your connection and try again.";
   }
+  if (
+    lower.includes("ic0508") ||
+    lower.includes("canister is stopped") ||
+    lower.includes("reject_code: 5") ||
+    lower.includes('"reject_code":5') ||
+    lower.includes('reject_code":5')
+  ) {
+    return "The service is temporarily unavailable. Please wait a moment and try again.";
+  }
   const verb = direction === "upload" ? "Upload" : "Download";
   return raw || `${verb} failed. Please try again.`;
+}
+
+/** Returns true if the error string indicates a transiently stopped canister (IC0508). */
+function isCanisterStoppedError(raw: string): boolean {
+  const lower = raw.toLowerCase();
+  return (
+    lower.includes("ic0508") ||
+    lower.includes("canister is stopped") ||
+    lower.includes("reject_code: 5") ||
+    lower.includes('"reject_code":5') ||
+    lower.includes('reject_code":5')
+  );
+}
+
+/** Sleep for `ms` milliseconds. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── Theme sync helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Inject the current themeColorOverrides (from localStorage via exportAllThemes)
+ * into the settings.otherSettings JSON so they get uploaded with the preferences.
+ */
+function injectThemeOverridesIntoSettings(settings: AppSettings): AppSettings {
+  try {
+    const overrides = exportAllThemes();
+    // Only inject if there are non-empty overrides to avoid bloating the payload
+    const hasOverrides = Object.values(overrides).some(
+      (themeOverrides) => Object.keys(themeOverrides).length > 0,
+    );
+    if (!hasOverrides) return settings;
+    const other = settings.otherSettings
+      ? (JSON.parse(settings.otherSettings) as Record<string, unknown>)
+      : {};
+    const merged = { ...other, themeColorOverrides: overrides };
+    return { ...settings, otherSettings: JSON.stringify(merged) };
+  } catch {
+    return settings;
+  }
+}
+
+/**
+ * On download, extract themeColorOverrides from settings.otherSettings and apply
+ * them locally via importThemes so custom theme colors are restored.
+ */
+function applyThemeOverridesFromSettings(
+  settings: AppSettings,
+  currentThemeId: ThemeId,
+): void {
+  try {
+    if (!settings.otherSettings) return;
+    const other = JSON.parse(settings.otherSettings) as Record<string, unknown>;
+    if (
+      other.themeColorOverrides &&
+      typeof other.themeColorOverrides === "object"
+    ) {
+      importThemes(
+        other.themeColorOverrides as Record<string, Record<string, string>>,
+        currentThemeId,
+      );
+    }
+  } catch {
+    // malformed otherSettings — silently ignore
+  }
 }
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
@@ -677,49 +761,81 @@ export function usePreferences(
 
     setIsUploadingSyncing(true);
     setIsSyncing(true);
-    try {
-      const actor = await getActor();
-      if (!actor) {
-        setUploadError("Not signed in — please log in and try again.");
+
+    let lastError = "Upload failed. Please try again.";
+
+    for (let attempt = 1; attempt <= SYNC_RETRY_ATTEMPTS; attempt++) {
+      try {
+        const actor = await getActor();
+        if (!actor) {
+          setUploadError("Not signed in — please log in and try again.");
+          setIsUploadingSyncing(false);
+          setIsSyncing(false);
+          return;
+        }
+
+        // Log exactly what's going up
+        console.log(
+          `[Sync] syncUpload attempt ${attempt}/${SYNC_RETRY_ATTEMPTS} — ${brushesRef.current.length} brush(es), theme: ${settingsRef.current.theme}`,
+        );
+        console.log(
+          "[Sync] savePreferences payload:",
+          JSON.stringify({
+            brushCount: brushesRef.current.length,
+            brushIds: brushesRef.current.map((b) => b.id),
+            theme: settingsRef.current.theme,
+          }),
+        );
+
+        const prefs: UserPreferences = {
+          brushes: brushesRef.current,
+          settings: injectThemeOverridesIntoSettings(settingsRef.current),
+          hotkeys: hotkeysRef.current,
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+          lastModified: Date.now(),
+        };
+        await actor.savePreferences(toCanisterPreferences(prefs));
+
+        const ts = Date.now();
+        setLastUploaded(ts);
+        console.log(
+          `[Preferences] Upload complete — ${brushesRef.current.length} brush(es) pushed to canister.`,
+        );
+        // Success — clear any lingering error and exit
+        setUploadError(null);
+        setIsUploadingSyncing(false);
+        setIsSyncing(false);
+        return;
+      } catch (e) {
+        const raw = e instanceof Error ? e.message : String(e);
+        lastError = raw;
+        console.warn(
+          `[Preferences] syncUpload attempt ${attempt}/${SYNC_RETRY_ATTEMPTS} failed:`,
+          e,
+        );
+
+        // Only retry on transient canister-stopped errors
+        if (isCanisterStoppedError(raw) && attempt < SYNC_RETRY_ATTEMPTS) {
+          console.log(
+            `[Preferences] Canister stopped — waiting ${SYNC_RETRY_DELAY_MS}ms before retry…`,
+          );
+          await sleep(SYNC_RETRY_DELAY_MS);
+          // Keep isUploadingSyncing=true so the button stays in loading state
+          continue;
+        }
+
+        // Non-retryable error or final attempt — surface friendly message
+        setUploadError(extractSyncError(raw, "upload"));
+        setIsUploadingSyncing(false);
+        setIsSyncing(false);
         return;
       }
-
-      // Log exactly what's going up
-      console.log(
-        `[Sync] syncUpload — ${brushesRef.current.length} brush(es), theme: ${settingsRef.current.theme}`,
-      );
-      console.log(
-        "[Sync] savePreferences payload:",
-        JSON.stringify({
-          brushCount: brushesRef.current.length,
-          brushIds: brushesRef.current.map((b) => b.id),
-          theme: settingsRef.current.theme,
-        }),
-      );
-
-      const prefs: UserPreferences = {
-        brushes: brushesRef.current,
-        settings: settingsRef.current,
-        hotkeys: hotkeysRef.current,
-        schemaVersion: CURRENT_SCHEMA_VERSION,
-        lastModified: Date.now(),
-      };
-      await actor.savePreferences(toCanisterPreferences(prefs));
-
-      const ts = Date.now();
-      setLastUploaded(ts);
-      console.log(
-        `[Preferences] Upload complete — ${brushesRef.current.length} brush(es) pushed to canister.`,
-      );
-    } catch (e) {
-      const raw = e instanceof Error ? e.message : String(e);
-      const msg = extractSyncError(raw, "upload");
-      console.warn("[Preferences] syncUpload failed:", e);
-      setUploadError(msg);
-    } finally {
-      setIsUploadingSyncing(false);
-      setIsSyncing(false);
     }
+
+    // All retries exhausted (canister still stopped)
+    setUploadError(extractSyncError(lastError, "upload"));
+    setIsUploadingSyncing(false);
+    setIsSyncing(false);
   }, [isAuthenticated, getActor, setLastUploaded]);
 
   // ── syncDownload — pull canister preferences and apply to local state ─────
@@ -742,72 +858,114 @@ export function usePreferences(
 
     setIsDownloadingSyncing(true);
     setIsSyncing(true);
-    try {
-      const actor = await getActor();
-      if (!actor) {
-        setDownloadError("Not signed in — please log in and try again.");
+
+    let lastError = "Download failed. Please try again.";
+
+    for (let attempt = 1; attempt <= SYNC_RETRY_ATTEMPTS; attempt++) {
+      try {
+        const actor = await getActor();
+        if (!actor) {
+          setDownloadError("Not signed in — please log in and try again.");
+          setIsDownloadingSyncing(false);
+          setIsSyncing(false);
+          return;
+        }
+
+        console.log(
+          `[Sync] syncDownload attempt ${attempt}/${SYNC_RETRY_ATTEMPTS}`,
+        );
+
+        const raw = await actor.getPreferences();
+        console.log(
+          "[Sync] getPreferences response:",
+          JSON.stringify(
+            raw !== null && raw !== undefined
+              ? {
+                  brushCount: (raw as { brushes: unknown[] }).brushes?.length,
+                  theme: (raw as { settings: { theme: string } }).settings
+                    ?.theme,
+                }
+              : null,
+          ),
+        );
+
+        if (raw !== null && raw !== undefined) {
+          const prefs = fromCanisterPreferences(raw);
+          const migrated = migratePreferences(prefs);
+
+          // If migration changed the schema, write it back
+          if (migrated.schemaVersion !== prefs.schemaVersion) {
+            void actor
+              .savePreferences(toCanisterPreferences(migrated))
+              .catch((e) =>
+                console.warn(
+                  "[Preferences] Post-download migration write failed:",
+                  e,
+                ),
+              );
+          }
+
+          setBrushes(migrated.brushes);
+          setSettings(migrated.settings);
+          setHotkeys(migrated.hotkeys);
+
+          // Restore custom theme color overrides if present in the downloaded preferences
+          const currentThemeId = (localStorage.getItem("sl-theme") ??
+            "light") as ThemeId;
+          applyThemeOverridesFromSettings(migrated.settings, currentThemeId);
+
+          const ts = Date.now();
+          setLastDownloaded(ts);
+
+          // Notify PaintingApp so the brush UI reflects the downloaded brushes
+          if (onDownloadCallbackRef.current) {
+            onDownloadCallbackRef.current(migrated.brushes);
+          }
+          console.log(
+            `[Preferences] Download complete — ${migrated.brushes.length} brush(es) loaded from canister.`,
+          );
+        } else {
+          // No preferences stored yet — nothing to pull, still record the attempt
+          setLastDownloaded(Date.now());
+          console.log(
+            "[Preferences] Download complete — no canister preferences found, keeping local state.",
+          );
+        }
+
+        // Success
+        setDownloadError(null);
+        setIsDownloadingSyncing(false);
+        setIsSyncing(false);
+        return;
+      } catch (e) {
+        const raw = e instanceof Error ? e.message : String(e);
+        lastError = raw;
+        console.warn(
+          `[Preferences] syncDownload attempt ${attempt}/${SYNC_RETRY_ATTEMPTS} failed:`,
+          e,
+        );
+
+        // Only retry on transient canister-stopped errors
+        if (isCanisterStoppedError(raw) && attempt < SYNC_RETRY_ATTEMPTS) {
+          console.log(
+            `[Preferences] Canister stopped — waiting ${SYNC_RETRY_DELAY_MS}ms before retry…`,
+          );
+          await sleep(SYNC_RETRY_DELAY_MS);
+          continue;
+        }
+
+        // Non-retryable error or final attempt
+        setDownloadError(extractSyncError(raw, "download"));
+        setIsDownloadingSyncing(false);
+        setIsSyncing(false);
         return;
       }
-
-      const raw = await actor.getPreferences();
-      console.log(
-        "[Sync] getPreferences response:",
-        JSON.stringify(
-          raw !== null && raw !== undefined
-            ? {
-                brushCount: (raw as { brushes: unknown[] }).brushes?.length,
-                theme: (raw as { settings: { theme: string } }).settings?.theme,
-              }
-            : null,
-        ),
-      );
-
-      if (raw !== null && raw !== undefined) {
-        const prefs = fromCanisterPreferences(raw);
-        const migrated = migratePreferences(prefs);
-
-        // If migration changed the schema, write it back
-        if (migrated.schemaVersion !== prefs.schemaVersion) {
-          void actor
-            .savePreferences(toCanisterPreferences(migrated))
-            .catch((e) =>
-              console.warn(
-                "[Preferences] Post-download migration write failed:",
-                e,
-              ),
-            );
-        }
-
-        setBrushes(migrated.brushes);
-        setSettings(migrated.settings);
-        setHotkeys(migrated.hotkeys);
-
-        const ts = Date.now();
-        setLastDownloaded(ts);
-
-        // Notify PaintingApp so the brush UI reflects the downloaded brushes
-        if (onDownloadCallbackRef.current) {
-          onDownloadCallbackRef.current(migrated.brushes);
-        }
-        console.log(
-          `[Preferences] Download complete — ${migrated.brushes.length} brush(es) loaded from canister.`,
-        );
-      } else {
-        // No preferences stored yet — nothing to pull, still record the attempt
-        setLastDownloaded(Date.now());
-        console.log(
-          "[Preferences] Download complete — no canister preferences found, keeping local state.",
-        );
-      }
-    } catch (e) {
-      const raw = e instanceof Error ? e.message : String(e);
-      const msg = extractSyncError(raw, "download");
-      console.warn("[Preferences] syncDownload failed:", e);
-      setDownloadError(msg);
-    } finally {
-      setIsDownloadingSyncing(false);
-      setIsSyncing(false);
     }
+
+    // All retries exhausted
+    setDownloadError(extractSyncError(lastError, "download"));
+    setIsDownloadingSyncing(false);
+    setIsSyncing(false);
   }, [isAuthenticated, getActor, setLastDownloaded]);
 
   // ── exportPreferences ─────────────────────────────────────────────────────
